@@ -1,0 +1,49 @@
+
+NHNCE-187
+Recording 1: Stainless Steel Cuff Implanted. Ramp from low intensity. Fast Settle Disabled. Picoscope and output ground connected. (Lower Range, at 5kZ)
+
+Recording 2: Stainless Steel Cuff Implanted. Ramp from low intensity. Fast Settle Enabled. Picoscope and output ground connected. (Starting at 1.0 mA, at 20kZ)
+
+Recording 3: Stainless Steel Cuff Implanted. Ramp from low intensity. Fast Settle Enabled. Picoscope and output ground connected. 
+
+Recording 4: Stainless Steel Cuff Implanted. Ramp from low intensity. Fast Settle Enabled. Picoscope Only connected. 
+
+
+Switching back to 5kZ
+
+
+
+2NHNCE-187 (With Needle Instead of Head) To Replicate Recording from 5/14/25
+Recording 1: Stainless Steel Cuff Implanted. Ramp Down to low intensity. Fast Settle Disabled. Picoscope and output ground connected. (Lower Range, at 5kZ)
+
+(Not Captured by Python Peristimulus Plots)
+[Time: 358.348800 s] Message: Starting 1.0 mA
+[Time: 380.116800 s] Message: Starting .75 mA
+[Time: 402.611800 s] Message: Starting .5 mA
+[Time: 441.824600 s] Message: Starting .4 mA
+[Time: 518.529000 s] Message: Starting .2 mA
+[Time: 539.723200 s] Message: Starting .1 mA
+[Time: 563.939600 s] Message: Starting .8 mA
+[Time: 592.402400 s] Message: Starting .6 mA
+[Time: 618.723000 s] Message: Starting .4 mA
+[Time: 669.298000 s] Message: Starting .2 mA
+[Time: 708.817000 s] Message: Starting .01 mA
+[Time: 737.241600 s] Message: Starting 1 mA
+
+
+RATNAME (With needle and New EMG electrode)
+
+
+Starting 0.15 mA
+
+
+~0.2 mA whenh evoked response comes on.
+
+~1.44/1.45 mA when neck twitching comes on.
+
+is 2.5 mA a sweet spot? 
+
+
+Starting at 0.15 mA
+
+Picoscope and Output Ground in

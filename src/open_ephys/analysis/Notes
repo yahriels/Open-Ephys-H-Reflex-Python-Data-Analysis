@@ -1,0 +1,478 @@
+"SNARE-46_2025-06-17_10-50-44_001" is organized where there are 2 record nodes that have slightly different processing for the same data. For each record node "Recorde Node 106" and "Recorde Node 111", there are 2 experiments: "experiment1" and "experiment2", within these experiment folders, there are the recording files that contain the actual data. In this session I have 4 total recordings in each node, 1 in experiment1, and 3 in experiment2.
+The count for the recording number resets back to 1 when switching to a new experiment. It switches to a new experiment and creates a new folder anytime you stop & start the data acquisition button on the Open Ephys GUI (Play Button)
+The count for the recording number progresses by n when switching to and creating a new recording file, anytime you stop & start the record button on the Open Ephys GUI (Circle/Record Button), while having the data acquisition continuously on.
+
+This should be how the recordings are organized by node. And how their respective channels are organized.
+
+
+Node 111: RAW Unfiltered Data
+SNARE-46_2025-06-17_10-50-44_001 > Record Node 111 > experiment1 > recording1
+SNARE-46_2025-06-17_10-50-44_001 > Record Node 111 > experiment2 > recording1
+SNARE-46_2025-06-17_10-50-44_001 > Record Node 111 > experiment1 > recording2
+SNARE-46_2025-06-17_10-50-44_001 > Record Node 111 > experiment2 > recording3
+
+> CH1: May ignore/NO DESIGNATION
+> CH5: EEG Data Unfiltered 
+> CH7: EMG1 Data Unfiltered *to be differentially subtracted and filtered*
+> CH11: EMG2 Data Unfiltered *to be differentially subtracted and filtered*
+
+
+
+Node 106 : Filtered Data
+SNARE-46_2025-06-17_10-50-44_001 > Record Node 106 > experiment1 > recording1
+SNARE-46_2025-06-17_10-50-44_001 > Record Node 106 > experiment2 > recording1
+SNARE-46_2025-06-17_10-50-44_001 > Record Node 106 > experiment1 > recording2
+SNARE-46_2025-06-17_10-50-44_001 > Record Node 106 > experiment2 > recording3
+
+> CH1: May ignore/NO DESIGNATION
+> CH5: EEG Data Filtered 
+> CH7: EMG1 Only, Filtered 
+> CH11: Differential EMG, Filtered *Final Signal* 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+.
+"SAP-55_2025-06-09_11-12-19_001" is organized as a directory in this fashion for each record node "Recorde Node 106", where the actual data is captured within the "recording1" or "recording2" file. In this session I have 4 total recordings, 2 in experiment1, and 2 in experiment2.
+
+SAP-55_2025-06-09_11-12-19_001 > Record Node 106 > experiment1 > recording1, recording2, ...
+SAP-55_2025-06-09_11-12-19_001 > Record Node 106 > experiment2 > recording1, recording2, ...
+
+Here are some helpful links (https://github.com/open-ephys/open-ephys-python-tools/tree/main , https://github.com/open-ephys/open-ephys-python-tools/tree/main/src/open_ephys/analysis) 
+
+
+I have this code that I want to make adjustments to. The main adjustment is that I want to change really only the peri-stimulus analysis plots sections, and keep everything else the same, with a  feature where it runs all of the same code, but simultaneously iterates through both Node 106 data and Node 111 data to populate the peri-stimulus subplots with the correct data respectively where the online (Node 106) goes on the left and the offline (Node 111) goes on the right. These are both going through the exact same peri-stimulus analysis, processing, and plotting.
+Within the loops access the data from each node at the same time, process it, and then produce the plot for online filtering (Node 106) on the left subplot of the peri-stimulus plots, and for offline filtering (Node 111) on the right subplot of the peri-stimulus plots, follow the exact format of the plot and analysis/processing already generated in the code below.
+I also want you to store the data and handling objects handling with each node and store them in their own variables respectively denoted by "_online" for Node 106 objects or "_offline" for Node 111 object name endings if they aren't already done so.
+
+Now return to me the complete updated code with the changes incorporated.
+
+
+Code:{
+fimport matplotlib.pyplot as plt
+import numpy as np
+from open_ephys.analysis import Session
+import os
+import re
+from scipy.signal import butter, filtfilt, lfilter
+from collections import defaultdict
+import scipy.stats as stats
+
+
+# ==== Select Session ====
+w = 1  # recordnode index 1 = Record Node 111 RAW is Offline Filtered
+u = 0       # recordnode index 0 = Record Node 106 is Online Filtered
+
+
+
+def scan_experiment_structure(session_dir, record_node_name):
+    node_path = os.path.join(session_dir, record_node_name)
+    
+    if not os.path.exists(node_path):
+        print(f"Record Node directory not found: {node_path}")
+        return {}
+    
+    experiment_info = defaultdict(list)
+    for item in sorted(os.listdir(node_path)):
+        exp_path = os.path.join(node_path, item)
+        if os.path.isdir(exp_path) and item.startswith("experiment"):
+            recordings = [r for r in sorted(os.listdir(exp_path)) 
+                          if os.path.isdir(os.path.join(exp_path, r)) and r.startswith("recording")]
+            experiment_info[item] = recordings
+    return experiment_info
+
+# ==== Load Session ====
+#directory = 'SNARE-40_2025-06-05_11-39-05_001'
+directory = 'SAP-55_2025-06-09_11-12-19_001'
+#directory = 'ABATE-008_2025-05-14_14-34-09_001'
+#directory = 'SNARE-32_2025-06-04_11-14-37_001'
+#directory = 'NHNCE-187_2025-05-16_10-28-20_001'
+#directory = '2NHNCE-187_2025-05-16_11-34-10_001'
+#directory = 'RAtname_2025-05-16_12-13-55_001'
+
+session_online = Session(directory)
+print('Pass Initial Test, Moving on to Loading Session...\n')
+session_offline = Session(directory)
+print('Pass Initial Test, Moving on to Loading Session...\n')
+
+# === Scan structure ===
+record_node_name_online = "Record Node 106" if u == 0 else "Record Node 111"
+record_node_name = record_node_name_online
+structure_online = scan_experiment_structure(directory, record_node_name)
+record_node_name_offline = "Record Node 111" if w == 1 else "Record Node 106"
+record_node_name = record_node_name_offline
+structure_offline = scan_experiment_structure(directory, record_node_name)
+
+# === Flatten experiment-recording_online pairs to loop ===
+flat_recordings = []
+for exp_name, rec_list in structure_online.items():
+    for rec in rec_list:
+        flat_recordings.append((exp_name, rec))
+
+# === Iterate over recordings with x, y, yy convention ===
+for x, (exp, yy) in enumerate(flat_recordings):
+    y = f"recording{x + 1}"
+    v = f"Record Node 106" if u == 0 else f"Record Node 111"
+    vv = f"Record Node 111" if w == 1 else f"Record Node 106"
+    i = 1
+
+    try:
+        recording_online = session_online.recordnodes[u].recordings[x]
+        recording_offline = session_offline.recordnodes[w].recordings[x]
+    except IndexError:
+        print(f"No recording {x+1} found in {v}/{exp}/{yy}")
+        print(f"No recording {x+1} found in {vv}/{exp}/{yy}")
+        continue
+
+    print(f"Processing: x={x}, Node={v}, y={y}, exp={exp}, yy={yy}")
+
+    # ==== Sync Setup ====
+    print(f"\n{exp.upper()}, Node={v},  Recording {x+1}")
+    print(recording_online)
+
+    # Only add sync line if a main one doesn't already exist
+    has_main_sync = any(sync.get("main", False) for sync in recording_online.sync_lines)
+    if not has_main_sync:
+        recording_online.add_sync_line(1, 100, 'Rhythm Data', main=True)
+
+    recording_online.compute_global_timestamps()
+
+    metadata = recording_online.continuous[0].metadata
+    channel_names = metadata['channel_names']
+    print("Channels:", channel_names, '\n')
+
+
+
+    # ==== Load ONLINE Data (Node 106) ====
+    timestamps_online = recording_online.continuous[0].timestamps
+    n_samples_online = len(timestamps_online)
+    data_online = recording_online.continuous[0].get_samples(start_sample_index=0, end_sample_index=len(timestamps_online))
+    sample_rate_online = recording_online.continuous[0].metadata['sample_rate']
+
+    emg_online_filt = data_online[:, 3]  # example channel
+    adc1_online = data_online[:, 4]      # example ADC1
+
+    # ==== Load OFFLINE Data (Node 111) ====
+    timestamps_offline = recording_offline.continuous[0].timestamps
+    n_samples_offline = len(timestamps_offline)
+    data_offline = data_online = recording_online.continuous[0].get_samples(start_sample_index=0, end_sample_index=len(timestamps_offline))
+    sample_rate_offline = recording_offline.continuous[0].metadata['sample_rate']
+
+    emg1_raw_offline = data_offline[:, 2]
+    emg2_raw_offline = data_offline[:, 3]
+    differential_offline = emg2_raw_offline - emg1_raw_offline
+
+    # Bandpass filter
+    lowcut = 100
+    highcut = 1000
+    b, a = butter(2, np.array([lowcut, highcut]) / (sample_rate_offline / 2), btype='bandpass')
+    emg_offline_filt = lfilter(b, a, differential_offline)
+
+    adc1_offline = data_offline[:, 4]
+
+   # ==== Plot EMG traces ====
+    plt.figure(figsize=(15, 4))
+    plt.plot(timestamps_online, emg_online_filt, label="Online Filtered NODE 106 EMG1 - EMG2", color='green')
+    plt.axhline(0, color='black', linestyle='--', linewidth=0.5)
+    plt.title(f"{directory}, {exp}, {yy}, Online Filtered EMG Signal")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude (μV)")
+    plt.grid(True)
+    plt.legend()
+    plt.ylim(top=15000)
+    plt.tight_layout()
+    plt.show()
+
+    
+    plt.figure(figsize=(15, 4))
+    plt.plot(timestamps_offline, emg_offline_filt, label="Offline Filtered NODE 111 EMG1 - EMG2", color='purple')
+    plt.axhline(0, color='black', linestyle='--', linewidth=0.5)
+    plt.title(f"{directory}, {exp}, {yy}, Offline Filtered Differential EMG Signal")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude (μV)")
+    plt.grid(True)
+    plt.legend()
+    plt.ylim(top=15000)
+    plt.tight_layout()
+    plt.show()
+
+    
+
+
+
+    # ==== Load MessageCenter ====
+    messagecenter_dir = os.path.join(directory, v, exp, yy, "events", "MessageCenter")
+    if not os.path.exists(messagecenter_dir):
+        print(f"MessageCenter directory not found for {exp}/{yy}")
+        continue
+
+    texts = np.load(os.path.join(messagecenter_dir, "text.npy"), allow_pickle=True)
+    timestamps_msg = np.load(os.path.join(messagecenter_dir, "timestamps.npy"))
+    decoded_texts = [t.decode('utf-8') if isinstance(t, bytes) else str(t) for t in texts]
+    message_entries = list(zip(timestamps_msg, decoded_texts))
+    print(f"Loaded {len(decoded_texts)} MessageCenter entries")
+
+    # ==== Debug Print ====
+    for text, time in zip(decoded_texts, timestamps_msg):
+        print(f"[Time: {time:.6f} s] Message: {text}")
+
+
+    # ==== Peri-Stimulus Analysis with Shaded Stimulus Duration ====
+    pre_event_time = 5   # ms before calculated stim start
+    post_event_time = 20 # ms after calculated stim start
+    stim_threshold = 0.1 # ADC1 threshold to detect pulse (adjust if needed)
+
+    peri_stim_segments = []
+    segment_stim_end_times = []
+    segment_stim_start_times = []
+
+    for stamp in sync_timestamps:
+        # First, find approximate sample index around the sync pulse
+        idx_center = np.searchsorted(timestamps, stamp)
+        # Define a generous window to locate true stim-onset in ADC1
+        idx_search_start = np.searchsorted(timestamps, stamp - 0.010)  # 10 ms before sync
+        idx_search_end   = np.searchsorted(timestamps, stamp + 0.010)  # 10 ms after sync
+
+        if idx_search_start < 0 or idx_search_end > len(timestamps):
+            continue
+
+        adc1_segment_for_detection = adc1[idx_search_start:idx_search_end]
+        time_segment_for_detection = timestamps[idx_search_start:idx_search_end]
+
+        # Detect true stim start: first crossing above threshold in that window
+        above_idxs = np.where(adc1_segment_for_detection > stim_threshold)[0]
+        if len(above_idxs) == 0:
+            continue
+        stim_start_idx = idx_search_start + above_idxs[0]
+        stim_start_time = timestamps[stim_start_idx]
+
+        # Now define peri-stimulus window around this stim_start_time
+        idx_pre  = int(stim_start_idx - (pre_event_time / 1000) * sample_rate)
+        idx_post = int(stim_start_idx + (post_event_time / 1000) * sample_rate)
+
+        if idx_pre < 0 or idx_post > len(timestamps):
+            continue
+
+        # Extract windows
+        time_window = timestamps[idx_pre:idx_post]
+        time_zeroed = time_window - stim_start_time  # in seconds
+
+        emg_window  = differential_emg[idx_pre:idx_post]
+        adc1_window = adc1[idx_pre:idx_post]
+
+        # Detect stim end: first time after stim_start where ADC1 falls back below threshold
+        post_onset_mask = (time_zeroed >= 0)
+        adc1_post_onset = adc1_window[post_onset_mask]
+        time_post_onset = time_zeroed[post_onset_mask]
+
+        below_idxs = np.where(adc1_post_onset < stim_threshold)[0]
+        if len(below_idxs) > 0:
+            stim_end_time = time_post_onset[below_idxs[0]] * 1000  # convert to ms
+        else:
+            stim_end_time = post_event_time
+
+        # Save for grouping
+        peri_stim_segments.append((time_zeroed * 1000, emg_window, stim_end_time))
+        segment_stim_start_times.append(stim_start_time)
+        segment_stim_end_times.append(stim_end_time)
+
+
+    # ==== Dynamically determine stimulation groups based on event messages ====
+
+    # First, extract only trigger messages and stim setting messages
+    trigger_pattern = re.compile(r"RHDCONTROL TRIGGER")
+    stim_pattern = re.compile(r"starting(?: at)? (\d+\.?\d*)\s*mA", re.IGNORECASE)
+
+    stim_groups = []
+    current_group = []
+    current_amp = None
+    trigger_times = []
+
+    for t, msg in message_entries:
+        if stim_pattern.search(msg):
+            # Save the previous group if any
+            if current_amp is not None and current_group:
+                stim_groups.append((current_amp, current_group))
+            # Start new group
+            current_amp = float(stim_pattern.search(msg).group(1))
+            current_group = []
+        elif trigger_pattern.search(msg):
+            if current_amp is not None:
+                current_group.append(t)
+    
+    # Don't forget to save the last group
+    if current_amp is not None and current_group:
+        stim_groups.append((current_amp, current_group))
+
+    # ==== Match trigger times to peri_stim_segments ====
+    # Create dictionary to associate each stim amplitude to its segments
+    stim_intensities = []
+    m_wave_peaks = []
+    h_wave_peaks = []
+
+    for stim_amp, trigger_times_group in stim_groups:
+        # For each trigger time, find matching peri_stim segment (by start time)
+        group_data = []
+        group_start_times = []
+        group_end_times = []
+
+        for trig_time in trigger_times_group:
+            # Find closest stim_start_time to this trigger time
+            idx_match = np.argmin(np.abs(np.array(segment_stim_start_times) - trig_time))
+            # Extra check: ensure it's reasonably close (e.g., within 100 ms)
+            if abs(segment_stim_start_times[idx_match] - trig_time) < 0.1:
+                group_data.append(peri_stim_segments[idx_match])
+                group_start_times.append(segment_stim_start_times[idx_match])
+                group_end_times.append(segment_stim_end_times[idx_match])
+
+        if not group_data:
+            continue  # skip if no valid matching data
+
+        # Proceed with same logic as original
+        time_ms_matrix = np.stack([gd[0] for gd in group_data])
+        emg_matrix     = np.stack([gd[1] for gd in group_data])
+
+        avg_time_ms = time_ms_matrix[0]  # identical for all in group
+        avg_emg     = np.mean(emg_matrix, axis=0)
+        avg_end_ms  = np.mean(group_end_times)
+
+        stim_intensities.append(stim_amp)
+
+        fig, axs = plt.subplots(1, 2, figsize=(14, 4))  # 1 row, 2 columns
+
+        for ax in axs:
+            for (_, trace, _) in group_data:
+                ax.plot(avg_time_ms, trace, color='red', alpha=0.6)
+            ax.plot(avg_time_ms, avg_emg, color='black', linewidth=2, label='Average EMG')
+
+            ax.axvline(x=0, color='red', linestyle='--', label='Stim Start/End')
+            ax.axvline(x=avg_end_ms, color='red', linestyle='--', label='_nolegend_')
+            ax.axvspan(0, avg_end_ms, color='red', alpha=0.3)
+
+            m_wave_start, m_wave_end = 2, 5.0
+            h_wave_start, h_wave_end = 6, 10
+
+            ax.axvspan(m_wave_start, m_wave_end, color='blue', alpha=0.3)
+            ax.axvspan(h_wave_start, h_wave_end, color='green', alpha=0.3)
+
+            m_wave_mask = (avg_time_ms >= m_wave_start) & (avg_time_ms <= m_wave_end)
+            m_wave_time_window = avg_time_ms[m_wave_mask]
+            m_wave_emg_window = avg_emg[m_wave_mask]
+            m_wave_peak_idx = np.argmax(m_wave_emg_window)
+            m_wave_peak_time = m_wave_time_window[m_wave_peak_idx]
+            m_wave_peak_amp = m_wave_emg_window[m_wave_peak_idx]
+            m_wave_peaks.append(m_wave_peak_amp)
+
+            h_wave_mask = (avg_time_ms >= h_wave_start) & (avg_time_ms <= h_wave_end)
+            h_wave_time_window = avg_time_ms[h_wave_mask]
+            h_wave_emg_window = avg_emg[h_wave_mask]
+            h_wave_peak_idx = np.argmax(h_wave_emg_window)
+            h_wave_peak_time = h_wave_time_window[h_wave_peak_idx]
+            h_wave_peak_amp = h_wave_emg_window[h_wave_peak_idx]
+            h_wave_peaks.append(h_wave_peak_amp)
+
+            ax.axvline(x=m_wave_peak_time, color='blue', linestyle=':', linewidth=2,
+                    label=f'M-Wave Peak: {m_wave_peak_amp:.1f} μV at {m_wave_peak_time:.2f} ms')
+            ax.axvline(x=h_wave_peak_time, color='green', linestyle=':', linewidth=2,
+                    label=f'H-Wave Peak: {h_wave_peak_amp:.1f} μV at {h_wave_peak_time:.2f} ms')
+
+            ax.text(m_wave_peak_time, m_wave_peak_amp + 200, f'{m_wave_peak_amp:.1f} μV',
+                    color='blue', fontsize=9, ha='center')
+            ax.text(h_wave_peak_time, h_wave_peak_amp + 200, f'{h_wave_peak_amp:.1f} μV',
+                    color='green', fontsize=9, ha='center')
+
+            ax.set_xlabel("Time (ms)")
+            ax.set_ylabel("Amplitude (μV)")
+            ax.grid(True)
+            ax.legend()
+            ax.set_ylim(top=15000)
+
+            min_ms = int(np.floor(avg_time_ms[0]))
+            max_ms = int(np.ceil(avg_time_ms[-1]))
+            ax.set_xticks(np.arange(min_ms, max_ms + 1, 1))
+
+        # Optional: Title for the full figure instead of each subplot
+        fig.suptitle(
+            f"{exp}, {yy}, Peri-Stimulus EMG (Events {i}-{i + (1)*len(group_data)}) | Stim Amp: {stim_amp} mA",
+            fontsize=14
+        )
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])  # Leave space for suptitle
+        plt.show()
+        i = i + (1)*len(group_data) + 1
+        
+
+    # ==== Group peak amplitudes by stimulation intensity ====
+    m_wave_dict = defaultdict(list)
+    h_wave_dict = defaultdict(list)
+
+    for amp, m_peak, h_peak in zip(stim_intensities, m_wave_peaks, h_wave_peaks):
+        m_wave_dict[amp].append(m_peak)
+        h_wave_dict[amp].append(h_peak)
+
+    # Sort by stimulation intensity
+    sorted_amps = sorted(set(stim_intensities))
+
+    m_wave_data = [m_wave_dict[amp] for amp in sorted_amps]
+    h_wave_data = [h_wave_dict[amp] for amp in sorted_amps]
+
+    # Compute mean and SEM for overlay
+    m_means = [np.mean(peaks) for peaks in m_wave_data]
+    m_sems  = [stats.sem(peaks) for peaks in m_wave_data]
+    h_means = [np.mean(peaks) for peaks in h_wave_data]
+    h_sems  = [stats.sem(peaks) for peaks in h_wave_data]
+
+    # ==== Plot Recruitment Curves as Box-and-Whisker ====
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    
+
+    # Boxplots
+    positions = np.arange(len(sorted_amps))  # for spacing
+    box1 = ax.boxplot(m_wave_data, positions=positions - 0.2, widths=0.3,
+                    patch_artist=True, boxprops=dict(facecolor='lightblue'),
+                    medianprops=dict(color='black'), labels=[f"{amp:.1f}" for amp in sorted_amps])
+    box2 = ax.boxplot(h_wave_data, positions=positions + 0.2, widths=0.3,
+                    patch_artist=True, boxprops=dict(facecolor='lightgreen'),
+                    medianprops=dict(color='black'))
+
+    # Overlay mean ± SEM
+    ax.errorbar(positions - 0.2, m_means, yerr=m_sems, fmt='o-', color='blue', label='M-Wave Mean ± SEM')
+    ax.errorbar(positions + 0.2, h_means, yerr=h_sems, fmt='o-', color='green', label='H-Wave Mean ± SEM')
+
+    # Aesthetics
+    ax.set_xticks(positions)
+    ax.set_xticklabels([f"{amp:.1f}" for amp in sorted_amps])
+    ax.set_xlabel("Stimulation Intensity (mA)")
+    ax.set_ylabel("Peak Amplitude (μV)")
+    ax.set_title(f"{exp}, {yy}, Recruitment Curves (Box & Whisker)")
+    ax.grid(True)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+}

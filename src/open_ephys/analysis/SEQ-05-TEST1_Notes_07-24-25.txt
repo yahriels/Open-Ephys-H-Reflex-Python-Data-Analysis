@@ -1,0 +1,26 @@
+
+
+Experiment 1
+
+PICOSCOPE OUT
+Recording 1: PI Cuff Implanted. Ramp from low intensity in intervals of 0.05 mA. Fast Settle Enabled. HEADSCREW GROUND AND EEG OUT. 5 kHz Sampling. FIRST TEST
+
+Starting at 0.00 mA
+.25 ms pulse width
+
+
+Recording 2: PICOSCOPE IN
+.5 ms pulse width
+
+Recording 3: PICOSCOPE IN
+.25 ms pulse width
+
+Toe twitch at 1.10 mA
+
+Recording 4: PICOSCOPE IN
+
+.1 ms pulse width
+
+evoked waveform around 2.15 mA
+
+cuff impedance of 1.8 kohms

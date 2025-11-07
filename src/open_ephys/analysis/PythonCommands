@@ -1,0 +1,73 @@
+
+
+recording
+<open_ephys.analysis.formats.BinaryRecording.BinaryRecording at 0x1800f71ba10>
+
+session.recordnodes
+[<open_ephys.analysis.recordnode.RecordNode at 0x1800f71b770>,
+ <open_ephys.analysis.recordnode.RecordNode at 0x1800f8711d0>]
+
+session.recordnodes[1]
+<open_ephys.analysis.recordnode.RecordNode at 0x1800f8711d0>
+
+recording.events
+line	sample_number	timestamp	processor_id	stream_index	stream_name	state
+0	1	2221404	74.046800	100	0	Rhythm Data	1
+1	1	2221434	74.047800	100	0	Rhythm Data	0
+2	1	3131316	104.377200	100	0	Rhythm Data	1
+3	1	3131346	104.378200	100	0	Rhythm Data	0
+4	1	4379095	145.969833	100	0	Rhythm Data	1
+5	1	4379125	145.970833	100	0	Rhythm Data	0
+6	1	4393868	146.462267	100	0	Rhythm Data	1
+7	1	4393898	146.463267	100	0	Rhythm Data	0
+8	1	5124932	170.831067	100	0	Rhythm Data	1
+9	1	5124962	170.832067	100	0	Rhythm Data	0
+10	1	6187564	206.252133	100	0	Rhythm Data	1
+11	1	6187594	206.253133	100	0	Rhythm Data	0
+12	1	7012265	233.742167	100	0	Rhythm Data	1
+13	1	7012295	233.743167	100	0	Rhythm Data	0
+14	1	7526120	250.870667	100	0	Rhythm Data	1
+15	1	7526150	250.871667	100	0	Rhythm Data	0
+16	1	8879258	295.975267	100	0	Rhythm Data	1
+17	1	8879288	295.976267	100	0	Rhythm Data	0
+
+
+
+df = recording.events
+
+df['timestamp']
+0      74.046800
+1      74.047800
+2     104.377200
+3     104.378200
+4     145.969833
+5     145.970833
+6     146.462267
+7     146.463267
+8     170.831067
+9     170.832067
+10    206.252133
+11    206.253133
+12    233.742167
+13    233.743167
+14    250.870667
+15    250.871667
+16    295.975267
+17    295.976267
+Name: timestamp, dtype: float64
+
+
+recording.Continuous
+
+recording.continuous
+recording.continuous[0].metadata
+{'source_node_id': 100,
+ 'source_node_name': 'Acquisition Board',
+ 'stream_name': 'Rhythm Data',
+ 'sample_rate': 30000.0,
+ 'num_channels': 4,
+ 'channel_names': ['CH5', 'CH7', 'CH11', 'ADC1'],
+ 'bit_volts': [0.1949999928474426,
+  0.1949999928474426,
+  0.1949999928474426,
+  0.000152587890625]}

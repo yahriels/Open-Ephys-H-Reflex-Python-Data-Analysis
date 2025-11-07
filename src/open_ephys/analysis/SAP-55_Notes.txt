@@ -1,0 +1,14 @@
+SNARE-55
+
+Experiment 1
+Recording 1: Stainless Steel Cuff Implanted. Ramp from low intensity in intervals of 0.10 mA. Fast Settle Enabled. HEADSCREW GROUND IN. Picoscope and output ground DISCONNECTED. 5 kHz Sampling
+
+Recording 2: Stainless Steel Cuff Implanted. Ramp from low intensity in intervals of 0.25 mA. Fast Settle Enabled. HEADSCREW GROUND IN. Picoscope and output ground DISCONNECTED. 5 kHz Sampling
+
+Everything WIred Exernally.
+--------------------------
+
+Experiment 2
+Recording 1: Stainless Steel Cuff Implanted. Ramp from low intensity in intervals of 0.10 mA. Fast Settle Enabled. HEADSCREW GROUND IN. Picoscope and output ground DISCONNECTED. 5 kHz Sampling
+
+Recording 2: Stainless Steel Cuff Implanted. Ramp from low intensity in intervals of 0.10 mA. Fast Settle Enabled. HEADSCREW GROUND IN. Picoscope and output ground DISCONNECTED. 5 kHz Sampling

@@ -1,0 +1,25 @@
+
+
+Experiment 1
+Recording 1: PI Cuff Implanted. Ramp from low intensity in intervals of 0.05 mA. Fast Settle Enabled. HEADSCREW GROUND AND EEG OUT. 5 kHz Sampling. FIRST TEST
+
+Starting at 0.00 mA
+
+getting H-Wave at 0.45-0.50 mA
+
+getting m-wave at 0.55-0.60 mA
+
+getting f-wave at 0.70 mA
+
+---------------------------
+
+
+
+Recruitment onset at 0.45-0.50 mA
+
+h-wave onset ~ 0.475 mA
+m-wave onset ~ 0.535 mA
+
+Recording 1: PI Cuff Implanted. Ramp from low intensity in intervals of 0.01 mA. Fast Settle Enabled. HEADSCREW GROUND AND EEG OUT. 5 kHz Sampling. FIRST TEST
+
+in steps of 0.01 mA, until 1.00 mA, then changed to 0.05 mA

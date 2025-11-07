@@ -1,0 +1,12 @@
+
+
+Experiment 1
+Recording 1: 250 ms, Polarity (Black knob down)
+Ramp
+
+Recording 2: 250 ms, Polarity (Black knob up)
+0.180 mA
+level m and h @ 0.210 mA
+
+Recording 3: 100 ms, Polarity (Black knob down)
+Ramp

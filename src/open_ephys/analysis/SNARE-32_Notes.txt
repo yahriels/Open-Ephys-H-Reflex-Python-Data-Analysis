@@ -1,0 +1,18 @@
+SNARE-32
+Recording 1: Stainless Steel Cuff Implanted. Ramp from low intensity in intervals of 0.10 mA. Fast Settle Enabled. HEADSCREW GROUND IN. Picoscope and output ground connected. 5 kHz Sampling
+- Missed 1.10, 1.20 mA, was actually 1.0 mA
+- 1.4 mA didn't register TTL Line Trigger.
+
+Recording 2: Stainless Steel Cuff Implanted. Ramp from low intensity in intervals of 0.10 mA. Fast Settle Enabled. HEADSCREW GROUND IN. Picoscope and output ground connected. 5 kHz Sampling
+- Repeat of 1.30 mA stim
+- Potential offset of trig line
+- Second 2.7/1.7 mA plot is the actual one. 
+
+Recording 3: Stainless Steel Cuff Implanted. Ramp from low intensity in intervals of 0.10 mA. Fast Settle Enabled. HEADSCREW GROUND IN. Picoscope and output ground DISCONNECTED. 5 kHz Sampling
+
+
+
+At the end, Rat died and very rapid breathing. 
+
+
+Mark down if the light cable inside cage, and out. 

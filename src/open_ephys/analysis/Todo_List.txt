@@ -1,0 +1,12 @@
+- debug surgical procedure and tunneling 
+
+- look into differential subtraction as a plugin
+
+- Yahriel start learning David’s software
+
+- talk to David next week about modifying his code to work with 4100, adding audio streaming of signal
+
+- rework tunneling procedure with trocar
+
+- for next recording session: bone screw ground, bone screw eeg
+ 
