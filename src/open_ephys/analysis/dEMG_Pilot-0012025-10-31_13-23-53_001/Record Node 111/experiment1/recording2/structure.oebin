@@ -1,0 +1,81 @@
+{
+    "GUI version": "0.6.7",
+    "continuous": [
+      {
+        "folder_name": "Acquisition_Board-100.Rhythm Data/",
+        "sample_rate": 25000.0,
+        "source_processor_name": "Acquisition Board",
+        "source_processor_id": 100,
+        "stream_name": "Rhythm Data",
+        "recorded_processor": "RAW",
+        "recorded_processor_id": 111,
+        "num_channels": 5,
+        "channels": [
+          {
+            "channel_name": "CH1",
+            "description": "Headstage channel from a Rhythm FPGA device",
+            "identifier": "",
+            "history": "Acquisition Board -> Rec Controller Output -> ZMQ Interface -> Channel Map -> RAW",
+            "bit_volts": 0.1949999928474426,
+            "units": "uV"
+          },
+          {
+            "channel_name": "CH5",
+            "description": "Headstage channel from a Rhythm FPGA device",
+            "identifier": "",
+            "history": "Acquisition Board -> Rec Controller Output -> ZMQ Interface -> Channel Map -> RAW",
+            "bit_volts": 0.1949999928474426,
+            "units": "uV"
+          },
+          {
+            "channel_name": "CH7",
+            "description": "Headstage channel from a Rhythm FPGA device",
+            "identifier": "",
+            "history": "Acquisition Board -> Rec Controller Output -> ZMQ Interface -> Channel Map -> RAW",
+            "bit_volts": 0.1949999928474426,
+            "units": "uV"
+          },
+          {
+            "channel_name": "CH11",
+            "description": "Headstage channel from a Rhythm FPGA device",
+            "identifier": "",
+            "history": "Acquisition Board -> Rec Controller Output -> ZMQ Interface -> Channel Map -> RAW",
+            "bit_volts": 0.1949999928474426,
+            "units": "uV"
+          },
+          {
+            "channel_name": "ADC1",
+            "description": "ADC input channel from a Rhythm FPGA device",
+            "identifier": "",
+            "history": "Acquisition Board -> Rec Controller Output -> ZMQ Interface -> Channel Map -> RAW",
+            "bit_volts": 0.000152587890625,
+            "units": "V"
+          }
+        ]
+      }
+    ],
+    "events": [
+      {
+        "folder_name": "Acquisition_Board-100.Rhythm Data/TTL/",
+        "channel_name": "Rhythm FPGA TTL Input",
+        "description": "Events on digital input lines of a Rhythm FPGA device",
+        "identifier": "rhythm-fpga-device.events",
+        "sample_rate": 25000.0,
+        "type": "int16",
+        "source_processor": "Acquisition Board",
+        "stream_name": "Rhythm Data",
+        "initial_state": 0
+      },
+      {
+        "folder_name": "MessageCenter/",
+        "channel_name": "Messages",
+        "description": "Broadcasts messages from the MessageCenter",
+        "identifier": "messagecenter.events",
+        "sample_rate": 25000.0,
+        "type": "string",
+        "source_processor": "Message Center",
+        "stream_name": "Rhythm Data"
+      }
+    ],
+    "spikes": []
+  }
