@@ -7,6 +7,20 @@ from scipy.signal import butter, filtfilt, lfilter
 from collections import defaultdict
 import scipy.stats as stats
 
+from scipy.signal import resample_poly
+
+def downsample_signal(signal, original_rate, target_rate):
+    """
+    Downsample a 1D signal from original_rate to target_rate
+    using polyphase filtering (resample_poly).
+    """
+    # Compute up/down ratios
+    up = target_rate
+    down = original_rate
+    return resample_poly(signal, up, down)
+
+
+
 def scan_experiment_structure(session_dir, record_node_name="Record Node 106"):
     node_path = os.path.join(session_dir, record_node_name)
 
@@ -113,6 +127,15 @@ differential_filt = lfilter(b, a, differential)
 differential_abs = np.abs(differential_filt)
 differential_emg = differential_abs
 
+# ==== Downsample from 25 kHz → 2 kHz ====
+target_rate = 2000  # desired sampling rate
+differential_emg_ds = downsample_signal(differential_emg, sample_rate, target_rate)
+
+# Also downsample timestamps
+timestamps_ds = downsample_signal(timestamps, sample_rate, target_rate)
+
+
+
 
 #differential_filt = data[:,3] #Only if online filtered
 
@@ -126,5 +149,16 @@ plt.ylabel("Amplitude (μV)")
 plt.grid(True)
 plt.legend()
 #plt.ylim(top=5)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(15, 8))
+plt.plot(timestamps_ds, differential_ds, label="Downsampled Filtered EMG (2 kHz)")
+plt.axhline(0, color='black', linestyle='--', linewidth=0.5)
+plt.title(f"{directory}, {experiment_name}, {recording_name}, Downsampled EMG (25kHz→2kHz)")
+plt.xlabel("Time (s)")
+plt.ylabel("Amplitude (μV)")
+plt.grid(True)
+plt.legend()
 plt.tight_layout()
 plt.show()

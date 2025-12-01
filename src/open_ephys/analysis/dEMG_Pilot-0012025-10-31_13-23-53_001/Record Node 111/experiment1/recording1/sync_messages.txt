@@ -1,2 +1,0 @@
-Software Time (milliseconds since midnight Jan 1st 1970 UTC): 1761935033407
-Start Time for OE FPGA Acquisition Board (100) - Rhythm Data @ 25000 Hz: 47513039
