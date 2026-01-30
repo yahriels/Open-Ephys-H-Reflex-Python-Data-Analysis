@@ -1,12 +1,394 @@
-- debug surgical procedure and tunneling 
 
-- look into differential subtraction as a plugin
+-----------------
 
-- Yahriel start learning David’s software
+Query: "Give me a pseudocode or overview of how the trials are set-up and binning is set-up and done in the emg_characterization_stage, since I want to implement these specific features into another separate data analysis code"
 
-- talk to David next week about modifying his code to work with 4100, adding audio streaming of signal
+Here's a comprehensive pseudocode overview of the trial setup and binning process for implementation in separate analysis code:
 
-- rework tunneling procedure with trocar
+Complete EMG Characterization Trial & Binning System
+Constants & Configuration
 
-- for next recording session: bone screw ground, bone screw eeg
- 
+// Sampling parameters
+SAMPLE_RATE = 5000  // Hz
+
+// Binning parameters
+BIN_DURATION_MS = 50
+BIN_SAMPLE_COUNT = (SAMPLE_RATE / 1000) * BIN_DURATION_MS  // 250 samples per bin
+
+// Trial initiation parameters
+TRIAL_DURATION_MIN_MS = 2200
+TRIAL_DURATION_MAX_MS = 2700
+TRIAL_INITIATION_MIN_UV = 5.0
+TRIAL_INITIATION_MAX_UV = 300.0
+Data Structures
+
+CLASS TrialState:
+    is_trial_set_up: boolean = FALSE
+    monitored_signal_duration_ms: integer
+    monitored_signal_sample_count: integer
+    bin_count: integer
+    current_trial_sample_count: integer = 0
+    current_session_sample_count: integer = 0
+    
+    // Data arrays (sliding windows)
+    monitored_signal: float array
+    monitored_signal_open_ephys_millis: uint64 array
+    monitored_signal_open_ephys_sample_ids: uint64 array
+    bins: float array
+    
+    // Results
+    trial_means: list of floats = []
+    completed_trials: list of Trial objects = []
+END CLASS
+
+CLASS Trial:
+    trial_end_datetime: datetime
+    trial_start_index: integer
+    trial_start_open_ephys_millis: uint64
+    trial_start_open_ephys_sample_id: uint64
+    grand_mean: float
+    bins: float array
+    monitored_signal: float array
+END CLASS
+Main Algorithm
+
+// ============================================
+// INITIALIZATION
+// ============================================
+FUNCTION initialize_session():
+    state = new TrialState()
+    random_generator = new Random(current_timestamp)
+    return state, random_generator
+END FUNCTION
+
+
+// ============================================
+// TRIAL SETUP
+// ============================================
+FUNCTION setup_new_trial(state, random_generator):
+    // 1. Choose random monitoring duration
+    dur_ms = random_generator.randint(TRIAL_DURATION_MIN_MS, TRIAL_DURATION_MAX_MS)
+    
+    // 2. Round to nearest 50ms to ensure whole number of bins
+    dur_ms = round_to_nearest_multiple(dur_ms, 50)
+    
+    // 3. Calculate parameters
+    state.monitored_signal_duration_ms = dur_ms
+    state.monitored_signal_sample_count = (dur_ms / 1000.0) * SAMPLE_RATE
+    state.bin_count = dur_ms / BIN_DURATION_MS
+    
+    // 4. Initialize/resize arrays
+    state.monitored_signal = zeros(state.monitored_signal_sample_count)
+    state.bins = zeros(state.bin_count)
+    state.monitored_signal_open_ephys_millis = zeros(state.monitored_signal_sample_count)
+    state.monitored_signal_open_ephys_sample_ids = zeros(state.monitored_signal_sample_count)
+    
+    // 5. Reset trial counter (NOT session counter)
+    state.current_trial_sample_count = 0
+    state.is_trial_set_up = TRUE
+    
+    PRINT "Trial set up: duration = " + dur_ms + "ms, bins = " + state.bin_count
+END FUNCTION
+
+
+// ============================================
+// HELPER: ROUND TO NEAREST MULTIPLE
+// ============================================
+FUNCTION round_to_nearest_multiple(value, base):
+    return base * round(value / base)
+END FUNCTION
+
+
+// ============================================
+// MAIN PROCESSING LOOP
+// ============================================
+FUNCTION process_data_frame(state, data_frame):
+    // data_frame contains:
+    //   - abs_data_block: array of float (absolute difference between EMG channels)
+    //   - timestamp: uint64 (Open Ephys millisecond timestamp)
+    //   - sample_id: uint64 (Open Ephys sample ID for first sample in block)
+    
+    // 1. Check if trial needs setup
+    IF NOT state.is_trial_set_up:
+        setup_new_trial(state, random_generator)
+    
+    // 2. Get incoming data
+    incoming_data = data_frame.abs_data_block  // This is abs(EMG_channel2 - EMG_channel1)
+    data_block_len = length(incoming_data)
+    
+    // 3. Create matching timestamp and sample ID arrays
+    incoming_timestamps = fill_array(data_block_len, data_frame.timestamp)
+    incoming_sample_ids = create_range(data_frame.sample_id, 
+                                       data_frame.sample_id + data_block_len)
+    
+    // 4. Update counters
+    state.current_session_sample_count += data_block_len
+    state.current_trial_sample_count += data_block_len
+    
+    // 5. SLIDING WINDOW: Add new data
+    state.monitored_signal = concatenate(state.monitored_signal, incoming_data)
+    state.monitored_signal_open_ephys_millis = concatenate(
+        state.monitored_signal_open_ephys_millis, 
+        incoming_timestamps
+    )
+    state.monitored_signal_open_ephys_sample_ids = concatenate(
+        state.monitored_signal_open_ephys_sample_ids, 
+        incoming_sample_ids
+    )
+    
+    // 6. SLIDING WINDOW: Remove old data to maintain fixed window size
+    elements_to_remove = length(state.monitored_signal) - state.monitored_signal_sample_count
+    IF elements_to_remove > 0:
+        state.monitored_signal = state.monitored_signal[elements_to_remove:]
+        state.monitored_signal_open_ephys_millis = 
+            state.monitored_signal_open_ephys_millis[elements_to_remove:]
+        state.monitored_signal_open_ephys_sample_ids = 
+            state.monitored_signal_open_ephys_sample_ids[elements_to_remove:]
+    END IF
+    
+    // 7. BINNING: Calculate mean for each 50ms bin
+    bin_grand_mean = calculate_bins(state)
+    
+    // 8. CHECK TRIAL INITIATION CRITERIA
+    trial_is_ready = (state.current_trial_sample_count >= state.monitored_signal_sample_count)
+    mean_in_range = (bin_grand_mean >= TRIAL_INITIATION_MIN_UV AND 
+                     bin_grand_mean <= TRIAL_INITIATION_MAX_UV)
+    
+    IF trial_is_ready AND mean_in_range:
+        // TRIAL INITIATED!
+        complete_trial(state, bin_grand_mean)
+    END IF
+    
+    // 9. Continue to next data frame
+    return state
+END FUNCTION
+
+
+// ============================================
+// BINNING CALCULATION
+// ============================================
+FUNCTION calculate_bins(state):
+    // Calculate mean for each bin
+    FOR bin_index FROM 0 TO state.bin_count - 1:
+        // Determine sample range for this bin
+        bin_start = BIN_SAMPLE_COUNT * bin_index
+        bin_end = BIN_SAMPLE_COUNT * (bin_index + 1)
+        
+        // Handle edge case: last bin might be incomplete
+        IF bin_end > length(state.monitored_signal):
+            bin_end = length(state.monitored_signal)
+        END IF
+        
+        // Calculate mean of samples in this bin
+        state.bins[bin_index] = mean(state.monitored_signal[bin_start:bin_end])
+    END FOR
+    
+    // Calculate grand mean (mean of all bin means)
+    bin_grand_mean = mean(state.bins)
+    
+    return bin_grand_mean
+END FUNCTION
+
+
+// ============================================
+// TRIAL COMPLETION
+// ============================================
+FUNCTION complete_trial(state, bin_grand_mean):
+    // Calculate trial start index in full session data
+    trial_start_index = state.current_session_sample_count - state.current_trial_sample_count
+    
+    // Get Open Ephys sync info from first sample in monitored signal
+    open_ephys_millis = state.monitored_signal_open_ephys_millis[0]
+    open_ephys_sample_id = state.monitored_signal_open_ephys_sample_ids[0]
+    
+    // Create trial object
+    trial = new Trial(
+        trial_end_datetime = current_datetime(),
+        trial_start_index = trial_start_index,
+        trial_start_open_ephys_millis = open_ephys_millis,
+        trial_start_open_ephys_sample_id = open_ephys_sample_id,
+        grand_mean = bin_grand_mean,
+        bins = copy(state.bins),  // Make copy of current bins
+        monitored_signal = copy(state.monitored_signal)  // Make copy of current signal
+    )
+    
+    // Store trial
+    state.trial_means.append(bin_grand_mean)
+    state.completed_trials.append(trial)
+    
+    PRINT "Trial " + length(state.trial_means) + " completed: grand_mean = " + bin_grand_mean
+    
+    // Reset for next trial
+    state.is_trial_set_up = FALSE
+    state.current_trial_sample_count = 0
+    
+    // Note: DO NOT reset current_session_sample_count - it continues across trials
+END FUNCTION
+Example Usage
+
+// ============================================
+// MAIN EXECUTION
+// ============================================
+FUNCTION run_emg_characterization_analysis():
+    // Initialize
+    state, random_gen = initialize_session()
+    
+    // Process streaming data
+    WHILE data_is_streaming:
+        // Get next data frame from EMG system
+        data_frame = get_next_emg_data_frame()
+        
+        // Process it
+        process_data_frame(state, data_frame)
+    END WHILE
+    
+    // When done, you have:
+    // - state.completed_trials: list of all completed trials
+    // - state.trial_means: list of grand means for all trials
+    
+    return state.completed_trials
+END FUNCTION
+Complete Example with Numbers
+
+EXAMPLE TRIAL:
+    1. setup_new_trial() chooses duration = 2250ms
+       - monitored_signal_sample_count = 11,250 samples
+       - bin_count = 45 bins
+       - Initialize arrays of size [11,250] and [45]
+    
+    2. Data streams in blocks (e.g., 100 samples at a time)
+       - Block 1: 100 samples added → monitored_signal = [0...100]
+       - Block 2: 100 samples added → monitored_signal = [0...200]
+       - ...
+       - Block 113: 100 samples added → monitored_signal = [0...11,300]
+         → Remove first 50 samples → monitored_signal = [50...11,300] (size 11,250)
+    
+    3. After each block, calculate bins:
+       Bin 0:  mean(samples[0:250])     = 45.2 µV
+       Bin 1:  mean(samples[250:500])   = 48.1 µV
+       Bin 2:  mean(samples[500:750])   = 43.7 µV
+       ...
+       Bin 44: mean(samples[11000:11250]) = 46.8 µV
+       
+       Grand Mean = mean([45.2, 48.1, 43.7, ..., 46.8]) = 46.3 µV
+    
+    4. Check criteria:
+       - current_trial_sample_count (11,250) >= monitored_signal_sample_count (11,250) ✓
+       - 5.0 <= grand_mean (46.3) <= 300.0 ✓
+       → TRIAL INITIATED!
+    
+    5. Save trial with:
+       - grand_mean = 46.3
+       - bins = [45.2, 48.1, 43.7, ..., 46.8]
+       - monitored_signal = all 11,250 samples
+       - metadata (timestamps, indices)
+    
+    6. Reset and setup next trial (might be different duration, e.g., 2300ms)
+Key Implementation Notes
+Sliding Window: Always maintain exact window size by removing old data
+Random Duration: Each trial has different monitoring duration (2200-2700ms)
+Rounding: Always round to 50ms multiple to ensure whole bins
+Two Counters:
+current_trial_sample_count: Reset each trial
+current_session_sample_count: Never reset, tracks position in full session
+Trial Triggers: Both conditions must be met:
+Window is full (enough samples collected)
+Grand mean is in acceptable range (5-300 µV)
+Data to Save: Copy the arrays when trial completes, as they'll be overwritten
+This should give you everything needed to implement the trial and binning system in your separate analysis code!
+
+
+-----------------
+Query: "Build upon the most recent response, but I would like to incorporate a change or added feature. For this code, the data that will be imported will be mixed with MEP (motor evoked potentials) marked by Event Markers (TTL lines) that are timestamped as a separate data channel separate from the EMG data. When the trials initiate and the binning takes place, I want the code to sweep through the trials and the recording sessions, but skip over the Event Markers or discard data from 10 ms before the Event Marker timestamp/sample number to 50 ms after the Event Marker timestamp/sample number, and then proceed with the sweeping thorugh the trials and session data. What is the best way to implement this "throw out" feature.  Give me a pseudocode or overview of how the trials would be set-up and binning is set-up, and how the throw out feature to take out data surrounding Event Markers would be  done in the emg_characterization_stage, since I want to implement these specific features into another separate data analysis code"
+
+
+
+Finding: Great idea — adding a short “throwout” window around Event Markers reduces MEP contamination of EMG-characterization bins. Below is a compact design + pseudocode that fits into emg_characterization_stage.py (key locations: process(), _setup_new_trial(), _save_trial()), using efficient NumPy masking and a small validity check so markers don’t produce spurious trials. ✅
+
+Goals & design choices 💡
+Throw Out window: discard 10 ms before → 50 ms after each Event Marker (configurable).
+Marker source: Event channel is a separate TTL channel in the incoming data_frame (timestamped/sample-id aligned).
+Throw Out approach: create a boolean mask over the current monitored buffer marking valid samples; when computing per-bin means use only valid samples (vectorized NumPy).
+Robustness: require a minimum fraction of valid samples in the trial buffer (e.g., min_valid_fraction = 0.7) or reject the trial as invalid.
+Bins with no valid samples: treat bin mean as NaN; compute grand mean across non-NaN bins (or use sample-weighted mean).
+Persistence: save both original and blanked bin/signal or annotate saved trial with throw out info.
+
+Parameters (suggested) 🔧
+blank_pre_ms = 10
+blank_post_ms = 50
+min_valid_fraction = 0.7 (i.e., at least 70% of expected samples must remain unblanked)
+Convert ms → samples: samples = ceil(ms * SAMPLE_RATE / 1000).
+
+Pseudocode — integrated into existing flow ✍️
+Setup trial (unchanged)
+
+_setup_new_trial() chooses duration, allocates:
+monitored_signal (len = N)
+monitored_signal_open_ephys_sample_ids (parallel array)
+bins (len = bin_count)
+On each incoming frame in process(data_frame):
+
+Append abs_data_block and sample ids/times as now.
+
+Detect event markers in data_frame (example):
+
+If marker_channel exists in data_frame.channel_data_blocks:
+marker_indices_in_block = np.where(marker_channel.data != 0)[0]
+For each index i: compute marker_sample_id = data_block_open_ephys_sample_id[i]
+Append these marker_sample_id values to a small list recent_markers (absolute sample ids)
+Trim recent_markers to match monitored buffer (remove markers older than earliest sample id kept) — keep absolute ids.
+
+Build validity mask for current monitored buffer:
+
+mask = np.ones(len(monitored_signal), dtype=bool)
+For each marker_sample_id in recent_markers:
+start = marker_sample_id - ceil(blank_pre_ms * SAMPLE_RATE / 1000)
+end = marker_sample_id + ceil(blank_post_ms * SAMPLE_RATE / 1000)
+mask &= ~((monitored_sample_ids >= start) & (monitored_sample_ids <= end))
+Compute bins using mask:
+
+For each bin_index:
+s = bin_start, e = bin_end (use existing BIN_SAMPLE_COUNT bounds, cap to len)
+segment = monitored_signal[s:e]
+segment_mask = mask[s:e]
+If segment_mask.any(): bins[bin_index] = np.mean(segment[segment_mask]) else bins[bin_index] = np.nan
+Compute valid_sample_count = mask.sum()
+valid_fraction = valid_sample_count / monitored_signal_sample_count
+Trial initiation check (modified):
+
+require current_trial_sample_count >= monitored_signal_sample_count
+require valid_fraction >= min_valid_fraction (else treat trial invalid/reset)
+compute bin_grand_mean = np.nanmean(bins) (ignores bins with NaN)
+if bin_grand_mean within min/max thresholds → declare trial initiated (as before)
+else continue streaming
+When saving trial (_save_trial):
+
+Save bins that were used (with NaNs) and the raw monitored_signal and/or the mask (or save a masked copy monitored_signal_blank = monitored_signal.copy(); monitored_signal_blank[~mask] = np.nan).
+Record blank_pre_ms, blank_post_ms, and markers (sample IDs or timestamps) to the trial metadata so later offline analysis knows what was blanked.
+Edge cases & recommendations ⚠️
+If many markers occur such that valid_fraction < threshold, skip/mark trial as invalid and start a new trial (avoid false triggers).
+When a bin contains no valid samples, setting its value to NaN and using np.nanmean avoids distorting the grand mean. Consider using np.average(bins, weights=bin_sample_counts) if you want sample-count weighting.
+Use vectorized boolean operations rather than Python loops for performance.
+Keep markers in absolute sample-id space to avoid having to re-index when the monitored buffer slides/rolls.
+Minimal numpy implementation sketch (conceptual)
+{
+# compute mask
+mask = np.ones(N, dtype=bool)
+for m in markers_absolute_sample_ids:
+    start = m - pre_samples
+    end = m + post_samples
+    mask &= ~((monitored_ids >= start) & (monitored_ids <= end))
+
+# bin means using mask
+for i in range(bin_count):
+    s = i*BIN_SAMPLE_COUNT
+    e = min((i+1)*BIN_SAMPLE_COUNT, N)
+    seg = monitored_signal[s:e]
+    seg_mask = mask[s:e]
+    bins[i] = np.nan if not seg_mask.any() else seg[seg_mask].mean()
+
+# trial decision
+valid_frac = mask.sum() / expected_sample_count
+if valid_frac >= min_valid_fraction and np.nanmean(bins) in thresholds:
+    save_trial(..., bins=bins, mask=mask)
+}
