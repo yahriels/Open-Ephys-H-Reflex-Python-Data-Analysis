@@ -151,6 +151,53 @@ def build_blank_mask(timestamps, trigger_times, sample_rate,
 # ANALYSIS UTILITIES
 # ====================================================================
 
+def autoscale_ylim(*signals, percentile_lo=1, percentile_hi=99, pad_frac=0.05, symmetric=True):
+    """Return (ymin, ymax) for a plot based on the percentile range of one or more signals.
+
+    Pass multiple signals to compute a shared limit across all of them (useful for
+    comparing traces on the same scale). Uses percentile clipping to avoid outliers
+    dominating the scale.
+
+    Parameters
+    ----------
+    *signals : array-like
+        One or more signal arrays (e.g. differential_1mm_emg, differential_2mm_emg).
+    percentile_lo : float
+        Lower percentile for the min bound (default 1).
+    percentile_hi : float
+        Upper percentile for the max bound (default 99).
+    pad_frac : float
+        Fractional padding added to the computed span (default 0.05 = 5%).
+    symmetric : bool
+        If True (default), returns (-abs_max, abs_max) — appropriate for zero-centred
+        bipolar signals like filtered differential EMG. If False, uses the raw
+        percentile bounds directly.
+
+    Returns
+    -------
+    (ymin, ymax) tuple suitable for plt.ylim() or ax.set_ylim().
+
+    Example
+    -------
+    ylim = autoscale_ylim(sig1, sig2, sig3)
+    plt.ylim(ylim)
+    """
+    all_data = np.concatenate([np.asarray(s).ravel() for s in signals])
+    p_lo = np.percentile(all_data, percentile_lo)
+    p_hi = np.percentile(all_data, percentile_hi)
+    if symmetric:
+        abs_max = max(abs(p_lo), abs(p_hi))
+        if abs_max <= 0:
+            abs_max = 1.0
+        pad = pad_frac * (2 * abs_max)
+        return (-abs_max - pad, abs_max + pad)
+    else:
+        span = p_hi - p_lo
+        if span <= 0:
+            span = max(1.0, abs(p_hi) * 0.1)
+        return (p_lo - pad_frac * span*20, p_hi + pad_frac * span*20)
+
+
 def round_to_nearest_multiple(x: int, base: int = BIN_DURATION_MS) -> int:
     return int(base * round(x / base))
 
