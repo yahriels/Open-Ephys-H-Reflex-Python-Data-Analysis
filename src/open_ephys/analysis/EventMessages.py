@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from open_ephys.analysis import Session
 
 # Load the session
-directory = 'ABATE-008_2025-05-14_14-34-09_001'
+directory = 'HRPilot-12_Chronic_Test12026-03-13_11-40-22_001'
 session = Session(directory)
 
 print('Pass Initial Test, Moving on to Loading Session...\n')
