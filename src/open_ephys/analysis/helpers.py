@@ -62,8 +62,8 @@ BLOCK_EMG_CHAR_TRIAL = 2
 BLOCK_MH_TRIAL       = 3
 
 # Low-level type maps (mirrors FileIO_Helpers from hreflex_txbdc)
-_HRS_TYPE_FMT  = {'int32': 'i', 'uint64': 'Q', 'uint8': 'B', 'float32': 'f', 'float64': 'd'}
-_HRS_TYPE_SIZE = {'int32': 4,   'uint64': 8,   'uint8': 1,   'float32': 4,   'float64': 8}
+_HRS_TYPE_FMT  = {'int8': 'b', 'int32': 'i', 'uint64': 'Q', 'uint8': 'B', 'float32': 'f', 'float64': 'd'}
+_HRS_TYPE_SIZE = {'int8': 1,  'int32': 4,   'uint64': 8,   'uint8': 1,   'float32': 4,   'float64': 8}
 
 
 # ====================================================================
@@ -156,6 +156,17 @@ class MhRecTrial:
     stimulation_amplitude_ma: float = 0.0
     trial_data: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     sync_data: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    # --- file_version >= 2 fields ---
+    trigger_wall_time_ms: int = 0
+    onset_sample_index: int = -1       # -1 = not found (fallback used)
+    onset_detected: int = 0            # 1 = real crossing, 0 = fallback
+    stim_end_sample_index: int = -1    # -1 = not found within recording window
+    stim_duration_samples: int = 0
+    stim_duration_ms: float = 0.0
+    sync_peak_voltage: float = 0.0     # max ADC in search window
+    n_pre_trigger_frames_discarded: int = 0
+    frame_received_timestamps_ms: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.uint64))
+    first_post_trigger_frame_sample_id: int = 0
 
 
 # ====================================================================
@@ -186,6 +197,17 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0) -> MhRecTrial:
     t.trial_data = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
     if file_version >= 1:
         t.sync_data = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    if file_version >= 2:
+        t.trigger_wall_time_ms              = hrs_read_val(fid, 'uint64')
+        t.onset_sample_index                = hrs_read_val(fid, 'int32')
+        t.onset_detected                    = hrs_read_val(fid, 'int8')
+        t.stim_end_sample_index             = hrs_read_val(fid, 'int32')
+        t.stim_duration_samples             = hrs_read_val(fid, 'int32')
+        t.stim_duration_ms                  = hrs_read_val(fid, 'float32')
+        t.sync_peak_voltage                 = hrs_read_val(fid, 'float32')
+        t.n_pre_trigger_frames_discarded    = hrs_read_val(fid, 'int32')
+        t.frame_received_timestamps_ms      = np.array(hrs_read_array(fid, 'uint64'), dtype=np.uint64)
+        t.first_post_trigger_frame_sample_id = hrs_read_val(fid, 'uint64')
     return t
 
 
