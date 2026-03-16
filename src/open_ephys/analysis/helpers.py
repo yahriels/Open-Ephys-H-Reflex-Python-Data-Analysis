@@ -10,10 +10,13 @@ trial initiation simulation engine used by both:
 import os
 import re
 import time
+import struct
+import glob as globmod
 import numpy as np
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import BinaryIO, List, Optional
 from random import Random
 from scipy.signal import butter, lfilter
 
@@ -39,6 +42,326 @@ MINIMUM_INTERTRIAL_INTERVAL_MS = 10000
 TRIAL_RECORDING_DURATION_MS = 100
 SIMULATION_BLOCK_SIZE = 50
 SIMULATION_RANDOM_SEED = 42
+
+# ====================================================================
+# HRS FILE FORMAT CONSTANTS
+# ====================================================================
+
+SAMPLE_RATE = 5000.0                     # Hz
+BIN_SAMPLES = int(BIN_DURATION_MS * SAMPLE_RATE / 1000)    # 250 samples
+TRIAL_RECORD_MS = 100                    # ms post-stim recording window
+TRIAL_RECORD_SAMPLES = int(TRIAL_RECORD_MS * SAMPLE_RATE / 1000)  # 500 samples
+MS_PER_SAMPLE = 1000.0 / SAMPLE_RATE    # 0.2 ms/sample
+
+STIM_ONSET_THRESHOLD = 1.0  # V -- ADC level marking stim onset rising edge
+STIM_END_THRESHOLD   = 0.6  # V -- ADC level below which stim pulse has ended
+
+# Block IDs (mirrors HReflexDataFileBlockIds)
+BLOCK_EMG_DATA       = 1
+BLOCK_EMG_CHAR_TRIAL = 2
+BLOCK_MH_TRIAL       = 3
+
+# Low-level type maps (mirrors FileIO_Helpers from hreflex_txbdc)
+_HRS_TYPE_FMT  = {'int32': 'i', 'uint64': 'Q', 'uint8': 'B', 'float32': 'f', 'float64': 'd'}
+_HRS_TYPE_SIZE = {'int32': 4,   'uint64': 8,   'uint8': 1,   'float32': 4,   'float64': 8}
+
+
+# ====================================================================
+# HRS BINARY READER PRIMITIVES
+# ====================================================================
+
+def hrs_read_val(fid: BinaryIO, dtype: str):
+    raw = fid.read(_HRS_TYPE_SIZE[dtype])
+    if len(raw) < _HRS_TYPE_SIZE[dtype]:
+        raise EOFError(f"Unexpected end of file reading {dtype}")
+    return struct.unpack(_HRS_TYPE_FMT[dtype], raw)[0]
+
+
+def hrs_read_string(fid: BinaryIO) -> str:
+    n = hrs_read_val(fid, 'int32')
+    return fid.read(n).decode('utf-8')
+
+
+def hrs_read_datetime(fid: BinaryIO) -> datetime:
+    datenum = hrs_read_val(fid, 'float64')
+    days = datenum % 1
+    return datetime.fromordinal(int(datenum)) + timedelta(days=days) - timedelta(days=366)
+
+
+def hrs_read_array(fid: BinaryIO, dtype: str):
+    n = hrs_read_val(fid, 'int32')
+    fmt = _HRS_TYPE_FMT[dtype]
+    size = _HRS_TYPE_SIZE[dtype]
+    raw = fid.read(n * size)
+    return list(struct.unpack(f'{n}{fmt}', raw))
+
+
+# ====================================================================
+# HRS DATA CLASSES
+# ====================================================================
+
+@dataclass
+class EmgCharHeader:
+    file_version: int = 0
+    subject_id: str = ""
+    session_datetime: datetime = None
+    stage_name: str = ""
+    stage_description: str = ""
+    stage_type: int = 0
+    trial_initiation_uv_min: float = 0.0
+    trial_initiation_uv_max: float = 0.0
+    trial_initiation_phase_min_ms: int = 0
+    trial_initiation_phase_max_ms: int = 0
+    bin_duration_ms: int = 0
+
+
+@dataclass
+class EmgCharTrial:
+    trial_end_datetime: datetime = None
+    trial_start_index: int = 0
+    trial_start_open_ephys_millis: int = 0
+    trial_start_open_ephys_sample_id: int = 0
+    grand_mean: float = 0.0
+    bins: list = field(default_factory=list)
+    monitored_signal: list = field(default_factory=list)
+
+
+@dataclass
+class EmgDataBlock:
+    ts_open_ephys_sent: int = 0
+    ts_python_received: int = 0
+    ts_background_emitted: int = 0
+    channel_names: list = field(default_factory=list)
+    raw_channels: list = field(default_factory=list)
+    diff: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    filtered: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    abs_val: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+
+
+@dataclass
+class MhRecHeader:
+    file_version: int = 0
+    subject_id: str = ""
+    session_start_time: datetime = None
+    stage_name: str = ""
+    stage_description: str = ""
+    stage_type: int = 0
+
+
+@dataclass
+class MhRecTrial:
+    start_time: datetime = None
+    min_initiation_threshold: float = 0.0
+    max_initiation_threshold: float = 0.0
+    stimulation_amplitude_ma: float = 0.0
+    trial_data: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    sync_data: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+
+
+# ====================================================================
+# HRS FILE READERS
+# ====================================================================
+
+def _read_emg_data_block(fid: BinaryIO) -> EmgDataBlock:
+    block = EmgDataBlock()
+    block.ts_open_ephys_sent     = hrs_read_val(fid, 'uint64')
+    block.ts_python_received     = hrs_read_val(fid, 'uint64')
+    block.ts_background_emitted  = hrs_read_val(fid, 'uint64')
+    n_names = hrs_read_val(fid, 'uint8')
+    block.channel_names = [hrs_read_string(fid) for _ in range(n_names)]
+    n_ch = hrs_read_val(fid, 'uint8')
+    block.raw_channels = [np.array(hrs_read_array(fid, 'float32'), dtype=np.float32) for _ in range(n_ch)]
+    block.diff     = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    block.filtered = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    block.abs_val  = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    return block
+
+
+def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0) -> MhRecTrial:
+    t = MhRecTrial()
+    t.start_time                = hrs_read_datetime(fid)
+    t.min_initiation_threshold  = hrs_read_val(fid, 'float32')
+    t.max_initiation_threshold  = hrs_read_val(fid, 'float32')
+    t.stimulation_amplitude_ma  = hrs_read_val(fid, 'float32')
+    t.trial_data = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    if file_version >= 1:
+        t.sync_data = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    return t
+
+
+def read_hrs1(filepath: str):
+    """Read an .hrs1 (EMG Characterization) data file.
+
+    Returns (header, trials, emg_blocks).
+    """
+    header = EmgCharHeader()
+    trials, emg_blocks = [], []
+
+    with open(filepath, 'rb') as fid:
+        header.file_version                  = hrs_read_val(fid, 'int32')
+        header.subject_id                    = hrs_read_string(fid)
+        header.session_datetime              = hrs_read_datetime(fid)
+        header.stage_name                    = hrs_read_string(fid)
+        header.stage_description             = hrs_read_string(fid)
+        header.stage_type                    = hrs_read_val(fid, 'int32')
+        header.trial_initiation_uv_min       = hrs_read_val(fid, 'float32')
+        header.trial_initiation_uv_max       = hrs_read_val(fid, 'float32')
+        header.trial_initiation_phase_min_ms = hrs_read_val(fid, 'int32')
+        header.trial_initiation_phase_max_ms = hrs_read_val(fid, 'int32')
+        header.bin_duration_ms               = hrs_read_val(fid, 'int32')
+
+        while True:
+            chunk = fid.read(4)
+            if len(chunk) < 4:
+                break
+            block_id = struct.unpack('i', chunk)[0]
+            if block_id == BLOCK_EMG_CHAR_TRIAL:
+                t = EmgCharTrial()
+                t.trial_end_datetime               = hrs_read_datetime(fid)
+                t.trial_start_index                = hrs_read_val(fid, 'uint64')
+                t.trial_start_open_ephys_millis    = hrs_read_val(fid, 'uint64')
+                t.trial_start_open_ephys_sample_id = hrs_read_val(fid, 'uint64')
+                t.grand_mean        = hrs_read_val(fid, 'float32')
+                t.bins              = hrs_read_array(fid, 'float32')
+                t.monitored_signal  = hrs_read_array(fid, 'float32')
+                trials.append(t)
+            elif block_id == BLOCK_EMG_DATA:
+                emg_blocks.append(_read_emg_data_block(fid))
+
+    return header, trials, emg_blocks
+
+
+def read_hrs2(filepath: str):
+    """Read an .hrs2 (MH Recruitment Curve) data file.
+
+    Notes:
+    - file_version 0: trial blocks contain trial_data only (no sync_data).
+    - file_version 1+: trial blocks also contain sync_data (ADC sync line).
+    - Known bug: MhRecruitmentCurveTrial.save_to_file writes block_id=1 instead
+      of block_id=3. This reader disambiguates by peeking at the first 8 bytes
+      (MATLAB datenum float64 ~730000-750000 vs Unix millis uint64 ~1.7e12).
+
+    Returns (header, trials, emg_blocks).
+    """
+    header = MhRecHeader()
+    trials, emg_blocks = [], []
+
+    with open(filepath, 'rb') as fid:
+        header.file_version      = hrs_read_val(fid, 'int32')
+        header.subject_id        = hrs_read_string(fid)
+        header.session_start_time = hrs_read_datetime(fid)
+        header.stage_name        = hrs_read_string(fid)
+        header.stage_description = hrs_read_string(fid)
+        header.stage_type        = hrs_read_val(fid, 'int32')
+
+        while True:
+            chunk = fid.read(4)
+            if len(chunk) < 4:
+                break
+            block_id = struct.unpack('i', chunk)[0]
+
+            if block_id == BLOCK_MH_TRIAL:
+                trials.append(_read_mh_trial_block(fid, header.file_version))
+            elif block_id == BLOCK_EMG_DATA:
+                # Could be a trial written with buggy block_id=1 -- peek to disambiguate.
+                pos = fid.tell()
+                peek = fid.read(8)
+                fid.seek(pos)
+                if len(peek) < 8:
+                    break
+                peek_float = struct.unpack('d', peek)[0]
+                if 730000 < peek_float < 750000:  # MATLAB datenum range for 2020-2030
+                    trials.append(_read_mh_trial_block(fid, header.file_version))
+                else:
+                    emg_blocks.append(_read_emg_data_block(fid))
+            else:
+                print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
+                break
+
+    return header, trials, emg_blocks
+
+
+def find_hrs_files(directory: str):
+    """Auto-detect the .hrs1 and .hrs2 files in a recording directory.
+
+    Returns (hrs1_path, hrs2_path). Raises FileNotFoundError if either is missing.
+    """
+    hrs1_files = globmod.glob(os.path.join(directory, "*.hrs1"))
+    hrs2_files = globmod.glob(os.path.join(directory, "*.hrs2"))
+
+    if not hrs1_files:
+        raise FileNotFoundError(f"No .hrs1 file found in '{directory}'")
+    if not hrs2_files:
+        raise FileNotFoundError(f"No .hrs2 file found in '{directory}'")
+    if len(hrs1_files) > 1:
+        print(f"Warning: multiple .hrs1 files found, using: {hrs1_files[0]}")
+    if len(hrs2_files) > 1:
+        print(f"Warning: multiple .hrs2 files found, using: {hrs2_files[0]}")
+
+    return hrs1_files[0], hrs2_files[0]
+
+
+# ====================================================================
+# HRS SIGNAL HELPERS
+# ====================================================================
+
+def detect_stim_onset(sync_data: np.ndarray,
+                      bin_samples: int = BIN_SAMPLES,
+                      record_samples: int = TRIAL_RECORD_SAMPLES,
+                      threshold: float = STIM_ONSET_THRESHOLD) -> int:
+    """Return the sample index of stim onset in sync_data.
+
+    Searches from 60% into the pre-stim bin through the end of the recording
+    window. Falls back to bin_samples if no onset is detected.
+    """
+    search_start = int(bin_samples * 0.6)
+    search_end   = min(bin_samples + record_samples, len(sync_data))
+    if len(sync_data) > search_start:
+        window = sync_data[search_start:search_end]
+        cands  = np.where(window >= threshold)[0]
+        if len(cands) > 0:
+            return search_start + int(cands[0])
+    return bin_samples
+
+
+def get_trial_window(trial: MhRecTrial,
+                     pre_plot_ms: float,
+                     post_plot_ms: float,
+                     ms_per_sample: float = MS_PER_SAMPLE,
+                     bin_samples: int = BIN_SAMPLES,
+                     record_samples: int = TRIAL_RECORD_SAMPLES,
+                     onset_threshold: float = STIM_ONSET_THRESHOLD,
+                     end_threshold: float = STIM_END_THRESHOLD):
+    """Extract the peri-stimulus window for one MhRecTrial.
+
+    Returns (t_ms, emg, adc_or_None, stim_end_ms_or_None).
+    """
+    has_sync  = len(trial.sync_data) > 1
+    onset_idx = detect_stim_onset(trial.sync_data, bin_samples, record_samples,
+                                  onset_threshold) if has_sync else bin_samples
+
+    pre_s = int(pre_plot_ms  / ms_per_sample)
+    pst_s = int(post_plot_ms / ms_per_sample)
+    i0 = max(0, onset_idx - pre_s)
+    i1 = min(len(trial.trial_data), onset_idx + pst_s)
+
+    emg  = trial.trial_data[i0:i1]
+    n    = len(emg)
+    t_ms = (np.arange(n) - (onset_idx - i0)) * ms_per_sample
+
+    adc = None
+    if has_sync and len(trial.sync_data) >= i1:
+        candidate = trial.sync_data[i0:i1]
+        if len(candidate) == n:
+            adc = candidate
+
+    stim_end_ms = None
+    if has_sync and onset_idx < len(trial.sync_data):
+        ends = np.where(trial.sync_data[onset_idx:] < end_threshold)[0]
+        if len(ends) > 0:
+            stim_end_ms = float(ends[0]) * ms_per_sample
+
+    return t_ms, emg, adc, stim_end_ms
 
 
 # ====================================================================
