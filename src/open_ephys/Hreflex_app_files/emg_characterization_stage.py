@@ -22,10 +22,6 @@ class EmgCharacterizationStage (Stage):
     #This defines the duration of an individual bin in miliseconds
     BIN_DURATION_MILLISECONDS: int = 50
 
-    #This defines the number of samples for an individual bin
-    #This is: (sample rate / 1000) * BIN_DURATION_MILLISECONDS
-    BIN_SAMPLE_COUNT: int = 250
-
     #The minimum duration for which we will scan for trial initiation criteria to be met
     TRIAL_INITIATION_PHASE_MIN_DURATION_MILLISECONDS: int = 2200
 
@@ -35,6 +31,15 @@ class EmgCharacterizationStage (Stage):
     #The minimum and maximum range for trial initiation
     TRIAL_INITIATION_MIN_RANGE_MICROVOLTS: float = 5.0 #15.0
     TRIAL_INITIATION_MAX_RANGE_MICROVOLTS: float = 300.0
+
+    #endregion
+
+    #region Classmethods
+
+    @classmethod
+    def bin_sample_count(cls) -> int:
+        '''Number of samples per bin, computed from the live Open Ephys sample rate.'''
+        return int(cls.BIN_DURATION_MILLISECONDS * ApplicationConfiguration.sample_rate / 1000)
 
     #endregion
 
@@ -180,8 +185,8 @@ class EmgCharacterizationStage (Stage):
             
             #Bin the data
             for bin_index in range(0, len(self._bins)):
-                bin_start = EmgCharacterizationStage.BIN_SAMPLE_COUNT * bin_index
-                bin_end = EmgCharacterizationStage.BIN_SAMPLE_COUNT * (bin_index + 1)
+                bin_start = EmgCharacterizationStage.bin_sample_count() * bin_index
+                bin_end = EmgCharacterizationStage.bin_sample_count() * (bin_index + 1)
 
                 if (bin_end > len(self._monitored_signal)):
                     bin_end = len(self._monitored_signal)
@@ -266,7 +271,7 @@ class EmgCharacterizationStage (Stage):
         self._monitored_signal_duration_seconds = float(dur_milliseconds) / 1000.0
 
         #Set the number of samples that we care about
-        self._monitored_signal_sample_count = int(self._monitored_signal_duration_seconds * Stage.SAMPLE_RATE)
+        self._monitored_signal_sample_count = int(self._monitored_signal_duration_seconds * ApplicationConfiguration.sample_rate)
 
         #Get the number of bins we will be collecting
         bin_count: int = int(dur_milliseconds / EmgCharacterizationStage.BIN_DURATION_MILLISECONDS)
@@ -290,6 +295,8 @@ class EmgCharacterizationStage (Stage):
 
         #Clear the plot
         self._session_widget.clear()
+        self._session_widget.getPlotItem().setLabel('bottom', 'Trial #')
+        self._session_widget.getPlotItem().setLabel('left', 'EMG Mean (µV)')
 
         #Plot the trial means
         self._session_widget.plot(range(0, len(self._trial_means)), self._trial_means, pen = None, symbol = 'o', symbolBrush=('b'), symbolSize=12)
@@ -299,16 +306,17 @@ class EmgCharacterizationStage (Stage):
     def _update_trial_plot (self, bin_grand_mean: float) -> None:
         #Clear the plot
         self._trial_widget.clear()
+        self._trial_widget.getPlotItem().setLabel('bottom', 'Time (s)')
+        self._trial_widget.getPlotItem().setLabel('left', 'EMG (µV)')
 
         #Plot the "raw" (absolute-valued) EMG data for this trial
         pen = pg.mkPen(color=(0, 0, 0))
-        self._trial_widget.plot(range(0, len(self._monitored_signal)), self._monitored_signal, pen = pen)
+        signal_xvals = [i / ApplicationConfiguration.sample_rate for i in range(0, len(self._monitored_signal))]
+        self._trial_widget.plot(signal_xvals, self._monitored_signal, pen = pen)
 
         #Plot the binned data
         pen = pg.mkPen(color=(255, 0, 0), width = 2.0)
-        xvals = list(range(0, len(self._bins)))
-        for i in range(0, len(xvals)):
-            xvals[i] *= EmgCharacterizationStage.BIN_SAMPLE_COUNT
+        xvals = [i * EmgCharacterizationStage.bin_sample_count() / ApplicationConfiguration.sample_rate for i in range(0, len(self._bins))]
         self._trial_widget.plot(xvals, self._bins, pen = pen)
 
         # Get the ViewBox object

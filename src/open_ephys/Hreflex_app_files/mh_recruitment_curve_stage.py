@@ -29,13 +29,16 @@ class MhRecruitmentCurveStage_TrialInitiationData:
         #Declare a variable to hold the absolute value monitored signal
         self.monitored_signal_abs: np.ndarray = np.zeros(1)
 
+        #Declare a variable to hold the ADC sync line rolling buffer
+        self.sync_signal: np.ndarray = np.zeros(1)
+
         #Declare a variable to hold the bins
         self.bins: np.ndarray = np.zeros(1)
 
         #Declare a variable to hold the current monitored signal duration
         self.monitored_signal_duration_seconds: float = 0.0
 
-        #Declare a variable to hold the number of samples that we will 
+        #Declare a variable to hold the number of samples that we will
         #store in the monitored signal
         self.monitored_signal_sample_count: int = 0
 
@@ -53,7 +56,7 @@ class MhRecruitmentCurveStage_TrialInitiationData:
         self.monitored_signal_duration_seconds = float(dur_milliseconds) / 1000.0
 
         #Set the number of samples that we care about
-        self.monitored_signal_sample_count = int(self.monitored_signal_duration_seconds * Stage.SAMPLE_RATE)
+        self.monitored_signal_sample_count = int(self.monitored_signal_duration_seconds * ApplicationConfiguration.sample_rate)
 
         #Get the number of bins we will be collecting
         bin_count: int = int(dur_milliseconds / MhRecruitmentCurveStage.BIN_DURATION_MILLISECONDS)
@@ -61,6 +64,7 @@ class MhRecruitmentCurveStage_TrialInitiationData:
         #Re-size the appropriate arrays to hold the data we care about
         self.monitored_signal = np.zeros(self.monitored_signal_sample_count)
         self.monitored_signal_abs = np.zeros(self.monitored_signal_sample_count)
+        self.sync_signal = np.zeros(self.monitored_signal_sample_count, dtype=np.float32)
         self.bins = np.zeros(bin_count)
 
         #We are done. return from this function.
@@ -72,18 +76,20 @@ class MhRecruitmentCurveStage_TrialInitiationData:
         #Add the number of samples we are pulling in to the current trial sample count
         self.current_monitored_signal_sample_count += len(data_frame.diff_data_block)
 
-        #Add the new data to the monitored signal
-        self.monitored_signal = np.concatenate([self.monitored_signal, data_frame.diff_data_block])
+        #Add the new data to the monitored signal (filtered differential signal)
+        self.monitored_signal = np.concatenate([self.monitored_signal, data_frame.filtered_data_block])
         self.monitored_signal_abs = np.concatenate([self.monitored_signal_abs, data_frame.abs_data_block])
+        self.sync_signal = np.concatenate([self.sync_signal, data_frame.sync_data_block])
         elements_to_remove: int = len(self.monitored_signal) - self.monitored_signal_sample_count
         if (elements_to_remove > 0):
             self.monitored_signal = self.monitored_signal[elements_to_remove:]
             self.monitored_signal_abs = self.monitored_signal_abs[elements_to_remove:]
+            self.sync_signal = self.sync_signal[elements_to_remove:]
 
         #Bin the data
         for bin_index in range(0, len(self.bins)):
-            bin_start = MhRecruitmentCurveStage.BIN_SAMPLE_COUNT * bin_index
-            bin_end = MhRecruitmentCurveStage.BIN_SAMPLE_COUNT * (bin_index + 1)
+            bin_start = MhRecruitmentCurveStage.bin_sample_count() * bin_index
+            bin_end = MhRecruitmentCurveStage.bin_sample_count() * (bin_index + 1)
 
             if (bin_end > len(self.monitored_signal_abs)):
                 bin_end = len(self.monitored_signal_abs)
@@ -119,18 +125,11 @@ class MhRecruitmentCurveStage (Stage):
     #This defines the duration of an individual bin in miliseconds
     BIN_DURATION_MILLISECONDS: int = 50
 
-    #This defines the number of samples for an individual bin
-    #This is: (sample rate / 1000) * BIN_DURATION_MILLISECONDS
-    BIN_SAMPLE_COUNT: int = 250
 
     #This defines the trial recording duration in milliseconds
     TRIAL_RECORDING_DURATION_MILLISECONDS: int = 100
 
-    #This defines the trial recording duration in number of samples
-    TRIAL_RECORDING_DURATION_SAMPLE_COUNT: int = 500
 
-    #This defines the number of milliseconds per sample
-    MILLISECONDS_PER_SAMPLE: float = 0.2
 
     #The minimum duration for which we will scan for trial initiation criteria to be met
     TRIAL_INITIATION_PHASE_MIN_DURATION_MILLISECONDS: int = 2200
@@ -148,6 +147,29 @@ class MhRecruitmentCurveStage (Stage):
 
     #The minimum inter-trial interval. We will not allow new trials during the designated timeout period.
     MINIMUM_INTERTRIAL_INTERVAL_MILLISECONDS: int = 10000
+
+    #ADC sync line thresholds for stim onset/end detection.
+    STIM_ONSET_THRESHOLD: float = 4.5
+    STIM_END_THRESHOLD: float = 1.9
+
+    #endregion
+
+    #region Classmethods
+
+    @classmethod
+    def bin_sample_count(cls) -> int:
+        '''Samples per bin, computed from the live Open Ephys sample rate.'''
+        return int(cls.BIN_DURATION_MILLISECONDS * ApplicationConfiguration.sample_rate / 1000)
+
+    @classmethod
+    def trial_recording_sample_count(cls) -> int:
+        '''Post-stimulus recording samples, computed from the live Open Ephys sample rate.'''
+        return int(cls.TRIAL_RECORDING_DURATION_MILLISECONDS * ApplicationConfiguration.sample_rate / 1000)
+
+    @classmethod
+    def ms_per_sample(cls) -> float:
+        '''Milliseconds per sample, computed from the live Open Ephys sample rate.'''
+        return 1000.0 / ApplicationConfiguration.sample_rate
 
     #endregion
 
@@ -209,7 +231,30 @@ class MhRecruitmentCurveStage (Stage):
         self._user_h_wave_window_start_time_milliseconds: float = 0
         self._user_h_wave_window_end_time_milliseconds: float = 0
 
-        
+        #Trial signal visibility flags: index 0 = EMG diff, index 1 = ADC sync line
+        self._trial_signal_flags: list[bool] = [True, False]
+
+        #Secondary ViewBox used to render the ADC sync line on a right-hand Y-axis.
+        #Kept as an instance variable so it can be cleaned up before each redraw.
+        self._trial_adc_viewbox: pg.ViewBox = None
+
+        #Wall-clock millisecond timestamp recorded at the moment trigger_single() is called.
+        #Used in TRIAL_STATE_RECORD to discard queued pre-trigger frames that the Qt signal
+        #queue may have buffered before the trigger was sent.
+        self._trigger_wall_time_ms: int = 0
+
+        #Per-trial debug accumulators reset at the start of each RECORD state.
+        self._n_pre_trigger_frames_discarded: int = 0
+        self._frame_received_timestamps_ms: list = []
+        self._first_post_trigger_frame_sample_id: int = 0
+
+        #Manual initiation thresholds — set via the 'thresh' command before or during
+        #a session to allow S2 to run without a prior S1 (EMG characterization) file.
+        #When _manual_thresholds_set is True, initialize() accepts missing HRS1 data
+        #and uses these values instead of the histogram-derived ones.
+        self._manual_min_threshold: float = 0.0
+        self._manual_max_threshold: float = 0.0
+        self._manual_thresholds_set: bool = False
 
         pass
         
@@ -234,6 +279,10 @@ class MhRecruitmentCurveStage (Stage):
         self._auto_thresholding_enabled = False
         self._current_stimulation_amplitude_ma = 0.0
         self._current_trial_state = MhRecruitmentCurveStage.TRIAL_STATE_NOT_SETUP
+        self._trigger_wall_time_ms = 0
+        self._n_pre_trigger_frames_discarded = 0
+        self._frame_received_timestamps_ms = []
+        self._first_post_trigger_frame_sample_id = 0
         
         #Create a list to hold all trials
         self._trials: list[MhRecruitmentCurveTrial] = []
@@ -271,31 +320,39 @@ class MhRecruitmentCurveStage (Stage):
                 break
 
         if (not hrs1_found):
-            return (False, "No EMG characterization data was found for this subject. Please run stage S1 before running this stage.")
+            #Allow the session to proceed without S1 data if the user has manually set
+            #both initiation thresholds via the 'thresh' command.
+            if (not self._manual_thresholds_set):
+                return (False,
+                    "No EMG characterization data was found for this subject. "
+                    "Run stage S1 first, or set manual thresholds with: "
+                    "thresh lb=X ub=Y")
 
-        #If we reach this point in the code, then we have an existing HRS1 file for this animal.
-        #Now let's check to see if there is already an existing HRS2 file for this animal.
-        for f in files_list:
-            if (f.endswith("hrs2")):
-                return (False, "This subject has already completed this stage. EMG sweep data exists for this animal. This stage cannot proceed. If this is an issue, please talk to your PI.")
+            #Proceed with manually-set thresholds; no histogram data will be available.
+            self._emg_histogram_data = None
+            self._current_min_initiation_threshold = self._manual_min_threshold
+            self._current_max_initiation_threshold = self._manual_max_threshold
+        else:
+            #If we reach this point in the code, then we have an existing HRS1 file for this animal.
+            #Now let's check to see if there is already an existing HRS2 file for this animal.
+            for f in files_list:
+                if (f.endswith("hrs2")):
+                    return (False, "This subject has already completed this stage. EMG sweep data exists for this animal. This stage cannot proceed. If this is an issue, please talk to your PI.")
 
-        #If we reach this point in the code, then no prior EMG sweep data exists for this animal.
-        #Therefore, this stage can proceed.
+            #Load in the EMG characterization data from stage 1
+            self._emg_characterization_data: EmgCharacterizationDataFile = EmgCharacterizationDataFile()
+            fid = open(os.path.join(file_path, hrs1_file_name), "rb")
+            self._emg_characterization_data.read(fid)
+            fid.close()
 
-        #Load in the EMG characterization data from stage 1
-        self._emg_characterization_data: EmgCharacterizationDataFile = EmgCharacterizationDataFile()
-        fid = open(os.path.join(file_path, hrs1_file_name), "rb")
-        self._emg_characterization_data.read(fid)
-        fid.close()
+            #Calculate the histogram data from the EMG characterization data from stage 1
+            self._emg_histogram_data: EmgHistogramData = self._emg_characterization_data.get_histogram_data()
 
-        #Calculate the histogram data from the EMG characterization data from stage 1
-        self._emg_histogram_data: EmgHistogramData = self._emg_characterization_data.get_histogram_data()
+            #Set thresholds from histogram data (manual thresholds are ignored when S1 exists)
+            self._current_min_initiation_threshold = self._emg_histogram_data.min
+            self._current_max_initiation_threshold = self._emg_histogram_data.max
 
-        #Set some values related to using the histogram data during this stage
-        self._current_min_initiation_threshold = self._emg_histogram_data.min
-        self._current_max_initiation_threshold = self._emg_histogram_data.max
-
-        #Update the histogram plot
+        #Update the histogram plot (guards internally for missing histogram data)
         self._update_histogram_plot()
 
         #Open a file for saving data for this stage
@@ -305,11 +362,15 @@ class MhRecruitmentCurveStage (Stage):
         self._save_file_header()
 
         #Display a message to the user with some information about this stage
+        s1_source: str = "S1 histogram" if (self._emg_histogram_data is not None) else "manual (no S1 data)"
         commands_messages: list[str] = [
             "This stage supports the following commands: ",
             "lb = x, lb += x, lb -= x (Set the init threshold lower bound)",
             "ub = x, ub += x, ub -= x (Set the init threshold upper bound)",
-            "auto on, auto off (Turn on/off the automated algorithm for determining the lower and upper bounds of the initiation threshold)"
+            "thresh (Show current thresholds)",
+            "thresh lb=X ub=Y  |  thresh lb=X  |  thresh ub=Y  (Set thresholds manually)",
+            "auto on, auto off (Turn on/off the automated threshold algorithm)",
+            f"--- Active thresholds [{s1_source}]: lb={self._current_min_initiation_threshold:.2f}  ub={self._current_max_initiation_threshold:.2f} ---"
         ]
 
         for message_str in commands_messages:
@@ -347,8 +408,6 @@ class MhRecruitmentCurveStage (Stage):
 
         #START HERE
 
-        data = data_frame.diff_data_block
-
         if (self._current_trial_state == MhRecruitmentCurveStage.TRIAL_STATE_NOT_SETUP):
             #Set things up for a new trial
             self._setup_new_trial()
@@ -358,6 +417,10 @@ class MhRecruitmentCurveStage (Stage):
             self._stimulation_amplitudes = self._stimulation_amplitudes[1:]
 
             #Set the stimulation parameters on the Model 4100 for the upcoming trial
+            #Disarm the stimulator first so the Model 4100 accepts the amplitude change
+            if (ApplicationConfiguration.stimulator is not None):
+                ApplicationConfiguration.stimulator.set_active(False)
+
             ApplicationConfiguration.set_stimulation_amplitude(self._current_stimulation_amplitude_ma)
 
             if (ApplicationConfiguration.stimulator is not None):
@@ -380,6 +443,21 @@ class MhRecruitmentCurveStage (Stage):
             if (should_initiate_trial):
                 #If it is determined that we should initiate a trial...
 
+                #------------------------------------------------------------------
+                # DEBUG: stim criteria met
+                #------------------------------------------------------------------
+                decision_wall_time_ms: int = int(datetime.now().timestamp() * 1000)
+                decision_oe_sample_id: int = data_frame.sample_id
+                decision_msg: str = (
+                    f"[DEBUG] Stim criteria met | "
+                    f"wall_time={decision_wall_time_ms} ms | "
+                    f"OE_sample_id={decision_oe_sample_id} | "
+                    f"amp={self._current_stimulation_amplitude_ma:.2f} mA"
+                )
+                print(decision_msg)
+                self.signals.new_message.emit(SessionMessage(decision_msg))
+                #------------------------------------------------------------------
+
                 #Set the trial state...
                 self._current_trial_state = MhRecruitmentCurveStage.TRIAL_STATE_RECORD
 
@@ -392,7 +470,32 @@ class MhRecruitmentCurveStage (Stage):
                 )
 
                 #Transfer the last 50 ms of trial initiation data into the trial object
-                self._current_trial.trial_data = self._current_trial_initiation_data.monitored_signal[-MhRecruitmentCurveStage.BIN_SAMPLE_COUNT:]
+                self._current_trial.trial_data = self._current_trial_initiation_data.monitored_signal[-MhRecruitmentCurveStage.bin_sample_count():]
+
+                #Transfer the last 50 ms of ADC sync line data into the trial object (pre-stim window)
+                self._current_trial.sync_data = self._current_trial_initiation_data.sync_signal[-MhRecruitmentCurveStage.bin_sample_count():].copy()
+
+                #Reset per-trial debug accumulators before entering RECORD state
+                self._n_pre_trigger_frames_discarded = 0
+                self._frame_received_timestamps_ms = []
+                self._first_post_trigger_frame_sample_id = 0
+
+                #Record the wall-clock time at which the trigger is sent so that RECORD
+                #state can identify and discard any queued pre-trigger frames.
+                self._trigger_wall_time_ms = int(datetime.now().timestamp() * 1000)
+
+                #------------------------------------------------------------------
+                # DEBUG: trigger actually sent
+                #------------------------------------------------------------------
+                trigger_msg: str = (
+                    f"[DEBUG] trigger_single() sent | "
+                    f"trigger_wall_time={self._trigger_wall_time_ms} ms | "
+                    f"OE_sample_id={data_frame.sample_id} | "
+                    f"decision→trigger latency={self._trigger_wall_time_ms - decision_wall_time_ms} ms"
+                )
+                print(trigger_msg)
+                self.signals.new_message.emit(SessionMessage(trigger_msg))
+                #------------------------------------------------------------------
 
                 #Trigger the Model 4100
                 if (ApplicationConfiguration.stimulator is not None):
@@ -400,18 +503,72 @@ class MhRecruitmentCurveStage (Stage):
 
         elif (self._current_trial_state == MhRecruitmentCurveStage.TRIAL_STATE_RECORD):
 
-            #Copy data into the trial object until we have 100 ms of post-stim data
-            self._current_trial.trial_data = np.concatenate([self._current_trial.trial_data, data])
+            #Only accumulate frames that were assembled by the background thread AFTER the
+            #trigger was sent.  Because data_received_signal crosses a thread boundary it uses
+            #Qt's queued connection, meaning several pre-trigger frames can already be waiting
+            #in the main-thread event queue at the moment trigger_single() is called.  Those
+            #frames were acquired before the stimulus and cannot contain the stim onset; adding
+            #them to the trial record would push the real onset outside the search window.
+            #
+            #We fall through to _save_emg_data_frame at the end of process() regardless, so
+            #the continuous background EMG record is never interrupted.
+            frame_is_post_trigger: bool = (
+                self._trigger_wall_time_ms == 0 or
+                data_frame.timestamp_emitted == 0 or
+                data_frame.timestamp_emitted >= self._trigger_wall_time_ms
+            )
 
-            #Check to see if we have enough data
-            if (len(self._current_trial.trial_data) >= (MhRecruitmentCurveStage.BIN_SAMPLE_COUNT + MhRecruitmentCurveStage.TRIAL_RECORDING_DURATION_SAMPLE_COUNT)):
-                #If so, move on to the next stage
-                self._current_trial_state = MhRecruitmentCurveStage.TRIAL_STATE_FINALIZE
+            if frame_is_post_trigger:
+                #Track the Open Ephys sample ID of the very first post-trigger frame so
+                #the analyst can locate the exact position in the continuous OE recording.
+                if (len(self._frame_received_timestamps_ms) == 0):
+                    self._first_post_trigger_frame_sample_id = data_frame.sample_id
+
+                #Record this frame's background-thread emit timestamp for later debug output.
+                self._frame_received_timestamps_ms.append(data_frame.timestamp_emitted)
+
+                #Copy data into the trial object until we have 100 ms of post-stim data
+                self._current_trial.trial_data = np.concatenate([self._current_trial.trial_data, data_frame.filtered_data_block])
+                self._current_trial.sync_data = np.concatenate([self._current_trial.sync_data, data_frame.sync_data_block])
+
+                #Check to see if we have enough data
+                if (len(self._current_trial.trial_data) >= (MhRecruitmentCurveStage.bin_sample_count() + MhRecruitmentCurveStage.trial_recording_sample_count())):
+                    #If so, move on to the next stage
+                    self._current_trial_state = MhRecruitmentCurveStage.TRIAL_STATE_FINALIZE
+            else:
+                #Count discarded pre-trigger frames for debug output
+                self._n_pre_trigger_frames_discarded += 1
 
         elif (self._current_trial_state == MhRecruitmentCurveStage.TRIAL_STATE_FINALIZE):
             
             #Append the current trial to the session's list of trials
             self._trials.append(self._current_trial)
+
+            #Compute and attach timing/sync debug fields before writing to disk
+            self._compute_trial_debug_fields(self._current_trial)
+
+            #------------------------------------------------------------------
+            # DEBUG: onset detection result
+            #------------------------------------------------------------------
+            t = self._current_trial
+            first_frame_delay_ms: float = (
+                float(self._frame_received_timestamps_ms[0]) - float(self._trigger_wall_time_ms)
+                if len(self._frame_received_timestamps_ms) > 0 else -1.0
+            )
+            onset_msg: str = (
+                f"[DEBUG] Trial finalized | "
+                f"onset_detected={t.onset_detected} | "
+                f"onset_sample={t.onset_sample_index} | "
+                f"end_sample={t.stim_end_sample_index} | "
+                f"stim_dur_ms={t.stim_duration_ms:.3f} | "
+                f"sync_peak_V={t.sync_peak_voltage:.3f} | "
+                f"pre_trigger_frames_discarded={t.n_pre_trigger_frames_discarded} | "
+                f"first_frame_delay_ms={first_frame_delay_ms:.1f} | "
+                f"first_OE_sample={t.first_post_trigger_frame_sample_id}"
+            )
+            print(onset_msg)
+            self.signals.new_message.emit(SessionMessage(onset_msg))
+            #------------------------------------------------------------------
 
             #Save the data for this trial to the session's data file
             self._current_trial.save_to_file(self._fid)
@@ -453,7 +610,9 @@ class MhRecruitmentCurveStage (Stage):
         #Remove all whitespace
         user_input = "".join(user_input.split())
 
-        if (user_input.startswith("lb")) or (user_input.startswith("ub")):
+        if (user_input.startswith("thresh")):
+            self._parse_command_thresh(user_input)
+        elif (user_input.startswith("lb")) or (user_input.startswith("ub")):
             self._parse_command_lb_ub(user_input)
         elif (user_input.startswith("auto")):
             self._parse_command_auto(user_input)
@@ -469,7 +628,10 @@ class MhRecruitmentCurveStage (Stage):
 
     def get_trial_plot_options (self) -> list[str]:
         return ["Most recent trial"]
-    
+
+    def get_trial_signal_options (self) -> list[str]:
+        return ["EMG signal", "ADC sync line"]
+
     def get_session_plot_options (self) -> list[str]:
         return ["S1 Histogram", "Recruitment Curve"]
 
@@ -495,7 +657,7 @@ class MhRecruitmentCurveStage (Stage):
 
             #Create a file header object
             header: MhRecruitmentCurveHeader = MhRecruitmentCurveHeader(
-                0,
+                2,
                 self._subject_id,
                 datetime.now(),
                 self.stage_name,
@@ -536,17 +698,25 @@ class MhRecruitmentCurveStage (Stage):
     def _update_histogram_plot (self) -> None:
         #Clear the plot
         self._session_widget.clear()
+        self._session_widget.getPlotItem().setLabel('bottom', 'EMG (µV)')
+        self._session_widget.getPlotItem().setLabel('left', 'Count')
 
-        #Plot a histogram of the grand means from the EMG characterization data
-        for i in range(0, len(self._emg_histogram_data.histogram_values)):
-            hist_val: float = self._emg_histogram_data.histogram_values[i]
-            hist_edge_01: float = self._emg_histogram_data.histogram_bin_edges[i]
-            hist_edge_02: float = self._emg_histogram_data.histogram_bin_edges[i+1]
-            hist_center: float = (hist_edge_01 + hist_edge_02) / 2.0
-            hist_width: float = hist_edge_02 - hist_edge_01
-            hist_bar: pg.BarGraphItem = pg.BarGraphItem(x = hist_center, height = hist_val, width = hist_width)
-            self._session_widget.addItem(hist_bar)
-        
+        if self._emg_histogram_data is not None:
+            #Plot a histogram of the grand means from the EMG characterization data
+            for i in range(0, len(self._emg_histogram_data.histogram_values)):
+                hist_val: float = self._emg_histogram_data.histogram_values[i]
+                hist_edge_01: float = self._emg_histogram_data.histogram_bin_edges[i]
+                hist_edge_02: float = self._emg_histogram_data.histogram_bin_edges[i+1]
+                hist_center: float = (hist_edge_01 + hist_edge_02) / 2.0
+                hist_width: float = hist_edge_02 - hist_edge_01
+                hist_bar: pg.BarGraphItem = pg.BarGraphItem(x = hist_center, height = hist_val, width = hist_width)
+                self._session_widget.addItem(hist_bar)
+        else:
+            #No histogram data — thresholds were set manually; show a label indicating this
+            text_item = pg.TextItem(text="Manual thresholds (no EMG characterization data)", anchor=(0.5, 0.5))
+            self._session_widget.addItem(text_item)
+            text_item.setPos(self._current_min_initiation_threshold, 0.5)
+
         #Plot vertical lines where the min and max thresholds are
         vert_line_pen = pg.mkPen(color=(255, 0, 0), width = 2.0, style = QtCore.Qt.DashLine)
         min_thresh_line: pg.InfiniteLine = pg.InfiniteLine(self._current_min_initiation_threshold, 90, vert_line_pen, movable=False)
@@ -555,38 +725,177 @@ class MhRecruitmentCurveStage (Stage):
         self._session_widget.addItem(max_thresh_line)
 
     def _update_trial_plot (self) -> None:
+        #Remove any ADC ViewBox left from a previous draw before clearing
+        self._cleanup_trial_adc_viewbox()
+
         #Clear the plot
         self._trial_widget.clear()
+        self._trial_widget.getPlotItem().hideAxis('right')
+        self._trial_widget.getPlotItem().setLabel('bottom', 'Time (ms)')
+        self._trial_widget.getPlotItem().setLabel('left', 'EMG (µV)')
 
-        #Plot the EMG signal for this trial
-        pen = pg.mkPen(color=(0, 0, 0), width = 2.0)
+        emg_pen = pg.mkPen(color=(0, 0, 0), width=2.0)
 
-        #Calculate how many samples correspond to 5ms pre-stim and 20ms post-stim
-        #This gives us a 25ms window to display
-        pre_stim_samples = int(5.0 / MhRecruitmentCurveStage.MILLISECONDS_PER_SAMPLE)  # 25 samples for 5ms
-        post_stim_samples = int(20.0 / MhRecruitmentCurveStage.MILLISECONDS_PER_SAMPLE)  # 100 samples for 20ms
-        total_display_samples = pre_stim_samples + post_stim_samples  # 125 samples total
+        #-------------------------------------------------------------------
+        # Phase 1: Detect true stim onset from the ADC sync line
+        #
+        # Search window design:
+        #   - Never look in the pre-stim window (sync_data[0 : bin_sample_count()]).
+        #     That data was captured BEFORE trigger_single() was called; any crossing
+        #     there is noise and was causing the ±10–50 ms jitter the user observed.
+        #   - Start at bin_sample_count() (the exact sample where post-trigger data
+        #     begins), then push forward by the measured TCP + frame-delivery delay.
+        #     The stim pulse physically cannot arrive before that delay elapses, so
+        #     those leading samples are safe to skip.  Capped at 60 ms so a slow
+        #     or bursty frame never hides a real onset.
+        #   - Search 120 ms of post-trigger data — wide enough to catch the onset
+        #     regardless of network / hardware jitter.
+        #-------------------------------------------------------------------
+        trigger_sample: int = MhRecruitmentCurveStage.bin_sample_count()
 
-        #Extract only the first 25ms of data to display (5ms pre + 20ms post)
-        data_to_plot = self._current_trial.trial_data[:total_display_samples]
+        #Search the full 120 ms of post-trigger data starting right at the trigger boundary.
+        #Using frame-delivery delay to push search_start forward was causing missed detections
+        #because timestamp_emitted reflects frame assembly completion, not stim hardware arrival.
+        #The stim pulse (hardware latency << frame latency) lands in the early samples of the
+        #first post-trigger frame, which the delay-based offset was skipping past.
+        search_start: int = trigger_sample
+        search_end: int = min(
+            trigger_sample + int(120.0 / MhRecruitmentCurveStage.ms_per_sample()),
+            len(self._current_trial.sync_data)
+        )
 
-        #Transform each sample index into a millisecond time value for the trial's x-axis
-        #Time axis goes from -5ms (pre-stim) to +20ms (post-stim), with stim event at 0ms
-        num_samples = len(data_to_plot)
-        x_data = (np.arange(0, num_samples) * MhRecruitmentCurveStage.MILLISECONDS_PER_SAMPLE) - 5.0
+        stim_onset_idx: int = trigger_sample  # fallback: start of post-trigger data
+        onset_was_detected: bool = False
 
-        #Plot the trial data
-        self._trial_widget.plot(x_data, data_to_plot, pen = pen)
+        if len(self._current_trial.sync_data) > search_start:
+            search_window = self._current_trial.sync_data[search_start:search_end]
+            above = np.where(search_window >= MhRecruitmentCurveStage.STIM_ONSET_THRESHOLD)[0]
+            if len(above) > 0:
+                #Prefer the first pair of consecutive samples above threshold to reject
+                #single-sample noise transients.  Fall back to first isolated crossing
+                #at low sample rates where the pulse fits in one sample.
+                chosen: int = int(above[0])
+                for i in range(len(above) - 1):
+                    if above[i + 1] == above[i] + 1:
+                        chosen = int(above[i])
+                        break
+                stim_onset_idx = search_start + chosen
+                onset_was_detected = True
 
-        #Set the x-axis range to -5ms to +20ms
-        self._trial_widget.setXRange(-5, 20, padding=0)
+        print(
+            f"[DEBUG] onset search | "
+            f"trigger_sample={trigger_sample} | "
+            f"search=[{search_start}, {search_end}] | "
+            f"stim_onset_idx={stim_onset_idx} | "
+            f"onset_detected={onset_was_detected} | "
+            f"sync_data_len={len(self._current_trial.sync_data)}"
+        )
 
-        #Plot a vertical line annotation showing where the stimulation event occurred (at time 0)
-        vert_line_pen = pg.mkPen(color=(255, 0, 0), width = 2.0, style=QtCore.Qt.DashLine)
-        vert_line: pg.InfiniteLine = pg.InfiniteLine(0, 90, vert_line_pen, movable=False)
-        self._trial_widget.addItem(vert_line)
+        #-------------------------------------------------------------------
+        # Phase 2: Cut peri-stimulus window (-20 ms … +30 ms around onset)
+        #-------------------------------------------------------------------
+        pre_stim_samples: int = int(20.0 / MhRecruitmentCurveStage.ms_per_sample())
+        post_stim_samples: int = int(30.0 / MhRecruitmentCurveStage.ms_per_sample())
+
+        idx_pre: int = max(0, stim_onset_idx - pre_stim_samples)
+        idx_post: int = min(len(self._current_trial.trial_data), stim_onset_idx + post_stim_samples)
+
+        data_to_plot = self._current_trial.trial_data[idx_pre:idx_post]
+        num_samples: int = len(data_to_plot)
+
+        #-------------------------------------------------------------------
+        # Phase 3: Zero the time axis — t=0 is exactly stim onset
+        #-------------------------------------------------------------------
+        samples_before_onset: int = stim_onset_idx - idx_pre
+        x_data = (np.arange(0, num_samples) - samples_before_onset) * MhRecruitmentCurveStage.ms_per_sample()
+
+        #Plot EMG signal (always shown while flag index 0 is True)
+        if len(self._trial_signal_flags) == 0 or self._trial_signal_flags[0]:
+            self._trial_widget.plot(x_data, data_to_plot, pen=emg_pen)
+
+        self._trial_widget.setXRange(-20, 30, padding=0)
+
+        #Stim onset marker at t=0 (blue dashed)
+        onset_pen = pg.mkPen(color=(0, 0, 255), width=2.0, style=QtCore.Qt.DashLine)
+        self._trial_widget.addItem(pg.InfiniteLine(0, 90, onset_pen, movable=False))
+
+        #-------------------------------------------------------------------
+        # Phase 4: Stim end marker
+        # Only drawn when the onset was positively detected.  When the fallback
+        # position is used (onset not found), skipping the end marker avoids the
+        # misleading "stim period = 0" display that previously appeared.
+        #-------------------------------------------------------------------
+        if onset_was_detected and len(self._current_trial.sync_data) > stim_onset_idx:
+            post_onset_sync = self._current_trial.sync_data[stim_onset_idx:]
+            end_candidates = np.where(post_onset_sync < MhRecruitmentCurveStage.STIM_END_THRESHOLD)[0]
+            if len(end_candidates) > 0:
+                stim_end_time_ms: float = int(end_candidates[0]) * MhRecruitmentCurveStage.ms_per_sample()
+                end_pen = pg.mkPen(color=(128, 0, 128), width=2.0, style=QtCore.Qt.DashLine)
+                self._trial_widget.addItem(pg.InfiniteLine(stim_end_time_ms, 90, end_pen, movable=False))
+
+        #-------------------------------------------------------------------
+        # Phase 5: Optional ADC sync overlay on a secondary (right) Y-axis
+        #-------------------------------------------------------------------
+        show_adc: bool = len(self._trial_signal_flags) > 1 and self._trial_signal_flags[1]
+        if show_adc and len(self._current_trial.sync_data) >= idx_post:
+            adc_to_plot = self._current_trial.sync_data[idx_pre:idx_post]
+            if len(adc_to_plot) == num_samples:
+                self._draw_trial_adc_overlay(x_data, adc_to_plot)
 
         pass
+
+    def _cleanup_trial_adc_viewbox (self) -> None:
+        '''Removes the secondary ADC ViewBox from the scene before a redraw.'''
+        if self._trial_adc_viewbox is not None:
+            try:
+                scene = self._trial_adc_viewbox.scene()
+                if scene is not None:
+                    scene.removeItem(self._trial_adc_viewbox)
+            except Exception:
+                pass
+            self._trial_adc_viewbox = None
+
+    def _draw_trial_adc_overlay (self, x_data: np.ndarray, adc_data: np.ndarray) -> None:
+        '''
+        Adds the ADC sync signal as a green trace on an independent right-hand Y-axis.
+        The X axis is shared with the main EMG plot so timing is pixel-perfect.
+        '''
+        plot_item = self._trial_widget.getPlotItem()
+
+        #Disconnect any previous resize callback to avoid accumulation
+        try:
+            plot_item.vb.sigResized.disconnect(self._on_trial_plot_resized)
+        except Exception:
+            pass
+
+        #Create a new ViewBox for the right axis
+        adc_vb = pg.ViewBox()
+        plot_item.scene().addItem(adc_vb)
+
+        #Show and configure the right axis
+        plot_item.showAxis('right')
+        plot_item.getAxis('right').setLabel('ADC (V)', color='#007700')
+        plot_item.getAxis('right').linkToView(adc_vb)
+
+        #Link X and set initial geometry
+        adc_vb.setXLink(plot_item)
+        adc_vb.setGeometry(plot_item.vb.sceneBoundingRect())
+
+        #Keep geometry in sync when the main view is resized
+        plot_item.vb.sigResized.connect(self._on_trial_plot_resized)
+
+        #Plot the ADC curve inside the secondary ViewBox
+        adc_pen = pg.mkPen(color=(0, 160, 0), width=1.5)
+        adc_vb.addItem(pg.PlotCurveItem(x_data, adc_data, pen=adc_pen))
+
+        self._trial_adc_viewbox = adc_vb
+
+    def _on_trial_plot_resized (self) -> None:
+        '''Keeps the ADC ViewBox geometry aligned with the main plot after a resize.'''
+        if self._trial_adc_viewbox is not None and self._trial_adc_viewbox.scene() is not None:
+            self._trial_adc_viewbox.setGeometry(
+                self._trial_widget.getPlotItem().vb.sceneBoundingRect()
+            )
 
     def _determine_min_max_initiation_threshold (self) -> None:
 
@@ -666,6 +975,64 @@ class MhRecruitmentCurveStage (Stage):
     def _round_special (self, x: int, base: int = 50) -> int:
         return base * int(round(float(x) / float(base)))
 
+    def _compute_trial_debug_fields (self, trial) -> None:
+        '''
+        Runs the same onset/end detection used by _update_trial_plot and writes the
+        results — plus the frame-timing accumulators — into the trial object so they
+        are persisted to the data file for offline analysis.
+        '''
+        #Carry over the frame-timing accumulators collected during RECORD state
+        trial.trigger_wall_time_ms = self._trigger_wall_time_ms
+        trial.n_pre_trigger_frames_discarded = self._n_pre_trigger_frames_discarded
+        trial.frame_received_timestamps_ms = np.array(
+            self._frame_received_timestamps_ms, dtype=np.uint64)
+        trial.first_post_trigger_frame_sample_id = self._first_post_trigger_frame_sample_id
+
+        #Onset search boundaries (mirrors _update_trial_plot Phase 1)
+        search_start: int = MhRecruitmentCurveStage.bin_sample_count()
+        search_end: int = min(
+            search_start + MhRecruitmentCurveStage.trial_recording_sample_count(),
+            len(trial.sync_data)
+        )
+
+        #Defaults when no onset is found
+        trial.onset_sample_index = -1
+        trial.onset_detected = 0
+        trial.stim_end_sample_index = -1
+        trial.stim_duration_samples = 0
+        trial.stim_duration_ms = 0.0
+        trial.sync_peak_voltage = 0.0
+
+        if len(trial.sync_data) > search_start:
+            search_window = trial.sync_data[search_start:search_end]
+            trial.sync_peak_voltage = float(np.max(search_window)) if len(search_window) > 0 else 0.0
+
+            above = np.where(search_window >= MhRecruitmentCurveStage.STIM_ONSET_THRESHOLD)[0]
+            if len(above) > 0:
+                #Prefer first consecutive pair to reject single-sample noise (same logic
+                #as _update_trial_plot); fall back to first isolated crossing.
+                chosen: int = int(above[0])
+                for i in range(len(above) - 1):
+                    if above[i + 1] == above[i] + 1:
+                        chosen = int(above[i])
+                        break
+
+                trial.onset_sample_index = search_start + chosen
+                trial.onset_detected = 1
+
+                #End detection
+                if len(trial.sync_data) > trial.onset_sample_index:
+                    post_onset = trial.sync_data[trial.onset_sample_index:]
+                    end_candidates = np.where(
+                        post_onset < MhRecruitmentCurveStage.STIM_END_THRESHOLD)[0]
+                    if len(end_candidates) > 0:
+                        trial.stim_end_sample_index = (
+                            trial.onset_sample_index + int(end_candidates[0]))
+                        trial.stim_duration_samples = (
+                            trial.stim_end_sample_index - trial.onset_sample_index)
+                        trial.stim_duration_ms = (
+                            trial.stim_duration_samples * MhRecruitmentCurveStage.ms_per_sample())
+
     def _parse_command_lb_ub (self, user_input: str) -> None:
         #Check to see if we should just report existing values
         if (user_input == "lb"):
@@ -727,8 +1094,13 @@ class MhRecruitmentCurveStage (Stage):
                 self.signals.new_message.emit(SessionMessage("Command failed: lower bound cannot be higher than the upper bound"))
                 return
             
-            self._current_min_initiation_threshold = max(lb, self._emg_histogram_data.min)
-            self.signals.new_message.emit(SessionMessage(f"Min threshold set: {self._current_min_initiation_threshold:.2f}"))
+            #Clamp to histogram min only when S1 data is available
+            if (self._emg_histogram_data is not None):
+                lb = max(lb, self._emg_histogram_data.min)
+            self._current_min_initiation_threshold = lb
+            self._manual_min_threshold = lb
+            self._manual_thresholds_set = True
+            self.signals.new_message.emit(SessionMessage(f"Lower bound set: {self._current_min_initiation_threshold:.2f}"))
             self.update_session_plot()
         else:
             ub: float = self._current_max_initiation_threshold
@@ -743,11 +1115,104 @@ class MhRecruitmentCurveStage (Stage):
             if (ub <= self._current_min_initiation_threshold):
                 self.signals.new_message.emit(SessionMessage("Command failed: upper bound cannot be lower than the lower bound"))
                 return
-            
-            self._current_max_initiation_threshold = min(ub, self._emg_histogram_data.max)
-            self.signals.new_message.emit(SessionMessage(f"Min threshold set: {self._current_max_initiation_threshold:.2f}"))
+
+            #Clamp to histogram max only when S1 data is available
+            if (self._emg_histogram_data is not None):
+                ub = min(ub, self._emg_histogram_data.max)
+            self._current_max_initiation_threshold = ub
+            self._manual_max_threshold = ub
+            self._manual_thresholds_set = True
+            self.signals.new_message.emit(SessionMessage(f"Upper bound set: {self._current_max_initiation_threshold:.2f}"))
             self.update_session_plot()
         pass
+
+    def _parse_command_thresh (self, user_input: str) -> None:
+        '''
+        Handles the 'thresh' command family.
+
+        thresh                  — display current lb and ub
+        thresh lb=X             — set lower bound to X
+        thresh ub=X             — set upper bound to X
+        thresh lb=X ub=Y        — set both at once
+
+        Works before AND during a session.  When used before starting S2, the values
+        are stored as manual thresholds so initialize() can proceed without an HRS1 file.
+        '''
+        #Strip the command verb and any surrounding whitespace
+        remainder: str = user_input.removeprefix("thresh").strip()
+
+        #No arguments — just display current values
+        if (remainder == ""):
+            source: str = "S1 histogram" if (self._emg_histogram_data is not None) else "manual"
+            self.signals.new_message.emit(SessionMessage(
+                f"Initiation thresholds [{source}]: "
+                f"lb={self._current_min_initiation_threshold:.2f}  "
+                f"ub={self._current_max_initiation_threshold:.2f}"
+            ))
+            if (self._manual_thresholds_set):
+                self.signals.new_message.emit(SessionMessage(
+                    f"Stored manual thresholds: lb={self._manual_min_threshold:.2f}  ub={self._manual_max_threshold:.2f}"
+                ))
+            return
+
+        #Parse key=value pairs (lb and/or ub)
+        new_lb: float = self._current_min_initiation_threshold
+        new_ub: float = self._current_max_initiation_threshold
+        lb_changed: bool = False
+        ub_changed: bool = False
+
+        for token in remainder.split():
+            token = token.replace(" ", "")
+            if token.startswith("lb="):
+                try:
+                    new_lb = float(token[3:])
+                    lb_changed = True
+                except ValueError:
+                    self.signals.new_message.emit(SessionMessage("thresh: invalid value for lb"))
+                    return
+            elif token.startswith("ub="):
+                try:
+                    new_ub = float(token[3:])
+                    ub_changed = True
+                except ValueError:
+                    self.signals.new_message.emit(SessionMessage("thresh: invalid value for ub"))
+                    return
+            else:
+                self.signals.new_message.emit(SessionMessage(
+                    f"thresh: unrecognized token '{token}'. "
+                    f"Usage: thresh lb=X ub=Y"))
+                return
+
+        if (not lb_changed) and (not ub_changed):
+            self.signals.new_message.emit(SessionMessage("thresh: no lb= or ub= found"))
+            return
+
+        if (new_lb >= new_ub):
+            self.signals.new_message.emit(SessionMessage(
+                "thresh: lower bound must be less than upper bound"))
+            return
+
+        #Apply, clamping to histogram bounds if S1 data is available
+        if (self._emg_histogram_data is not None):
+            new_lb = max(new_lb, self._emg_histogram_data.min)
+            new_ub = min(new_ub, self._emg_histogram_data.max)
+
+        self._current_min_initiation_threshold = new_lb
+        self._current_max_initiation_threshold = new_ub
+        self._manual_min_threshold = new_lb
+        self._manual_max_threshold = new_ub
+        self._manual_thresholds_set = True
+
+        self.signals.new_message.emit(SessionMessage(
+            f"Thresholds updated: lb={self._current_min_initiation_threshold:.2f}  "
+            f"ub={self._current_max_initiation_threshold:.2f}"
+        ))
+        print(
+            f"[thresh] lb={self._current_min_initiation_threshold:.2f}  "
+            f"ub={self._current_max_initiation_threshold:.2f}  "
+            f"manual_thresholds_set={self._manual_thresholds_set}"
+        )
+        self.update_session_plot()
 
     def _parse_command_auto (self, user_input: str) -> None:
         on_or_off: str = user_input.removeprefix("auto")
@@ -757,5 +1222,81 @@ class MhRecruitmentCurveStage (Stage):
         else:
             self._auto_thresholding_enabled = False
             self.signals.new_message.emit(SessionMessage("Auto thresholding: DISABLED"))
-        
+
+    #endregion
+
+    #region Public methods
+
+    def manual_stim (self) -> None:
+        '''
+        Manually triggers a stimulation using the next amplitude from the algorithm.
+        Only fires when the stage is actively waiting for trial initiation.
+        The inter-trial interval is still enforced.
+        '''
+        #Only allowed while waiting for EMG-triggered initiation
+        if (self._current_trial_state != MhRecruitmentCurveStage.TRIAL_STATE_WAIT_FOR_INITIATION):
+            self.signals.new_message.emit(SessionMessage("Manual stim ignored: trial already in progress or stage not ready"))
+            return
+
+        #Enforce the inter-trial interval
+        if (len(self._trials) > 0):
+            elapsed_ms: int = int((datetime.now() - self._trials[-1].start_time).total_seconds() * 1000.0)
+            if (elapsed_ms < MhRecruitmentCurveStage.MINIMUM_INTERTRIAL_INTERVAL_MILLISECONDS):
+                remaining_sec: float = (MhRecruitmentCurveStage.MINIMUM_INTERTRIAL_INTERVAL_MILLISECONDS - elapsed_ms) / 1000.0
+                self.signals.new_message.emit(SessionMessage(f"Manual stim ignored: inter-trial interval not elapsed ({remaining_sec:.1f}s remaining)"))
+                return
+
+        #Reset per-trial debug accumulators before entering RECORD state
+        self._n_pre_trigger_frames_discarded = 0
+        self._frame_received_timestamps_ms = []
+        self._first_post_trigger_frame_sample_id = 0
+
+        #Transition to the record state
+        self._current_trial_state = MhRecruitmentCurveStage.TRIAL_STATE_RECORD
+
+        #Create the trial object
+        self._current_trial = MhRecruitmentCurveTrial()
+        self._current_trial.initialize(
+            self._current_min_initiation_threshold,
+            self._current_max_initiation_threshold,
+            self._current_stimulation_amplitude_ma
+        )
+
+        #Transfer the last 50 ms of pre-stim data from the rolling buffer
+        self._current_trial.trial_data = self._current_trial_initiation_data.monitored_signal[-MhRecruitmentCurveStage.bin_sample_count():]
+        self._current_trial.sync_data = self._current_trial_initiation_data.sync_signal[-MhRecruitmentCurveStage.bin_sample_count():].copy()
+
+        #Record the trigger wall-clock time before firing so the RECORD state
+        #can discard any queued pre-trigger frames (same fix as the automatic path).
+        self._trigger_wall_time_ms = int(datetime.now().timestamp() * 1000)
+
+        #Trigger the stimulator
+        if (ApplicationConfiguration.stimulator is not None):
+            ApplicationConfiguration.stimulator.trigger_single()
+
+        self.signals.new_message.emit(SessionMessage(f"Manual stim triggered at {self._current_stimulation_amplitude_ma:.2f} mA"))
+
+    def set_manual_thresholds(self, lb: float, ub: float) -> str:
+        '''
+        Sets manual initiation thresholds directly (e.g. from the GUI threshold panel).
+        Works before or during a session.
+        If S1 histogram data is loaded, values are clamped to histogram bounds.
+        Returns a result message string (does not emit any signals).
+        '''
+        if lb >= ub:
+            return "Threshold error: lower bound must be less than upper bound."
+
+        #Clamp to histogram bounds if S1 data is available
+        if self._emg_histogram_data is not None:
+            lb = max(lb, self._emg_histogram_data.min)
+            ub = min(ub, self._emg_histogram_data.max)
+
+        self._manual_min_threshold = lb
+        self._manual_max_threshold = ub
+        self._manual_thresholds_set = True
+        self._current_min_initiation_threshold = lb
+        self._current_max_initiation_threshold = ub
+
+        return f"Initiation thresholds set: lb={lb:.2f} µV   ub={ub:.2f} µV"
+
     #endregion

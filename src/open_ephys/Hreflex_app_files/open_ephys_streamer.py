@@ -10,8 +10,9 @@ from typing import Tuple
 from dataclasses import dataclass, field
 
 from .emg_data_filter import EmgDataFilter
+from .application_configuration import ApplicationConfiguration
 
-OPEN_EPHYS_EXPECTED_CHANNEL_COUNT: int = 2
+OPEN_EPHYS_EXPECTED_CHANNEL_COUNT: int = 3
 
 @dataclass
 class OpenEphysDataBlock:
@@ -38,22 +39,49 @@ class OpenEphysDataFrame:
     diff_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     filtered_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     abs_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    sync_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
 
     #region Public methods
 
+
     def calculate_fields (self) -> None:
-        if (len(self.channel_data_blocks) >= 2):
-            #Do the differential subtraction
-            self.diff_data_block = self.channel_data_blocks[1].data - self.channel_data_blocks[0].data
+        if ApplicationConfiguration.filtering_protocol == "ONLINE":
+            #ONLINE FILTERING: channels arrive pre-processed from Open Ephys.
+            #ch0 = unipolar already-filtered signal  →  diff_data_block (the "raw" display slot)
+            #ch1 = bipolar diff + bandpass + abs, fully processed in Open Ephys  →  filtered_data_block / abs_data_block
+            #ch2 = ADC sync line  →  sync_data_block
+            if (len(self.channel_data_blocks) >= 1):
+                self.diff_data_block = self.channel_data_blocks[0].data
 
-            #Now filter the data
-            self.filtered_data_block = EmgDataFilter.filter(self.diff_data_block)
+            if (len(self.channel_data_blocks) >= 2):
+                self.filtered_data_block = self.channel_data_blocks[1].data
+                self.abs_data_block = np.abs(self.channel_data_blocks[1].data)
 
-            #Now take the absolute value of the data
-            self.abs_data_block = np.abs(self.filtered_data_block)
+            if (len(self.channel_data_blocks) >= 3):
+                self.sync_data_block = np.abs(self.channel_data_blocks[2].data)
+        else:
+            #OFFLINE FILTERING: perform differential subtraction and bandpass filter in-app.
+            #ch0 & ch1 = raw EMG electrodes  →  diff → filter → abs
+            #ch2 = ADC sync line  →  sync_data_block
+            if (len(self.channel_data_blocks) >= 2):
+                #Do the differential subtraction
+                self.diff_data_block = self.channel_data_blocks[1].data - self.channel_data_blocks[0].data
+
+                #Now filter the data
+                self.filtered_data_block = EmgDataFilter.filter(self.diff_data_block)
+
+                #Now take the absolute value of the data
+                self.abs_data_block = np.abs(self.filtered_data_block)
+
+            if (len(self.channel_data_blocks) >= 3):
+                #Extract the ADC sync line (channel index 2) used for precise stim-onset alignment.
+                #Absolute value is applied to handle any polarity ambiguity in the ADC signal.
+                self.sync_data_block = np.abs(self.channel_data_blocks[2].data)
 
     #endregion
+    
 
+    
 class OpenEphysStreamer (object):
 
     #region Constructor
@@ -89,7 +117,11 @@ class OpenEphysStreamer (object):
         j_msg = json.dumps(d)
 
         #Send the message
-        self.event_socket.send(j_msg.encode('utf-8'))
+        try:
+            self.event_socket.send(j_msg.encode('utf-8'))
+        except Exception as ex:
+            print(f"An unexpected error occurred: {ex}")
+            pass
         self.last_heartbeat_time = time.time()
         self.socket_waits_reply = True
 

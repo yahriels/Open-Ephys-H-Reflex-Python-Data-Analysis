@@ -82,10 +82,59 @@ class MhRecruitmentCurveTrial:
         #Define a numpy array to hold trial data
         self.trial_data: np.ndarray = np.zeros(1, dtype=np.float32)
 
+        #Define a numpy array to hold the ADC sync line data for this trial
+        #(used for precise stim-onset alignment; populated when file_version >= 1)
+        self.sync_data: np.ndarray = np.zeros(1, dtype=np.float32)
+
         #Create variables to hold trial parameters
         self.min_initiation_threshold: float = 0.0
         self.max_initiation_threshold: float = 0.0
         self.stimulation_amplitude_ma: float = 0.0
+
+        # --- Timing / sync debug fields (file format version 2) ---
+
+        #Unix epoch milliseconds recorded at the instant trigger_single() was called.
+        #Lets you correlate the trigger moment against Open Ephys sample timestamps.
+        self.trigger_wall_time_ms: int = 0
+
+        #Index into sync_data of the first onset sample that crossed STIM_ONSET_THRESHOLD.
+        #-1 means no threshold crossing was found and the fallback position was used.
+        self.onset_sample_index: int = -1
+
+        #1 if onset was positively identified via a threshold crossing, 0 if the fallback
+        #position (bin_sample_count) was used because no crossing was found.
+        self.onset_detected: int = 0
+
+        #Index into sync_data of the first sample that dropped below STIM_END_THRESHOLD
+        #after the onset.  -1 means the end was not detected within the recorded window.
+        self.stim_end_sample_index: int = -1
+
+        #Stim duration expressed in samples (stim_end_sample_index − onset_sample_index).
+        #0 when end was not detected.
+        self.stim_duration_samples: int = 0
+
+        #Stim duration expressed in milliseconds.
+        self.stim_duration_ms: float = 0.0
+
+        #Maximum sync voltage observed inside the onset search window.
+        #Use this to tune STIM_ONSET_THRESHOLD: if this value is consistently below
+        #the threshold the pulse is not being captured.
+        self.sync_peak_voltage: float = 0.0
+
+        #Number of data frames that were received by the RECORD state but discarded
+        #because their timestamp_emitted pre-dated the trigger call.  A non-zero value
+        #here confirms the queued-frame race condition was active on this trial.
+        self.n_pre_trigger_frames_discarded: int = 0
+
+        #timestamp_emitted (Unix ms, set by the background thread) of every post-trigger
+        #frame that was accumulated during the RECORD state.  Compare against
+        #trigger_wall_time_ms to verify the timing of incoming data relative to the trigger.
+        self.frame_received_timestamps_ms: np.ndarray = np.zeros(0, dtype=np.uint64)
+
+        #Open Ephys absolute sample counter (sample_id) of the first post-trigger frame.
+        #Cross-reference with the Open Ephys recording to find the exact sample position
+        #in the continuous data stream where post-trigger accumulation began.
+        self.first_post_trigger_frame_sample_id: int = 0
 
         pass
 
@@ -99,7 +148,7 @@ class MhRecruitmentCurveTrial:
         self.max_initiation_threshold = max_init_threshold
         self.stimulation_amplitude_ma = stim_amp
 
-    def read_from_file (self, fid: BinaryIO) -> None:
+    def read_from_file (self, fid: BinaryIO, file_version: int = 0) -> None:
         #Read the timestamp for this trial
         self.start_time = FileIO_Helpers.read_datetime(fid)
 
@@ -112,6 +161,24 @@ class MhRecruitmentCurveTrial:
 
         #Read the trial data
         self.trial_data = FileIO_Helpers.read_array(fid, "float32")
+
+        #Read the ADC sync line data (added in file format version 1)
+        if (file_version >= 1):
+            self.sync_data = np.array(FileIO_Helpers.read_array(fid, "float32"), dtype=np.float32)
+
+        #Read timing / sync debug fields (added in file format version 2)
+        if (file_version >= 2):
+            self.trigger_wall_time_ms = FileIO_Helpers.read(fid, "uint64")
+            self.onset_sample_index = FileIO_Helpers.read(fid, "int32")
+            self.onset_detected = FileIO_Helpers.read(fid, "int8")
+            self.stim_end_sample_index = FileIO_Helpers.read(fid, "int32")
+            self.stim_duration_samples = FileIO_Helpers.read(fid, "int32")
+            self.stim_duration_ms = FileIO_Helpers.read(fid, "float32")
+            self.sync_peak_voltage = FileIO_Helpers.read(fid, "float32")
+            self.n_pre_trigger_frames_discarded = FileIO_Helpers.read(fid, "int32")
+            self.frame_received_timestamps_ms = np.array(
+                FileIO_Helpers.read_array(fid, "uint64"), dtype=np.uint64)
+            self.first_post_trigger_frame_sample_id = FileIO_Helpers.read(fid, "uint64")
 
     def save_to_file (self, fid: BinaryIO) -> None:
         #Save a trial block indicator
@@ -129,6 +196,21 @@ class MhRecruitmentCurveTrial:
 
         #Save the trial data
         FileIO_Helpers.write_array(fid, "float32", self.trial_data)
+
+        #Save the ADC sync line data (file format version 1+)
+        FileIO_Helpers.write_array(fid, "float32", self.sync_data)
+
+        #Save timing / sync debug fields (file format version 2+)
+        FileIO_Helpers.write(fid, "uint64", self.trigger_wall_time_ms)
+        FileIO_Helpers.write(fid, "int32", self.onset_sample_index)
+        FileIO_Helpers.write(fid, "int8", self.onset_detected)
+        FileIO_Helpers.write(fid, "int32", self.stim_end_sample_index)
+        FileIO_Helpers.write(fid, "int32", self.stim_duration_samples)
+        FileIO_Helpers.write(fid, "float32", self.stim_duration_ms)
+        FileIO_Helpers.write(fid, "float32", self.sync_peak_voltage)
+        FileIO_Helpers.write(fid, "int32", self.n_pre_trigger_frames_discarded)
+        FileIO_Helpers.write_array(fid, "uint64", self.frame_received_timestamps_ms)
+        FileIO_Helpers.write(fid, "uint64", self.first_post_trigger_frame_sample_id)
 
     #endregion
 
@@ -164,7 +246,7 @@ class MhRecruitmentCurveDataFile:
             block_id: int = struct.unpack(FileIO_Helpers.type_dictionary["int32"], chunk)[0]
             if (block_id == HReflexDataFileBlockIds.MH_RECRUITMENT_CURVE_TRIAL_BLOCK):
                 trial: MhRecruitmentCurveTrial = MhRecruitmentCurveTrial()
-                trial.read_from_file(fid)
+                trial.read_from_file(fid, self.header.file_version)
 
                 self.trials.append(trial)
             elif (block_id == HReflexDataFileBlockIds.EMG_DATA_BLOCK):
