@@ -53,8 +53,8 @@ TRIAL_RECORD_MS = 100                    # ms post-stim recording window
 TRIAL_RECORD_SAMPLES = int(TRIAL_RECORD_MS * SAMPLE_RATE / 1000)  # 500 samples
 MS_PER_SAMPLE = 1000.0 / SAMPLE_RATE    # 0.2 ms/sample
 
-STIM_ONSET_THRESHOLD = 1.0  # V -- ADC level marking stim onset rising edge
-STIM_END_THRESHOLD   = 0.6  # V -- ADC level below which stim pulse has ended
+STIM_ONSET_THRESHOLD = 4.5  # V -- ADC level marking stim onset rising edge
+STIM_END_THRESHOLD   = 1.9  # V -- ADC level below which stim pulse has ended
 
 # Block IDs (mirrors HReflexDataFileBlockIds)
 BLOCK_EMG_DATA       = 1
@@ -356,11 +356,22 @@ def get_trial_window(trial: MhRecTrial,
                      end_threshold: float = STIM_END_THRESHOLD):
     """Extract the peri-stimulus window for one MhRecTrial.
 
+    For file_version >= 2 trials the app-computed onset_sample_index is used
+    directly (it was detected with the live STIM_ONSET_THRESHOLD at record time).
+    For older trials onset is re-derived from sync_data.
+
     Returns (t_ms, emg, adc_or_None, stim_end_ms_or_None).
     """
-    has_sync  = len(trial.sync_data) > 1
-    onset_idx = detect_stim_onset(trial.sync_data, bin_samples, record_samples,
-                                  onset_threshold) if has_sync else bin_samples
+    has_sync = len(trial.sync_data) > 1
+
+    # Prefer the pre-computed onset stored in the trial (file_version >= 2)
+    if getattr(trial, 'onset_detected', 0) == 1 and getattr(trial, 'onset_sample_index', -1) >= 0:
+        onset_idx = trial.onset_sample_index
+    elif has_sync:
+        onset_idx = detect_stim_onset(trial.sync_data, bin_samples, record_samples,
+                                      onset_threshold)
+    else:
+        onset_idx = bin_samples
 
     pre_s = int(pre_plot_ms  / ms_per_sample)
     pst_s = int(post_plot_ms / ms_per_sample)
@@ -384,6 +395,209 @@ def get_trial_window(trial: MhRecTrial,
             stim_end_ms = float(ends[0]) * ms_per_sample
 
     return t_ms, emg, adc, stim_end_ms
+
+
+def get_trial_context_window(trial: 'MhRecTrial',
+                             emg_blocks: list,
+                             pre_s: float = 10.0,
+                             post_s: float = 10.0,
+                             sample_rate: float = SAMPLE_RATE_HINT,
+                             bin_samples: int = BIN_SAMPLES):
+    """Extract a wide context window (default ±10 s) from the continuous EMG record.
+
+    Uses ``first_post_trigger_frame_sample_id`` (file_version >= 2) to locate the
+    trial onset in the continuous ``emg_blocks`` list, then stitches together the
+    blocks that overlap the requested window.
+
+    Falls back to matching via ``ts_background_emitted`` wall-clock ms vs
+    ``trigger_wall_time_ms`` when sample-ID info is unavailable.
+
+    Parameters
+    ----------
+    trial      : MhRecTrial – the trial whose onset anchors the window.
+    emg_blocks : list[EmgDataBlock] – the continuous EMG blocks (hrs2_emg_blocks).
+    pre_s      : seconds of data to include *before* the onset (default 10 s).
+    post_s     : seconds of data to include *after*  the onset (default 10 s).
+    sample_rate: recording sample rate in Hz.
+    bin_samples: number of pre-trigger samples prepended to trial_data.
+
+    Returns
+    -------
+    (t_s, emg_filt, onset_idx) where
+        t_s        – time axis in seconds, zeroed at the detected onset
+        emg_filt   – filtered EMG signal over the window
+        onset_idx  – index in the returned arrays corresponding to t_s = 0
+    Returns None if the onset position cannot be determined or no blocks overlap.
+    """
+    if not emg_blocks:
+        return None
+
+    pre_samp  = int(pre_s  * sample_rate)
+    post_samp = int(post_s * sample_rate)
+
+    # ── Locate onset in OE sample space ──────────────────────────────────────
+    onset_oe: int | None = None
+
+    first_id = getattr(trial, 'first_post_trigger_frame_sample_id', 0)
+    onset_idx_in_trial = getattr(trial, 'onset_sample_index', -1)
+
+    if first_id > 0 and onset_idx_in_trial >= 0:
+        # onset_sample_index is relative to the start of trial_data;
+        # the first BIN_SAMPLES of trial_data are pre-trigger, so:
+        onset_oe = int(first_id) + (onset_idx_in_trial - bin_samples)
+    else:
+        # Fallback: use trigger wall-clock time to find nearest block by
+        # ts_background_emitted (background-thread wall-clock ms).
+        tw = getattr(trial, 'trigger_wall_time_ms', 0)
+        if tw > 0:
+            best_diff = None
+            best_block_idx = None
+            cumulative = 0
+            for bi, blk in enumerate(emg_blocks):
+                d = abs(int(getattr(blk, 'ts_background_emitted', 0)) - int(tw))
+                if best_diff is None or d < best_diff:
+                    best_diff = d
+                    best_block_idx = bi
+                cumulative += len(blk.filtered)
+            if best_block_idx is not None:
+                # Use ts_open_ephys_sent as OE sample anchor
+                blk = emg_blocks[best_block_idx]
+                onset_oe = int(blk.ts_open_ephys_sent) + bin_samples
+        if onset_oe is None:
+            return None
+
+    target_start = onset_oe - pre_samp
+    target_end   = onset_oe + post_samp
+
+    # ── Stitch blocks that overlap [target_start, target_end] ────────────────
+    segments: list[np.ndarray] = []
+    adc_segments: list[np.ndarray] = []
+    collected_start: int | None = None  # OE sample of first collected sample
+
+    for blk in emg_blocks:
+        blk_start = int(blk.ts_open_ephys_sent)
+        blk_end   = blk_start + len(blk.filtered) - 1
+
+        if blk_end < target_start:
+            continue
+        if blk_start > target_end:
+            break
+
+        clip_lo = max(0, target_start - blk_start)
+        clip_hi = min(len(blk.filtered), target_end - blk_start + 1)
+        if clip_lo >= clip_hi:
+            continue
+
+        chunk = blk.filtered[clip_lo:clip_hi]
+        if collected_start is None:
+            collected_start = blk_start + clip_lo
+        segments.append(chunk)
+
+        # Stitch ADC channel (look for 'ADC' in channel names, fall back to index 2)
+        adc_idx = None
+        for ci, cn in enumerate(blk.channel_names):
+            if 'ADC' in cn.upper() and ci < len(blk.raw_channels):
+                adc_idx = ci
+                break
+        if adc_idx is None and len(blk.raw_channels) >= 3:
+            adc_idx = 2
+        if adc_idx is not None:
+            adc_segments.append(blk.raw_channels[adc_idx][clip_lo:clip_hi])
+
+    if not segments:
+        return None
+
+    emg_cat = np.concatenate(segments)
+    adc_cat = np.concatenate(adc_segments) if len(adc_segments) == len(segments) else None
+    onset_in_window = onset_oe - collected_start
+    t_s = (np.arange(len(emg_cat)) - onset_in_window) / sample_rate
+
+    return t_s, emg_cat, onset_in_window, adc_cat
+
+
+def classify_trials(trials, file_version=0,
+                    bin_samples=BIN_SAMPLES, record_samples=TRIAL_RECORD_SAMPLES,
+                    onset_threshold=STIM_ONSET_THRESHOLD, end_threshold=STIM_END_THRESHOLD):
+    """Scan all MhRecTrial objects and return a list of dicts describing each trial's
+    ADC-sync quality.
+
+    For file_version >= 2, pre-computed fields on each trial are used directly.
+    For file_version < 2, onset detection is re-derived from sync_data.
+
+    Keys in each returned dict:
+        idx                              -- 0-based trial index
+        amp_ma                           -- stimulation amplitude (mA)
+        has_sync                         -- sync_data present (file_version >= 1)
+        onset_found                      -- True if a real rising edge was detected
+        onset_idx                        -- sample index used for onset
+        adc_peak                         -- max ADC value in the onset search window
+        adc_noise_std                    -- std of ADC pre-stim baseline
+        stim_end_ms                      -- ms after onset where ADC dropped (or None)
+        stim_duration_ms                 -- pulse duration in ms (0 if end not found)
+        n_pre_trigger_frames_discarded   -- queued frames discarded (v2 only, else 0)
+        first_post_trigger_frame_sample_id -- OE sample counter of first RECORD frame
+        failed                           -- True when onset_found is False
+    """
+    search_start = int(bin_samples * 0.6)
+    results = []
+
+    for i, tr in enumerate(trials):
+        has_sync = len(tr.sync_data) > 1
+        rec = {'idx': i, 'amp_ma': tr.stimulation_amplitude_ma, 'has_sync': has_sync}
+
+        if not has_sync:
+            rec.update(onset_found=False, onset_idx=bin_samples,
+                       adc_peak=float('nan'), adc_noise_std=float('nan'),
+                       stim_end_ms=None, stim_duration_ms=0.0,
+                       n_pre_trigger_frames_discarded=0,
+                       first_post_trigger_frame_sample_id=0,
+                       failed=True)
+            results.append(rec)
+            continue
+
+        if file_version >= 2:
+            onset_found = bool(tr.onset_detected)
+            onset_idx   = tr.onset_sample_index if onset_found else bin_samples
+            adc_peak    = float(tr.sync_peak_voltage)
+            stim_end_ms = (float(tr.stim_duration_ms)
+                           if tr.stim_end_sample_index >= 0 else None)
+            stim_dur_ms = float(tr.stim_duration_ms)
+            n_disc      = int(tr.n_pre_trigger_frames_discarded)
+            first_sid   = int(tr.first_post_trigger_frame_sample_id)
+        else:
+            sd = np.asarray(tr.sync_data, dtype=float)
+            search_end = min(bin_samples + record_samples, len(sd))
+            window = sd[search_start:search_end]
+            cands  = np.where(window >= onset_threshold)[0]
+            if len(cands) > 0:
+                onset_idx   = search_start + int(cands[0])
+                onset_found = True
+            else:
+                onset_idx   = bin_samples
+                onset_found = False
+            adc_peak    = float(window.max()) if len(window) > 0 else float('nan')
+            stim_end_ms = None
+            stim_dur_ms = 0.0
+            if onset_idx < len(sd):
+                ends = np.where(sd[onset_idx:] < end_threshold)[0]
+                if len(ends) > 0:
+                    stim_end_ms = float(ends[0]) * MS_PER_SAMPLE
+                    stim_dur_ms = stim_end_ms
+            n_disc    = 0
+            first_sid = 0
+
+        sd_for_noise = np.asarray(tr.sync_data, dtype=float)
+        pre_window = sd_for_noise[:search_start]
+        adc_noise_std = float(pre_window.std()) if len(pre_window) > 0 else float('nan')
+
+        rec.update(onset_found=onset_found, onset_idx=onset_idx,
+                   adc_peak=adc_peak, adc_noise_std=adc_noise_std,
+                   stim_end_ms=stim_end_ms, stim_duration_ms=stim_dur_ms,
+                   n_pre_trigger_frames_discarded=n_disc,
+                   first_post_trigger_frame_sample_id=first_sid,
+                   failed=not onset_found)
+        results.append(rec)
+    return results
 
 
 # ====================================================================
