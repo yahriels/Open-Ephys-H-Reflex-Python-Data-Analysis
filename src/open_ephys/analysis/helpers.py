@@ -306,21 +306,21 @@ def read_hrs2(filepath: str):
 def find_hrs_files(directory: str):
     """Auto-detect the .hrs1 and .hrs2 files in a recording directory.
 
-    Returns (hrs1_path, hrs2_path). Raises FileNotFoundError if either is missing.
+    Returns (hrs1_path, hrs2_path). hrs2_path is None if no .hrs2 file is found.
+    Raises FileNotFoundError only if the .hrs1 file is missing.
     """
     hrs1_files = globmod.glob(os.path.join(directory, "*.hrs1"))
     hrs2_files = globmod.glob(os.path.join(directory, "*.hrs2"))
 
     if not hrs1_files:
         raise FileNotFoundError(f"No .hrs1 file found in '{directory}'")
-    if not hrs2_files:
-        raise FileNotFoundError(f"No .hrs2 file found in '{directory}'")
     if len(hrs1_files) > 1:
         print(f"Warning: multiple .hrs1 files found, using: {hrs1_files[0]}")
     if len(hrs2_files) > 1:
         print(f"Warning: multiple .hrs2 files found, using: {hrs2_files[0]}")
 
-    return hrs1_files[0], hrs2_files[0]
+    hrs2_path = hrs2_files[0] if hrs2_files else None
+    return hrs1_files[0], hrs2_path
 
 
 # ====================================================================
