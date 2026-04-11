@@ -237,18 +237,22 @@ def read_hrs1(filepath: str):
             if len(chunk) < 4:
                 break
             block_id = struct.unpack('i', chunk)[0]
-            if block_id == BLOCK_EMG_CHAR_TRIAL:
-                t = EmgCharTrial()
-                t.trial_end_datetime               = hrs_read_datetime(fid)
-                t.trial_start_index                = hrs_read_val(fid, 'uint64')
-                t.trial_start_open_ephys_millis    = hrs_read_val(fid, 'uint64')
-                t.trial_start_open_ephys_sample_id = hrs_read_val(fid, 'uint64')
-                t.grand_mean        = hrs_read_val(fid, 'float32')
-                t.bins              = hrs_read_array(fid, 'float32')
-                t.monitored_signal  = hrs_read_array(fid, 'float32')
-                trials.append(t)
-            elif block_id == BLOCK_EMG_DATA:
-                emg_blocks.append(_read_emg_data_block(fid))
+            try:
+                if block_id == BLOCK_EMG_CHAR_TRIAL:
+                    t = EmgCharTrial()
+                    t.trial_end_datetime               = hrs_read_datetime(fid)
+                    t.trial_start_index                = hrs_read_val(fid, 'uint64')
+                    t.trial_start_open_ephys_millis    = hrs_read_val(fid, 'uint64')
+                    t.trial_start_open_ephys_sample_id = hrs_read_val(fid, 'uint64')
+                    t.grand_mean        = hrs_read_val(fid, 'float32')
+                    t.bins              = hrs_read_array(fid, 'float32')
+                    t.monitored_signal  = hrs_read_array(fid, 'float32')
+                    trials.append(t)
+                elif block_id == BLOCK_EMG_DATA:
+                    emg_blocks.append(_read_emg_data_block(fid))
+            except struct.error:
+                # Last block was truncated (file closed mid-write); discard it.
+                break
 
     return header, trials, emg_blocks
 
