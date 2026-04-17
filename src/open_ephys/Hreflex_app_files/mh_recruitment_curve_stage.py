@@ -29,6 +29,9 @@ class MhRecruitmentCurveStage_TrialInitiationData:
         #Declare a variable to hold the absolute value monitored signal
         self.monitored_signal_abs: np.ndarray = np.zeros(1)
 
+        #Declare a variable to hold the unipolar (non-differential) filtered rolling buffer
+        self.monitored_signal_unipolar: np.ndarray = np.zeros(1)
+
         #Declare a variable to hold the ADC sync line rolling buffer
         self.sync_signal: np.ndarray = np.zeros(1)
 
@@ -64,12 +67,13 @@ class MhRecruitmentCurveStage_TrialInitiationData:
         #Re-size the appropriate arrays to hold the data we care about
         self.monitored_signal = np.zeros(self.monitored_signal_sample_count)
         self.monitored_signal_abs = np.zeros(self.monitored_signal_sample_count)
+        self.monitored_signal_unipolar = np.zeros(self.monitored_signal_sample_count)
         self.sync_signal = np.zeros(self.monitored_signal_sample_count, dtype=np.float32)
         self.bins = np.zeros(bin_count)
 
         #We are done. return from this function.
         return
-    
+
     def process (self, data_frame: OpenEphysDataFrame, current_initiation_min: float, current_initiation_max: float) -> bool:
         should_initiate_trial: bool = False
 
@@ -79,11 +83,13 @@ class MhRecruitmentCurveStage_TrialInitiationData:
         #Add the new data to the monitored signal (filtered differential signal)
         self.monitored_signal = np.concatenate([self.monitored_signal, data_frame.filtered_data_block])
         self.monitored_signal_abs = np.concatenate([self.monitored_signal_abs, data_frame.abs_data_block])
+        self.monitored_signal_unipolar = np.concatenate([self.monitored_signal_unipolar, data_frame.unipolar_filtered_data_block])
         self.sync_signal = np.concatenate([self.sync_signal, data_frame.sync_data_block])
         elements_to_remove: int = len(self.monitored_signal) - self.monitored_signal_sample_count
         if (elements_to_remove > 0):
             self.monitored_signal = self.monitored_signal[elements_to_remove:]
             self.monitored_signal_abs = self.monitored_signal_abs[elements_to_remove:]
+            self.monitored_signal_unipolar = self.monitored_signal_unipolar[elements_to_remove:]
             self.sync_signal = self.sync_signal[elements_to_remove:]
 
         #Bin the data
@@ -127,7 +133,7 @@ class MhRecruitmentCurveStage (Stage):
 
 
     #This defines the trial recording duration in milliseconds
-    TRIAL_RECORDING_DURATION_MILLISECONDS: int = 100
+    TRIAL_RECORDING_DURATION_MILLISECONDS: int = 500
 
 
 
@@ -216,11 +222,17 @@ class MhRecruitmentCurveStage (Stage):
         #Create an object to hold a set of stimulation amplitudes that we will sweep through
         self._stimulation_amplitudes: np.ndarray = np.array([], dtype=np.float64)
 
+        #Create a variable that will store the user-defined minimum stimulation amplitude
+        self._user_min_stimulation_amplitude: float = MhRecruitmentCurveStage.STIMULATION_AMPLITUDE_MIN
+
         #Create a variable that will store the user-defined maximum stimulation amplitude
         self._user_max_stimulation_amplitude: float = MhRecruitmentCurveStage.STIMULATION_AMPLITUDE_MAX
 
         #Create a variable that will store the user-defined stimulation amplitude step-size
         self._user_stimulation_amplitude_step_size: float = MhRecruitmentCurveStage.STIMULATION_AMPLITUDE_STEP
+
+        #Create a flag to control whether stimulation intensities are swept sequentially (ascending) or randomly
+        self._sequential_stimulation: bool = False
 
         #Create a variable that will store the user-defined minimum stimulation interval
         self._user_minimum_stimulation_interval_milliseconds: int = MhRecruitmentCurveStage.MINIMUM_INTERTRIAL_INTERVAL_MILLISECONDS
@@ -231,8 +243,10 @@ class MhRecruitmentCurveStage (Stage):
         self._user_h_wave_window_start_time_milliseconds: float = 0
         self._user_h_wave_window_end_time_milliseconds: float = 0
 
-        #Trial signal visibility flags: index 0 = EMG diff, index 1 = ADC sync line
-        self._trial_signal_flags: list[bool] = [True, False]
+        #Trial signal visibility flags:
+        #  index 0 = bipolar filtered (diff), index 1 = ADC sync line, index 2 = |bipolar filtered|
+        #  index 3 = unipolar filtered, index 4 = |unipolar filtered|
+        self._trial_signal_flags: list[bool] = [True, False, False, False, False]
 
         #Secondary ViewBox used to render the ADC sync line on a right-hand Y-axis.
         #Kept as an instance variable so it can be cleaned up before each redraw.
@@ -435,7 +449,7 @@ class MhRecruitmentCurveStage (Stage):
                 elapsed_ms: int = int((current_datetime - self._trials[-1].start_time).total_seconds() * 1000.0)
 
                 #If we are still inside of the inter-trial timeout period, then just return immediately
-                if (elapsed_ms < MhRecruitmentCurveStage.MINIMUM_INTERTRIAL_INTERVAL_MILLISECONDS):
+                if (elapsed_ms < self._user_minimum_stimulation_interval_milliseconds):
                     return
 
             #Check to see if we should initiate a trial
@@ -472,6 +486,9 @@ class MhRecruitmentCurveStage (Stage):
                 #Transfer the last 50 ms of trial initiation data into the trial object
                 self._current_trial.trial_data = self._current_trial_initiation_data.monitored_signal[-MhRecruitmentCurveStage.bin_sample_count():]
 
+                #Transfer the last 50 ms of unipolar initiation data into the trial object
+                self._current_trial.unipolar_trial_data = self._current_trial_initiation_data.monitored_signal_unipolar[-MhRecruitmentCurveStage.bin_sample_count():].copy()
+
                 #Transfer the last 50 ms of ADC sync line data into the trial object (pre-stim window)
                 self._current_trial.sync_data = self._current_trial_initiation_data.sync_signal[-MhRecruitmentCurveStage.bin_sample_count():].copy()
 
@@ -501,6 +518,9 @@ class MhRecruitmentCurveStage (Stage):
                 if (ApplicationConfiguration.stimulator is not None):
                     ApplicationConfiguration.stimulator.trigger_single()
 
+                #Notify listeners (e.g. live EMG overlay) that a stim was just sent
+                self.signals.stim_triggered.emit()
+
         elif (self._current_trial_state == MhRecruitmentCurveStage.TRIAL_STATE_RECORD):
 
             #Only accumulate frames that were assembled by the background thread AFTER the
@@ -529,6 +549,7 @@ class MhRecruitmentCurveStage (Stage):
 
                 #Copy data into the trial object until we have 100 ms of post-stim data
                 self._current_trial.trial_data = np.concatenate([self._current_trial.trial_data, data_frame.filtered_data_block])
+                self._current_trial.unipolar_trial_data = np.concatenate([self._current_trial.unipolar_trial_data, data_frame.unipolar_filtered_data_block])
                 self._current_trial.sync_data = np.concatenate([self._current_trial.sync_data, data_frame.sync_data_block])
 
                 #Check to see if we have enough data
@@ -587,8 +608,8 @@ class MhRecruitmentCurveStage (Stage):
                 self._average_ms_between_trials = np.mean(trial_isi_list)
 
             #Plot data about this trial in the application's charts
-            ## TO DO
             self._update_trial_plot()
+            self.update_session_plot()
 
             #Set the state
             self._current_trial_state = MhRecruitmentCurveStage.TRIAL_STATE_NOT_SETUP
@@ -630,10 +651,10 @@ class MhRecruitmentCurveStage (Stage):
         return ["Most recent trial"]
 
     def get_trial_signal_options (self) -> list[str]:
-        return ["EMG signal", "ADC sync line"]
+        return ["EMG signal", "ADC sync line", "|EMG| (abs)", "Unipolar EMG signal", "|Unipolar EMG| (abs)"]
 
     def get_session_plot_options (self) -> list[str]:
-        return ["S1 Histogram", "Recruitment Curve"]
+        return ["S1 Histogram", "Recruitment Curve", "Unipolar Recruitment Curve"]
 
     def update_trial_plot (self) -> None:
         #This stage does not support updating the "most recent trial plot" from an external function call.
@@ -645,8 +666,22 @@ class MhRecruitmentCurveStage (Stage):
             self._update_histogram_plot()
         elif (self._session_plot_index == 1):
             self._update_recruitment_curve_plot()
+        elif (self._session_plot_index == 2):
+            self._update_unipolar_recruitment_curve_plot()
 
         pass
+
+    def set_stim_params (self, min_amp: float, max_amp: float, step: float, isi_ms: int, sequential: bool) -> str:
+        self._user_min_stimulation_amplitude = min_amp
+        self._user_max_stimulation_amplitude = max_amp
+        self._user_stimulation_amplitude_step_size = step
+        self._user_minimum_stimulation_interval_milliseconds = isi_ms
+        self._sequential_stimulation = sequential
+        #Force regeneration of the amplitude list on the next trial setup
+        self._stimulation_amplitudes = np.array([], dtype=np.float64)
+        order = "sequential" if sequential else "randomized"
+        return (f"Stim params set: min={min_amp:.2f} mA, max={max_amp:.2f} mA, "
+                f"step={step:.2f} mA, ISI={isi_ms} ms, order={order}")
 
     #endregion
 
@@ -657,7 +692,7 @@ class MhRecruitmentCurveStage (Stage):
 
             #Create a file header object
             header: MhRecruitmentCurveHeader = MhRecruitmentCurveHeader(
-                2,
+                3,
                 self._subject_id,
                 datetime.now(),
                 self.stage_name,
@@ -693,7 +728,170 @@ class MhRecruitmentCurveStage (Stage):
         pass
 
     def _update_recruitment_curve_plot (self) -> None:
-        pass
+        self._session_widget.clear()
+        self._session_widget.getPlotItem().setLabel('bottom', 'Stim Amp (mA)')
+        self._session_widget.getPlotItem().setLabel('left', 'Pk Amp (µV)')
+
+        if len(self._trials) == 0:
+            return
+
+        m_start = self._user_m_wave_window_start_time_milliseconds
+        m_end   = self._user_m_wave_window_end_time_milliseconds
+        h_start = self._user_h_wave_window_start_time_milliseconds
+        h_end   = self._user_h_wave_window_end_time_milliseconds
+
+        if m_end <= m_start and h_end <= h_start:
+            text = pg.TextItem("Set M/H wave windows to view recruitment curve", anchor=(0.5, 0.5))
+            self._session_widget.addItem(text)
+            return
+
+        ms_per_sample = MhRecruitmentCurveStage.ms_per_sample()
+
+        m_dict: dict = {}
+        h_dict: dict = {}
+
+        for trial in self._trials:
+            amp_key = round(trial.stimulation_amplitude_ma, 2)
+            onset_idx = trial.onset_sample_index if trial.onset_sample_index >= 0 else MhRecruitmentCurveStage.bin_sample_count()
+
+            n = len(trial.trial_data)
+            t_ms = (np.arange(n) - onset_idx) * ms_per_sample
+            emg  = np.abs(trial.trial_data)
+
+            if m_end > m_start:
+                m_mask = (t_ms >= m_start) & (t_ms <= m_end)
+                if np.any(m_mask):
+                    m_dict.setdefault(amp_key, []).append(float(np.max(emg[m_mask])))
+
+            if h_end > h_start:
+                h_mask = (t_ms >= h_start) & (t_ms <= h_end)
+                if np.any(h_mask):
+                    h_dict.setdefault(amp_key, []).append(float(np.max(emg[h_mask])))
+
+        all_amps = sorted(set(m_dict.keys()) | set(h_dict.keys()))
+        if len(all_amps) == 0:
+            return
+
+        positions = np.arange(len(all_amps), dtype=float)
+
+        self._session_widget.addLegend(offset=(0, 0))
+
+        if m_end > m_start and len(m_dict) > 0:
+            m_means = np.array([np.mean(m_dict.get(a, [0])) for a in all_amps])
+            m_sems  = np.array([float(np.std(m_dict[a]) / np.sqrt(len(m_dict[a]))) if len(m_dict.get(a, [])) > 1 else 0.0 for a in all_amps])
+            m_pen = pg.mkPen(color=(0, 0, 200), width=2)
+            self._session_widget.plot(positions - 0.1, m_means, pen=m_pen, symbol='o',
+                                      symbolBrush=(0, 0, 200), symbolSize=6, name='M-wave')
+            nonzero = m_sems > 0
+            if np.any(nonzero):
+                m_err = pg.ErrorBarItem(x=positions[nonzero] - 0.1, y=m_means[nonzero],
+                                        top=m_sems[nonzero], bottom=m_sems[nonzero],
+                                        pen=pg.mkPen(color=(0, 0, 200)))
+                self._session_widget.addItem(m_err)
+
+        if h_end > h_start and len(h_dict) > 0:
+            h_means = np.array([np.mean(h_dict.get(a, [0])) for a in all_amps])
+            h_sems  = np.array([float(np.std(h_dict[a]) / np.sqrt(len(h_dict[a]))) if len(h_dict.get(a, [])) > 1 else 0.0 for a in all_amps])
+            h_pen = pg.mkPen(color=(0, 160, 0), width=2)
+            self._session_widget.plot(positions + 0.1, h_means, pen=h_pen, symbol='o',
+                                      symbolBrush=(0, 160, 0), symbolSize=6, name='H-wave')
+            nonzero = h_sems > 0
+            if np.any(nonzero):
+                h_err = pg.ErrorBarItem(x=positions[nonzero] + 0.1, y=h_means[nonzero],
+                                        top=h_sems[nonzero], bottom=h_sems[nonzero],
+                                        pen=pg.mkPen(color=(0, 160, 0)))
+                self._session_widget.addItem(h_err)
+
+        #X-axis tick labels: show amplitude every 10 steps to avoid crowding
+        tick_pairs = [(int(i), f'{a:.1f}' if i % 10 == 0 else '') for i, a in enumerate(all_amps)]
+        self._session_widget.getPlotItem().getAxis('bottom').setTicks([tick_pairs])
+
+    def _update_unipolar_recruitment_curve_plot (self) -> None:
+        self._session_widget.clear()
+        self._session_widget.getPlotItem().setLabel('bottom', 'Stim Amp (mA)')
+        self._session_widget.getPlotItem().setLabel('left', 'Pk Amp (µV)')
+
+        if len(self._trials) == 0:
+            return
+
+        m_start = self._user_m_wave_window_start_time_milliseconds
+        m_end   = self._user_m_wave_window_end_time_milliseconds
+        h_start = self._user_h_wave_window_start_time_milliseconds
+        h_end   = self._user_h_wave_window_end_time_milliseconds
+
+        if m_end <= m_start and h_end <= h_start:
+            text = pg.TextItem("Set M/H wave windows to view unipolar recruitment curve", anchor=(0.5, 0.5))
+            self._session_widget.addItem(text)
+            return
+
+        ms_per_sample = MhRecruitmentCurveStage.ms_per_sample()
+
+        m_dict: dict = {}
+        h_dict: dict = {}
+
+        for trial in self._trials:
+            #Skip any trial that was recorded before unipolar data was available
+            if len(trial.unipolar_trial_data) <= 1:
+                continue
+
+            amp_key = round(trial.stimulation_amplitude_ma, 2)
+            onset_idx = trial.onset_sample_index if trial.onset_sample_index >= 0 else MhRecruitmentCurveStage.bin_sample_count()
+
+            n = len(trial.unipolar_trial_data)
+            t_ms = (np.arange(n) - onset_idx) * ms_per_sample
+            emg  = np.abs(trial.unipolar_trial_data)
+
+            if m_end > m_start:
+                m_mask = (t_ms >= m_start) & (t_ms <= m_end)
+                if np.any(m_mask):
+                    m_dict.setdefault(amp_key, []).append(float(np.max(emg[m_mask])))
+
+            if h_end > h_start:
+                h_mask = (t_ms >= h_start) & (t_ms <= h_end)
+                if np.any(h_mask):
+                    h_dict.setdefault(amp_key, []).append(float(np.max(emg[h_mask])))
+
+        all_amps = sorted(set(m_dict.keys()) | set(h_dict.keys()))
+        if len(all_amps) == 0:
+            return
+
+        positions = np.arange(len(all_amps), dtype=float)
+
+        self._session_widget.addLegend(offset=(0, 0))
+
+        #Light green dashed — M-wave unipolar
+        if m_end > m_start and len(m_dict) > 0:
+            m_means = np.array([np.mean(m_dict.get(a, [0])) for a in all_amps])
+            m_sems  = np.array([float(np.std(m_dict[a]) / np.sqrt(len(m_dict[a]))) if len(m_dict.get(a, [])) > 1 else 0.0 for a in all_amps])
+            m_color = (100, 210, 100)
+            m_pen = pg.mkPen(color=m_color, width=2, style=QtCore.Qt.DashLine)
+            self._session_widget.plot(positions - 0.1, m_means, pen=m_pen, symbol='o',
+                                      symbolBrush=m_color, symbolSize=6, name='M-wave (unipolar)')
+            nonzero = m_sems > 0
+            if np.any(nonzero):
+                m_err = pg.ErrorBarItem(x=positions[nonzero] - 0.1, y=m_means[nonzero],
+                                        top=m_sems[nonzero], bottom=m_sems[nonzero],
+                                        pen=pg.mkPen(color=m_color))
+                self._session_widget.addItem(m_err)
+
+        #Light blue dashed — H-wave unipolar
+        if h_end > h_start and len(h_dict) > 0:
+            h_means = np.array([np.mean(h_dict.get(a, [0])) for a in all_amps])
+            h_sems  = np.array([float(np.std(h_dict[a]) / np.sqrt(len(h_dict[a]))) if len(h_dict.get(a, [])) > 1 else 0.0 for a in all_amps])
+            h_color = (100, 180, 240)
+            h_pen = pg.mkPen(color=h_color, width=2, style=QtCore.Qt.DashLine)
+            self._session_widget.plot(positions + 0.1, h_means, pen=h_pen, symbol='o',
+                                      symbolBrush=h_color, symbolSize=6, name='H-wave (unipolar)')
+            nonzero = h_sems > 0
+            if np.any(nonzero):
+                h_err = pg.ErrorBarItem(x=positions[nonzero] + 0.1, y=h_means[nonzero],
+                                        top=h_sems[nonzero], bottom=h_sems[nonzero],
+                                        pen=pg.mkPen(color=h_color))
+                self._session_widget.addItem(h_err)
+
+        #X-axis tick labels: show amplitude every 10 steps to avoid crowding
+        tick_pairs = [(int(i), f'{a:.1f}' if i % 10 == 0 else '') for i, a in enumerate(all_amps)]
+        self._session_widget.getPlotItem().getAxis('bottom').setTicks([tick_pairs])
 
     def _update_histogram_plot (self) -> None:
         #Clear the plot
@@ -719,16 +917,33 @@ class MhRecruitmentCurveStage (Stage):
 
         #Plot vertical lines where the min and max thresholds are
         vert_line_pen = pg.mkPen(color=(255, 0, 0), width = 2.0, style = QtCore.Qt.DashLine)
-        min_thresh_line: pg.InfiniteLine = pg.InfiniteLine(self._current_min_initiation_threshold, 90, vert_line_pen, movable=False)
-        max_thresh_line: pg.InfiniteLine = pg.InfiniteLine(self._current_max_initiation_threshold, 90, vert_line_pen, movable=False)
+        min_thresh_line: pg.InfiniteLine = pg.InfiniteLine(self._current_min_initiation_threshold, 90, vert_line_pen, movable=False,
+            label='LB', labelOpts={'position': 0.9, 'color': (200, 0, 0)})
+        max_thresh_line: pg.InfiniteLine = pg.InfiniteLine(self._current_max_initiation_threshold, 90, vert_line_pen, movable=False,
+            label='UB', labelOpts={'position': 0.9, 'color': (200, 0, 0)})
         self._session_widget.addItem(min_thresh_line)
         self._session_widget.addItem(max_thresh_line)
+
+        #Quartile markers (Q1/Q2/Q3) from the S1 histogram data
+        if self._emg_histogram_data is not None and len(self._emg_histogram_data.quartiles) >= 3:
+            quartile_names  = ['Q1', 'Q2', 'Q3']
+            quartile_colors = [(0, 0, 200), (200, 0, 0), (0, 160, 0)]
+            for val, name, color in zip(self._emg_histogram_data.quartiles, quartile_names, quartile_colors):
+                pen = pg.mkPen(color=color, width=2.0, style=QtCore.Qt.DashLine)
+                line = pg.InfiniteLine(
+                    pos=val, angle=90, pen=pen, movable=False,
+                    label=name,
+                    labelOpts={'position': 0.75, 'color': color}
+                )
+                self._session_widget.addItem(line)
 
     def _update_trial_plot (self) -> None:
         #Remove any ADC ViewBox left from a previous draw before clearing
         self._cleanup_trial_adc_viewbox()
 
-        #Clear the plot
+        #Clear the plot and set background: red tint for failed (no ADC pulse), white for success.
+        #Background must be set before clear() so it applies to the fresh plot.
+        self._trial_widget.setBackground(pg.mkColor(255, 220, 220) if not self._current_trial.onset_detected else 'w')
         self._trial_widget.clear()
         self._trial_widget.getPlotItem().hideAxis('right')
         self._trial_widget.getPlotItem().setLabel('bottom', 'Time (ms)')
@@ -760,7 +975,7 @@ class MhRecruitmentCurveStage (Stage):
         #first post-trigger frame, which the delay-based offset was skipping past.
         search_start: int = trigger_sample
         search_end: int = min(
-            trigger_sample + int(120.0 / MhRecruitmentCurveStage.ms_per_sample()),
+            trigger_sample + int(500.0 / MhRecruitmentCurveStage.ms_per_sample()),
             len(self._current_trial.sync_data)
         )
 
@@ -791,11 +1006,21 @@ class MhRecruitmentCurveStage (Stage):
             f"sync_data_len={len(self._current_trial.sync_data)}"
         )
 
+        if not onset_was_detected:
+            fail_msg: str = (
+                f"[FAILED STIM TRIAL] No ADC pulse detected above {MhRecruitmentCurveStage.STIM_ONSET_THRESHOLD} V "
+                f"in search window [{search_start}, {search_end}] — "
+                f"plot zeroed at trigger boundary (sample {trigger_sample}). "
+                f"Check stimulator connection and ADC sync cable."
+            )
+            print(fail_msg)
+            self.signals.new_message.emit(SessionMessage(fail_msg))
+
         #-------------------------------------------------------------------
         # Phase 2: Cut peri-stimulus window (-20 ms … +30 ms around onset)
         #-------------------------------------------------------------------
-        pre_stim_samples: int = int(20.0 / MhRecruitmentCurveStage.ms_per_sample())
-        post_stim_samples: int = int(30.0 / MhRecruitmentCurveStage.ms_per_sample())
+        pre_stim_samples: int = int(2.0 / MhRecruitmentCurveStage.ms_per_sample())
+        post_stim_samples: int = int(15.0 / MhRecruitmentCurveStage.ms_per_sample())
 
         idx_pre: int = max(0, stim_onset_idx - pre_stim_samples)
         idx_post: int = min(len(self._current_trial.trial_data), stim_onset_idx + post_stim_samples)
@@ -809,11 +1034,58 @@ class MhRecruitmentCurveStage (Stage):
         samples_before_onset: int = stim_onset_idx - idx_pre
         x_data = (np.arange(0, num_samples) - samples_before_onset) * MhRecruitmentCurveStage.ms_per_sample()
 
-        #Plot EMG signal (always shown while flag index 0 is True)
+        #M-wave and H-wave shaded regions (drawn before signal so traces render on top)
+        m_start = self._user_m_wave_window_start_time_milliseconds
+        m_end   = self._user_m_wave_window_end_time_milliseconds
+        h_start = self._user_h_wave_window_start_time_milliseconds
+        h_end   = self._user_h_wave_window_end_time_milliseconds
+
+        if m_end > m_start:
+            m_region = pg.LinearRegionItem(
+                values=[m_start, m_end],
+                brush=pg.mkBrush(0, 0, 255, 40),
+                movable=False
+            )
+            m_region.setZValue(-10)
+            self._trial_widget.addItem(m_region)
+
+        if h_end > h_start:
+            h_region = pg.LinearRegionItem(
+                values=[h_start, h_end],
+                brush=pg.mkBrush(0, 200, 0, 40),
+                movable=False
+            )
+            h_region.setZValue(-10)
+            self._trial_widget.addItem(h_region)
+
+        #Prepare the unipolar data slice (same window indices as the bipolar slice)
+        has_unipolar: bool = len(self._current_trial.unipolar_trial_data) > 1
+        unipolar_data_to_plot: np.ndarray = None
+        if has_unipolar and len(self._current_trial.unipolar_trial_data) >= idx_post:
+            unipolar_data_to_plot = self._current_trial.unipolar_trial_data[idx_pre:idx_post]
+
+        #Plot |unipolar EMG| abs trace in grayish-purple (index 4), drawn before other traces
+        if (unipolar_data_to_plot is not None and
+                len(self._trial_signal_flags) > 4 and self._trial_signal_flags[4]):
+            unipolar_abs_pen = pg.mkPen(color=(148, 130, 172), width=1.5)
+            self._trial_widget.plot(x_data, np.abs(unipolar_data_to_plot), pen=unipolar_abs_pen)
+
+        #Plot unipolar filtered signal in orange (index 3)
+        if (unipolar_data_to_plot is not None and
+                len(self._trial_signal_flags) > 3 and self._trial_signal_flags[3]):
+            unipolar_pen = pg.mkPen(color=(255, 140, 0), width=1.5)
+            self._trial_widget.plot(x_data, unipolar_data_to_plot, pen=unipolar_pen)
+
+        #Plot |EMG| abs trace in gray (index 2), drawn before bipolar signal so it renders underneath
+        if len(self._trial_signal_flags) > 2 and self._trial_signal_flags[2]:
+            abs_pen = pg.mkPen(color=(150, 150, 150), width=1.5)
+            self._trial_widget.plot(x_data, np.abs(data_to_plot), pen=abs_pen)
+
+        #Plot EMG signal (bipolar/differential filtered) in black (index 0)
         if len(self._trial_signal_flags) == 0 or self._trial_signal_flags[0]:
             self._trial_widget.plot(x_data, data_to_plot, pen=emg_pen)
 
-        self._trial_widget.setXRange(-20, 30, padding=0)
+        self._trial_widget.setXRange(-2, 15, padding=0)
 
         #Stim onset marker at t=0 (blue dashed)
         onset_pen = pg.mkPen(color=(0, 0, 255), width=2.0, style=QtCore.Qt.DashLine)
@@ -841,6 +1113,43 @@ class MhRecruitmentCurveStage (Stage):
             adc_to_plot = self._current_trial.sync_data[idx_pre:idx_post]
             if len(adc_to_plot) == num_samples:
                 self._draw_trial_adc_overlay(x_data, adc_to_plot)
+
+        #-------------------------------------------------------------------
+        # Phase 6: Peak markers (star) at M-wave and H-wave detection points
+        #-------------------------------------------------------------------
+        # M-wave peak marker — blue star at the sample used for recruitment curve
+        if m_end > m_start:
+            m_mask = (x_data >= m_start) & (x_data <= m_end)
+            if np.any(m_mask):
+                m_masked_indices = np.where(m_mask)[0]
+                peak_local_idx = int(np.argmax(np.abs(data_to_plot[m_mask])))
+                peak_global_idx = m_masked_indices[peak_local_idx]
+                peak_x = float(x_data[peak_global_idx])
+                peak_y = float(data_to_plot[peak_global_idx])
+                m_marker = pg.ScatterPlotItem(
+                    x=[peak_x], y=[peak_y],
+                    symbol='star', size=14,
+                    pen=pg.mkPen(color=(0, 0, 200), width=1.5),
+                    brush=pg.mkBrush(0, 0, 200, 200)
+                )
+                self._trial_widget.addItem(m_marker)
+
+        # H-wave peak marker — green star at the sample used for recruitment curve
+        if h_end > h_start:
+            h_mask = (x_data >= h_start) & (x_data <= h_end)
+            if np.any(h_mask):
+                h_masked_indices = np.where(h_mask)[0]
+                peak_local_idx = int(np.argmax(np.abs(data_to_plot[h_mask])))
+                peak_global_idx = h_masked_indices[peak_local_idx]
+                peak_x = float(x_data[peak_global_idx])
+                peak_y = float(data_to_plot[peak_global_idx])
+                h_marker = pg.ScatterPlotItem(
+                    x=[peak_x], y=[peak_y],
+                    symbol='star', size=14,
+                    pen=pg.mkPen(color=(0, 160, 0), width=1.5),
+                    brush=pg.mkBrush(0, 160, 0, 200)
+                )
+                self._trial_widget.addItem(h_marker)
 
         pass
 
@@ -874,7 +1183,7 @@ class MhRecruitmentCurveStage (Stage):
 
         #Show and configure the right axis
         plot_item.showAxis('right')
-        plot_item.getAxis('right').setLabel('ADC (V)', color='#007700')
+        plot_item.getAxis('right').setLabel('ADC In (V)', color='#007700')
         plot_item.getAxis('right').linkToView(adc_vb)
 
         #Link X and set initial geometry
@@ -951,14 +1260,17 @@ class MhRecruitmentCurveStage (Stage):
 
         #Check to see if we need to regenerate the stimulation amplitudes list
         if (len(self._stimulation_amplitudes) == 0):
-            #Generate a list of stimulation amplitudes
+            #Generate a list of stimulation amplitudes using user-defined parameters
             self._stimulation_amplitudes = np.arange(
-                MhRecruitmentCurveStage.STIMULATION_AMPLITUDE_MIN,
-                MhRecruitmentCurveStage.STIMULATION_AMPLITUDE_MAX + MhRecruitmentCurveStage.STIMULATION_AMPLITUDE_STEP,
-                MhRecruitmentCurveStage.STIMULATION_AMPLITUDE_STEP, dtype=np.float64)
-            
-            #Shuffle the list
-            self._numpy_rng.shuffle(self._stimulation_amplitudes)
+                self._user_min_stimulation_amplitude,
+                self._user_max_stimulation_amplitude + self._user_stimulation_amplitude_step_size,
+                self._user_stimulation_amplitude_step_size, dtype=np.float64)
+
+            #Shuffle or sort depending on the selected order mode
+            if self._sequential_stimulation:
+                self._stimulation_amplitudes = np.sort(self._stimulation_amplitudes)
+            else:
+                self._numpy_rng.shuffle(self._stimulation_amplitudes)
 
         #We are done. return from this function.
         return
@@ -1274,22 +1586,19 @@ class MhRecruitmentCurveStage (Stage):
         if (ApplicationConfiguration.stimulator is not None):
             ApplicationConfiguration.stimulator.trigger_single()
 
+        #Notify listeners (e.g. live EMG overlay) that a stim was just sent
+        self.signals.stim_triggered.emit()
+
         self.signals.new_message.emit(SessionMessage(f"Manual stim triggered at {self._current_stimulation_amplitude_ma:.2f} mA"))
 
     def set_manual_thresholds(self, lb: float, ub: float) -> str:
         '''
         Sets manual initiation thresholds directly (e.g. from the GUI threshold panel).
-        Works before or during a session.
-        If S1 histogram data is loaded, values are clamped to histogram bounds.
+        Works before or during a session. Values are applied as-is with no clamping.
         Returns a result message string (does not emit any signals).
         '''
         if lb >= ub:
             return "Threshold error: lower bound must be less than upper bound."
-
-        #Clamp to histogram bounds if S1 data is available
-        if self._emg_histogram_data is not None:
-            lb = max(lb, self._emg_histogram_data.min)
-            ub = min(ub, self._emg_histogram_data.max)
 
         self._manual_min_threshold = lb
         self._manual_max_threshold = ub
@@ -1297,6 +1606,9 @@ class MhRecruitmentCurveStage (Stage):
         self._current_min_initiation_threshold = lb
         self._current_max_initiation_threshold = ub
 
-        return f"Initiation thresholds set: lb={lb:.2f} µV   ub={ub:.2f} µV"
+        #Refresh the session plot so threshold lines update immediately
+        self.update_session_plot()
+
+        return f"Init thresholds overridden: lb={lb:.2f} µV   ub={ub:.2f} µV"
 
     #endregion

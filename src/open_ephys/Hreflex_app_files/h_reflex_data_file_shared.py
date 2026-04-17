@@ -11,6 +11,7 @@ class HReflexDataFileBlockIds:
     EMG_DATA_BLOCK: int = 1
     EMG_CHARACTERIZATION_TRIAL_BLOCK: int = 2
     MH_RECRUITMENT_CURVE_TRIAL_BLOCK: int = 3
+    EMG_TRIALS_PER_HOUR_BLOCK: int = 4
 
     pass
 

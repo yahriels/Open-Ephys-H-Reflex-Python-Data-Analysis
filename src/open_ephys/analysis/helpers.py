@@ -57,9 +57,10 @@ STIM_ONSET_THRESHOLD = 4.5  # V -- ADC level marking stim onset rising edge
 STIM_END_THRESHOLD   = 1.9  # V -- ADC level below which stim pulse has ended
 
 # Block IDs (mirrors HReflexDataFileBlockIds)
-BLOCK_EMG_DATA       = 1
-BLOCK_EMG_CHAR_TRIAL = 2
-BLOCK_MH_TRIAL       = 3
+BLOCK_EMG_DATA             = 1
+BLOCK_EMG_CHAR_TRIAL       = 2
+BLOCK_MH_TRIAL             = 3
+BLOCK_EMG_TRIALS_PER_HOUR  = 4
 
 # Low-level type maps (mirrors FileIO_Helpers from hreflex_txbdc)
 _HRS_TYPE_FMT  = {'int8': 'b', 'int32': 'i', 'uint64': 'Q', 'uint8': 'B', 'float32': 'f', 'float64': 'd'}
@@ -113,6 +114,18 @@ class EmgCharHeader:
     trial_initiation_phase_min_ms: int = 0
     trial_initiation_phase_max_ms: int = 0
     bin_duration_ms: int = 0
+    # Present in new-format HRS1 files; defaults to 5000.0 for legacy files.
+    sample_rate: float = 5000.0
+    # Set when an EMG_TRIALS_PER_HOUR block is present in the file; otherwise None.
+    trials_per_hour_data: object = None
+
+
+@dataclass
+class EmgTrialsPerHourData:
+    sweep_centre_uv: float = 0.0
+    elapsed_hours: float = 0.0
+    window_sizes: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    trials_per_hour: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
 
 
 @dataclass
@@ -167,6 +180,8 @@ class MhRecTrial:
     n_pre_trigger_frames_discarded: int = 0
     frame_received_timestamps_ms: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.uint64))
     first_post_trigger_frame_sample_id: int = 0
+    # --- file_version >= 3 fields ---
+    unipolar_trial_data: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
 
 
 # ====================================================================
@@ -208,6 +223,8 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0) -> MhRecTrial:
         t.n_pre_trigger_frames_discarded    = hrs_read_val(fid, 'int32')
         t.frame_received_timestamps_ms      = np.array(hrs_read_array(fid, 'uint64'), dtype=np.uint64)
         t.first_post_trigger_frame_sample_id = hrs_read_val(fid, 'uint64')
+    if file_version >= 3:
+        t.unipolar_trial_data = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
     return t
 
 
@@ -232,6 +249,19 @@ def read_hrs1(filepath: str):
         header.trial_initiation_phase_max_ms = hrs_read_val(fid, 'int32')
         header.bin_duration_ms               = hrs_read_val(fid, 'int32')
 
+        # Auto-detect the sample_rate field added in newer HRS1 files.
+        # Peek at the next 4 bytes: if they parse as a float32 in the valid
+        # sample-rate range (500–100 000 Hz), consume them; otherwise seek back
+        # so the block-ID loop reads correctly (legacy files without this field).
+        _pos  = fid.tell()
+        _peek = fid.read(4)
+        if len(_peek) == 4:
+            _as_float = struct.unpack('f', _peek)[0]
+            if 500.0 <= _as_float <= 100_000.0:
+                header.sample_rate = _as_float
+            else:
+                fid.seek(_pos)
+
         while True:
             chunk = fid.read(4)
             if len(chunk) < 4:
@@ -250,6 +280,13 @@ def read_hrs1(filepath: str):
                     trials.append(t)
                 elif block_id == BLOCK_EMG_DATA:
                     emg_blocks.append(_read_emg_data_block(fid))
+                elif block_id == BLOCK_EMG_TRIALS_PER_HOUR:
+                    tph = EmgTrialsPerHourData()
+                    tph.sweep_centre_uv = hrs_read_val(fid, 'float32')
+                    tph.elapsed_hours   = hrs_read_val(fid, 'float32')
+                    tph.window_sizes    = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+                    tph.trials_per_hour = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+                    header.trials_per_hour_data = tph
             except struct.error:
                 # Last block was truncated (file closed mid-write); discard it.
                 break
@@ -357,12 +394,20 @@ def get_trial_window(trial: MhRecTrial,
                      bin_samples: int = BIN_SAMPLES,
                      record_samples: int = TRIAL_RECORD_SAMPLES,
                      onset_threshold: float = STIM_ONSET_THRESHOLD,
-                     end_threshold: float = STIM_END_THRESHOLD):
+                     end_threshold: float = STIM_END_THRESHOLD,
+                     use_unipolar: bool = False):
     """Extract the peri-stimulus window for one MhRecTrial.
 
     For file_version >= 2 trials the app-computed onset_sample_index is used
     directly (it was detected with the live STIM_ONSET_THRESHOLD at record time).
     For older trials onset is re-derived from sync_data.
+
+    Parameters
+    ----------
+    use_unipolar : bool
+        When True, return the unipolar_trial_data slice instead of trial_data.
+        Requires file_version >= 3. Falls back to trial_data silently when
+        unipolar_trial_data is empty.
 
     Returns (t_ms, emg, adc_or_None, stim_end_ms_or_None).
     """
@@ -377,12 +422,16 @@ def get_trial_window(trial: MhRecTrial,
     else:
         onset_idx = bin_samples
 
+    # Select bipolar or unipolar signal
+    unipolar = getattr(trial, 'unipolar_trial_data', np.array([], dtype=np.float32))
+    signal = unipolar if (use_unipolar and len(unipolar) > 1) else trial.trial_data
+
     pre_s = int(pre_plot_ms  / ms_per_sample)
     pst_s = int(post_plot_ms / ms_per_sample)
     i0 = max(0, onset_idx - pre_s)
-    i1 = min(len(trial.trial_data), onset_idx + pst_s)
+    i1 = min(len(signal), onset_idx + pst_s)
 
-    emg  = trial.trial_data[i0:i1]
+    emg  = signal[i0:i1]
     n    = len(emg)
     t_ms = (np.arange(n) - (onset_idx - i0)) * ms_per_sample
 

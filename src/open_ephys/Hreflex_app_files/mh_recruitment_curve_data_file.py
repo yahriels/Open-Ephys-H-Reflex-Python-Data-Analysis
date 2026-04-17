@@ -79,8 +79,12 @@ class MhRecruitmentCurveTrial:
         #Create a timestamp
         self.start_time: datetime = datetime.min
 
-        #Define a numpy array to hold trial data
+        #Define a numpy array to hold trial data (bipolar/differential filtered)
         self.trial_data: np.ndarray = np.zeros(1, dtype=np.float32)
+
+        #Define a numpy array to hold unipolar (non-differential) filtered trial data.
+        #Populated at runtime for display only — not persisted to the data file.
+        self.unipolar_trial_data: np.ndarray = np.zeros(1, dtype=np.float32)
 
         #Define a numpy array to hold the ADC sync line data for this trial
         #(used for precise stim-onset alignment; populated when file_version >= 1)
@@ -180,6 +184,10 @@ class MhRecruitmentCurveTrial:
                 FileIO_Helpers.read_array(fid, "uint64"), dtype=np.uint64)
             self.first_post_trigger_frame_sample_id = FileIO_Helpers.read(fid, "uint64")
 
+        #Read the unipolar filtered trial data (added in file format version 3)
+        if (file_version >= 3):
+            self.unipolar_trial_data = np.array(FileIO_Helpers.read_array(fid, "float32"), dtype=np.float32)
+
     def save_to_file (self, fid: BinaryIO) -> None:
         #Save a trial block indicator
         FileIO_Helpers.write(fid, "int32", int(1))
@@ -211,6 +219,9 @@ class MhRecruitmentCurveTrial:
         FileIO_Helpers.write(fid, "int32", self.n_pre_trigger_frames_discarded)
         FileIO_Helpers.write_array(fid, "uint64", self.frame_received_timestamps_ms)
         FileIO_Helpers.write(fid, "uint64", self.first_post_trigger_frame_sample_id)
+
+        #Save the unipolar (non-differential) filtered trial data (file format version 3+)
+        FileIO_Helpers.write_array(fid, "float32", self.unipolar_trial_data)
 
     #endregion
 

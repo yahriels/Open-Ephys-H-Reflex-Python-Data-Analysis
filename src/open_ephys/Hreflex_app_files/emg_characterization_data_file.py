@@ -25,6 +25,7 @@ class EmgCharacterizationHeader:
     trial_initiation_uv_max: float = 0
     trial_initiation_phase_min_ms: int = 0
     trial_initiation_phase_max_ms: int = 0
+    sample_rate: float = 0.0
 
     def read_from_file (self, fid: BinaryIO) -> None:
         self.file_version = FileIO_Helpers.read(fid, "int32")
@@ -39,6 +40,7 @@ class EmgCharacterizationHeader:
         self.trial_initiation_phase_min_ms = FileIO_Helpers.read(fid, "int32")
         self.trial_initiation_phase_max_ms = FileIO_Helpers.read(fid, "int32")
         self.bin_duration_ms = FileIO_Helpers.read(fid, "int32")
+        self.sample_rate = FileIO_Helpers.read(fid, "float32")
 
         pass
 
@@ -72,6 +74,9 @@ class EmgCharacterizationHeader:
 
         #Save the bin width
         FileIO_Helpers.write(fid, "int32", self.bin_duration_ms)
+
+        #Save the sample rate
+        FileIO_Helpers.write(fid, "float32", self.sample_rate)
 
         pass
 
@@ -138,6 +143,37 @@ class EmgCharacterizationTrial:
         #Save the monitored signal
         FileIO_Helpers.write_array(fid, "float32", self.monitored_signal)
 
+## This class holds the computed "trials per hour vs window size" curve and IS saved to the
+## data file as a single block written at session end (block ID = EMG_TRIALS_PER_HOUR_BLOCK).
+@dataclass
+class EmgTrialsPerHourData:
+
+    #Centre of the sweep (median of trial grand means at the time of saving), in µV
+    sweep_centre_uv: float = 0.0
+
+    #Total elapsed session time in hours (used to normalise trial counts to a per-hour rate)
+    elapsed_hours: float = 0.0
+
+    #Array of window widths (µV) evaluated during the sweep
+    window_sizes: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+
+    #Corresponding trials-per-hour count for each window width
+    trials_per_hour: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+
+    def read_from_file (self, fid: BinaryIO) -> None:
+        self.sweep_centre_uv = FileIO_Helpers.read(fid, "float32")
+        self.elapsed_hours = FileIO_Helpers.read(fid, "float32")
+        self.window_sizes = np.array(FileIO_Helpers.read_array(fid, "float32"), dtype=np.float32)
+        self.trials_per_hour = np.array(FileIO_Helpers.read_array(fid, "float32"), dtype=np.float32)
+
+    def save_to_file (self, fid: BinaryIO) -> None:
+        FileIO_Helpers.write(fid, "int32", HReflexDataFileBlockIds.EMG_TRIALS_PER_HOUR_BLOCK)
+        FileIO_Helpers.write(fid, "float32", self.sweep_centre_uv)
+        FileIO_Helpers.write(fid, "float32", self.elapsed_hours)
+        FileIO_Helpers.write_array(fid, "float32", self.window_sizes)
+        FileIO_Helpers.write_array(fid, "float32", self.trials_per_hour)
+
+
 ## This class (EmgHistogramData) is NOT saved in the data file. Rather, it is CALCULATED
 ## from data that is present in the data file.
 @dataclass
@@ -161,6 +197,7 @@ class EmgCharacterizationDataFile:
         self.header: EmgCharacterizationHeader = None
         self.emg_data_blocks: list[HReflexDataFileEmgData] = []
         self.trials: list[EmgCharacterizationTrial] = []
+        self.trials_per_hour_data: EmgTrialsPerHourData = None
 
     #endregion
 
@@ -188,8 +225,12 @@ class EmgCharacterizationDataFile:
             elif (block_id == HReflexDataFileBlockIds.EMG_DATA_BLOCK):
                 emg_data_block: HReflexDataFileEmgData = HReflexDataFileEmgData()
                 emg_data_block.read_from_file(fid)
-                
+
                 self.emg_data_blocks.append(emg_data_block)
+            elif (block_id == HReflexDataFileBlockIds.EMG_TRIALS_PER_HOUR_BLOCK):
+                tph: EmgTrialsPerHourData = EmgTrialsPerHourData()
+                tph.read_from_file(fid)
+                self.trials_per_hour_data = tph
         
         pass
 

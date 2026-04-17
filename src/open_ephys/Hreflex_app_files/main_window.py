@@ -47,7 +47,8 @@ class MainWindow(QMainWindow):
 
     #region Class members / constants
 
-    EMG_PLOTTING_SAMPLE_COUNT: int = 50000
+    EMG_PLOTTING_SAMPLE_COUNT: int = 25000
+    LIVE_EMG_WINDOW_SECONDS: float = 5.0
 
     #endregion
 
@@ -69,6 +70,15 @@ class MainWindow(QMainWindow):
         # Index 0 = plot raw/unipolar data, Index 1 = plot filtered data, Index 2 = plot abs'd data
         self._live_emg_data_plot_flags: list[bool] = [True, False, False]
         self._live_emg_data_plot_legend_names: list[str] = self._get_live_emg_legend_names()
+
+        # Y-axis limits for the live EMG plot (µV)
+        self._live_emg_y_min: float = -250.0
+        self._live_emg_y_max: float = 250.0
+
+        # Wall-clock timestamps (ms) of each stim event in the current session,
+        # and the list of ScatterPlotItems (star markers) currently drawn on the live EMG plot.
+        self._stim_event_times_ms: list = []
+        self._live_emg_stim_markers: list = []
       
         # Initialize a list of stages
         self._stages: list[Stage] = []
@@ -209,7 +219,10 @@ class MainWindow(QMainWindow):
         right_grid.setColumnStretch(3, 1)
 
         grid.addLayout(right_grid, 0, 1)
-
+        '''
+        Currently commenting this section below out, since we are not currently using it, will add back in once we will start using it
+        '''
+        '''
         #Create labels for the booth name
         booth = QLabel("Booth: ")
         booth.setFont(self._bold_font)
@@ -245,6 +258,51 @@ class MainWindow(QMainWindow):
         self._percent_label = QLabel("NA")
         self._percent_label.setFont(self._regular_font)
         right_grid.addWidget(self._percent_label, 1, 3)
+        '''
+        #Stimulation parameter panel — visible only when MH Recruitment Curve stage is selected
+        self._stim_params_frame = QFrame()
+        self._stim_params_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        sp_layout = QGridLayout(self._stim_params_frame)
+        sp_layout.setContentsMargins(4, 4, 4, 4)
+        sp_layout.setSpacing(4)
+
+        sp_title = QLabel("Stim Params:")
+        sp_title.setFont(self._bold_font)
+        sp_layout.addWidget(sp_title, 0, 0)
+
+        sp_layout.addWidget(QLabel("Min (mA):"), 0, 1)
+        self._stim_min_amp_entry = QLineEdit(str(MhRecruitmentCurveStage.STIMULATION_AMPLITUDE_MIN))
+        self._stim_min_amp_entry.setFixedWidth(55)
+        sp_layout.addWidget(self._stim_min_amp_entry, 0, 2)
+
+        sp_layout.addWidget(QLabel("Max (mA):"), 0, 3)
+        self._stim_max_amp_entry = QLineEdit(str(MhRecruitmentCurveStage.STIMULATION_AMPLITUDE_MAX))
+        self._stim_max_amp_entry.setFixedWidth(55)
+        sp_layout.addWidget(self._stim_max_amp_entry, 0, 4)
+
+        sp_layout.addWidget(QLabel("Step (mA):"), 1, 1)
+        self._stim_step_entry = QLineEdit(str(MhRecruitmentCurveStage.STIMULATION_AMPLITUDE_STEP))
+        self._stim_step_entry.setFixedWidth(55)
+        sp_layout.addWidget(self._stim_step_entry, 1, 2)
+
+        sp_layout.addWidget(QLabel("ISI (ms):"), 1, 3)
+        self._stim_isi_entry = QLineEdit(str(MhRecruitmentCurveStage.MINIMUM_INTERTRIAL_INTERVAL_MILLISECONDS))
+        self._stim_isi_entry.setFixedWidth(65)
+        sp_layout.addWidget(self._stim_isi_entry, 1, 4)
+
+        self._stim_sequential_checkbox = QtWidgets.QCheckBox("Sequential")
+        self._stim_sequential_checkbox.setFont(self._regular_font)
+        self._stim_sequential_checkbox.setChecked(False)
+        sp_layout.addWidget(self._stim_sequential_checkbox, 2, 1, 1, 2)
+
+        self._stim_params_set_button = QPushButton("Set")
+        self._stim_params_set_button.setFont(self._regular_font)
+        self._stim_params_set_button.setFixedWidth(45)
+        self._stim_params_set_button.clicked.connect(self._on_stim_params_set_button_clicked)
+        sp_layout.addWidget(self._stim_params_set_button, 2, 4)
+
+        self._stim_params_frame.setVisible(False)
+        right_grid.addWidget(self._stim_params_frame, 1, 0, 1, 4)
 
         #M/H wave window panel — visible only when the MH Recruitment Curve stage is selected
         self._wave_window_frame = QFrame()
@@ -316,6 +374,38 @@ class MainWindow(QMainWindow):
         self._threshold_frame.setVisible(False)
         right_grid.addWidget(self._threshold_frame, 3, 0, 1, 4)
 
+        #EMG Characterization init threshold panel — visible only when S1 is selected
+        self._emg_char_threshold_frame = QFrame()
+        self._emg_char_threshold_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        ec_layout = QGridLayout(self._emg_char_threshold_frame)
+        ec_layout.setContentsMargins(4, 4, 4, 4)
+        ec_layout.setSpacing(4)
+
+        ec_thresh_title = QLabel("EMG Init Thresholds:")
+        ec_thresh_title.setFont(self._bold_font)
+        ec_layout.addWidget(ec_thresh_title, 0, 0)
+
+        ec_layout.addWidget(QLabel("LB (µV):"), 0, 1)
+        self._emg_char_thresh_lb_entry = QLineEdit(str(EmgCharacterizationStage.TRIAL_INITIATION_MIN_RANGE_MICROVOLTS))
+        self._emg_char_thresh_lb_entry.setFont(self._regular_font)
+        self._emg_char_thresh_lb_entry.setFixedWidth(65)
+        ec_layout.addWidget(self._emg_char_thresh_lb_entry, 0, 2)
+
+        ec_layout.addWidget(QLabel("UB (µV):"), 0, 3)
+        self._emg_char_thresh_ub_entry = QLineEdit(str(EmgCharacterizationStage.TRIAL_INITIATION_MAX_RANGE_MICROVOLTS))
+        self._emg_char_thresh_ub_entry.setFont(self._regular_font)
+        self._emg_char_thresh_ub_entry.setFixedWidth(65)
+        ec_layout.addWidget(self._emg_char_thresh_ub_entry, 0, 4)
+
+        self._emg_char_thresh_set_button = QPushButton("Set")
+        self._emg_char_thresh_set_button.setFont(self._regular_font)
+        self._emg_char_thresh_set_button.setFixedWidth(45)
+        self._emg_char_thresh_set_button.clicked.connect(self._on_emg_char_threshold_set_button_clicked)
+        ec_layout.addWidget(self._emg_char_thresh_set_button, 0, 5)
+
+        self._emg_char_threshold_frame.setVisible(True)  # S1 is the default stage
+        right_grid.addWidget(self._emg_char_threshold_frame, 0, 0, 1, 4)
+
         #Add the primary grid to the layout object
         self._layout.addLayout(grid, 0, 0)
 
@@ -376,11 +466,23 @@ class MainWindow(QMainWindow):
             action: QAction = self.live_emg_signal_tool_menu.addAction(self._live_emg_data_plot_legend_names[i])
             action.setCheckable(True)
             action.setChecked(self._live_emg_data_plot_flags[i])
-            
+
             action.toggled.connect(self._handle_live_emg_data_plot_selection_changed)
-        
+
         self.live_emg_signal_tool_button.setMenu(self.live_emg_signal_tool_menu)
         self.live_emg_signal_tool_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+
+        #Y-axis limit controls for the live EMG plot
+        self._live_emg_ymin_entry = QLineEdit(str(int(self._live_emg_y_min)))
+        self._live_emg_ymin_entry.setFixedWidth(55)
+        self._live_emg_ymin_entry.setFont(self._regular_font)
+        self._live_emg_ymax_entry = QLineEdit(str(int(self._live_emg_y_max)))
+        self._live_emg_ymax_entry.setFixedWidth(55)
+        self._live_emg_ymax_entry.setFont(self._regular_font)
+        self._live_emg_ylim_set_button = QPushButton("Set Y")
+        self._live_emg_ylim_set_button.setFixedWidth(50)
+        self._live_emg_ylim_set_button.setFont(self._regular_font)
+        self._live_emg_ylim_set_button.clicked.connect(self._on_live_emg_ylim_set_clicked)
 
         #This plot widget will show the session history
         self._session_history_plot_widget = pg.PlotWidget()
@@ -409,7 +511,7 @@ class MainWindow(QMainWindow):
         # Label axes for live EMG (keep ranges unchanged)
         try:
             self._live_emg_graph_widget.getPlotItem().setLabel('left', 'EMG (µV)')
-            self._live_emg_graph_widget.getPlotItem().setLabel('bottom', 'Time (ms)')
+            self._live_emg_graph_widget.getPlotItem().setLabel('bottom', 'Time (s)')
         except Exception:
             pass
         
@@ -422,9 +524,20 @@ class MainWindow(QMainWindow):
         trial_controls_layout.addWidget(self._most_recent_trial_plot_selection_box)
         trial_controls_layout.addWidget(self._trial_signal_tool_button)
 
+        #Pack the live EMG button and Y-limit controls together in one row
+        live_emg_controls_layout = QHBoxLayout()
+        live_emg_controls_layout.setContentsMargins(0, 0, 0, 0)
+        live_emg_controls_layout.setSpacing(4)
+        live_emg_controls_layout.addWidget(self.live_emg_signal_tool_button)
+        live_emg_controls_layout.addWidget(QLabel("Y min:"))
+        live_emg_controls_layout.addWidget(self._live_emg_ymin_entry)
+        live_emg_controls_layout.addWidget(QLabel("Y max:"))
+        live_emg_controls_layout.addWidget(self._live_emg_ymax_entry)
+        live_emg_controls_layout.addWidget(self._live_emg_ylim_set_button)
+
         middle_grid.addWidget(self._session_history_plot_selection_box, 0, 0)
         middle_grid.addLayout(trial_controls_layout, 0, 1)
-        middle_grid.addWidget(self.live_emg_signal_tool_button, 0, 2)
+        middle_grid.addLayout(live_emg_controls_layout, 0, 2)
 
         middle_grid.addWidget(self._session_history_plot_widget, 1, 0)
         middle_grid.addWidget(self._previous_trial_plot_widget, 1, 1)
@@ -630,10 +743,18 @@ class MainWindow(QMainWindow):
             self._selected_stage is not None and
             self._selected_stage.stage_type == Stage.STAGE_TYPE_RECRUITMENT_CURVE
         )
+        is_emg_char: bool = (
+            self._selected_stage is not None and
+            self._selected_stage.stage_type == Stage.STAGE_TYPE_EMG_CHARACTERIZATION
+        )
+        if hasattr(self, "_stim_params_frame") and self._stim_params_frame is not None:
+            self._stim_params_frame.setVisible(is_recruitment_curve)
         if hasattr(self, "_wave_window_frame") and self._wave_window_frame is not None:
             self._wave_window_frame.setVisible(is_recruitment_curve)
         if hasattr(self, "_threshold_frame") and self._threshold_frame is not None:
             self._threshold_frame.setVisible(is_recruitment_curve)
+        if hasattr(self, "_emg_char_threshold_frame") and self._emg_char_threshold_frame is not None:
+            self._emg_char_threshold_frame.setVisible(is_emg_char)
 
         #Manage stage signal connection so pre-session commands give visible feedback.
         #Disconnect from the previous stage (if any), connect to the newly selected stage.
@@ -746,6 +867,13 @@ class MainWindow(QMainWindow):
                 #Return immediately from this function
                 return
 
+            #Clear stim events from any previous session and connect the stim overlay signal
+            self._stim_event_times_ms = []
+            try:
+                self._selected_stage.signals.stim_triggered.connect(self._on_stim_triggered)
+            except Exception:
+                pass
+
             #Add a session message indicating the session is beginning
             message: SessionMessage = SessionMessage(f"Session started ({self._subject_name})")
             self._session_messages.append(message)
@@ -790,6 +918,19 @@ class MainWindow(QMainWindow):
 
             #Set the "session running" flag to False
             self._is_session_running = False
+
+            #Disconnect the stim overlay signal and clear any remaining stim markers
+            try:
+                self._selected_stage.signals.stim_triggered.disconnect(self._on_stim_triggered)
+            except Exception:
+                pass
+            self._stim_event_times_ms = []
+            for marker in self._live_emg_stim_markers:
+                try:
+                    self._live_emg_graph_widget.removeItem(marker)
+                except Exception:
+                    pass
+            self._live_emg_stim_markers = []
 
             #Finalize the stage and close the data file
             self._selected_stage.finalize()
@@ -887,6 +1028,43 @@ class MainWindow(QMainWindow):
         self._session_messages.append(msg)
         self._update_session_messages()
 
+    def _on_stim_params_set_button_clicked (self) -> None:
+        if (self._selected_stage is None or
+                self._selected_stage.stage_type != Stage.STAGE_TYPE_RECRUITMENT_CURVE):
+            return
+        try:
+            min_amp = float(self._stim_min_amp_entry.text())
+            max_amp = float(self._stim_max_amp_entry.text())
+            step    = float(self._stim_step_entry.text())
+            isi_ms  = int(float(self._stim_isi_entry.text()))
+        except ValueError:
+            msg = SessionMessage("Stim params error: enter valid numbers for Min, Max, Step, and ISI.")
+            self._session_messages.append(msg)
+            self._update_session_messages()
+            return
+        sequential = self._stim_sequential_checkbox.isChecked()
+        result: str = self._selected_stage.set_stim_params(min_amp, max_amp, step, isi_ms, sequential)
+        msg = SessionMessage(result)
+        self._session_messages.append(msg)
+        self._update_session_messages()
+
+    def _on_emg_char_threshold_set_button_clicked (self) -> None:
+        if (self._selected_stage is None or
+                self._selected_stage.stage_type != Stage.STAGE_TYPE_EMG_CHARACTERIZATION):
+            return
+        try:
+            lb = float(self._emg_char_thresh_lb_entry.text())
+            ub = float(self._emg_char_thresh_ub_entry.text())
+        except ValueError:
+            msg = SessionMessage("Threshold error: enter valid numbers for LB and UB.")
+            self._session_messages.append(msg)
+            self._update_session_messages()
+            return
+        result: str = self._selected_stage.set_initiation_thresholds(lb, ub)
+        msg = SessionMessage(result)
+        self._session_messages.append(msg)
+        self._update_session_messages()
+
     def _on_stim_button_clicked (self) -> None:
         if (self._is_session_running) and (not self._is_session_paused):
             self._selected_stage.manual_stim()
@@ -923,6 +1101,29 @@ class MainWindow(QMainWindow):
         if (self._is_session_running):
             current_index = self._most_recent_trial_plot_selection_box.currentIndex()
             self._selected_stage.trial_plot_index = current_index
+
+    def _on_stim_triggered (self) -> None:
+        '''Records the wall-clock time of each stimulation for the live EMG overlay.'''
+        self._stim_event_times_ms.append(int(datetime.now().timestamp() * 1000))
+
+    def _on_live_emg_ylim_set_clicked (self) -> None:
+        '''Reads the Y-min/Y-max entries and applies them to the live EMG plot Y-axis.'''
+        try:
+            y_min = float(self._live_emg_ymin_entry.text())
+            y_max = float(self._live_emg_ymax_entry.text())
+        except ValueError:
+            self._live_emg_ymin_entry.setText(str(int(self._live_emg_y_min)))
+            self._live_emg_ymax_entry.setText(str(int(self._live_emg_y_max)))
+            return
+
+        if y_min >= y_max:
+            self._live_emg_ymin_entry.setText(str(int(self._live_emg_y_min)))
+            self._live_emg_ymax_entry.setText(str(int(self._live_emg_y_max)))
+            return
+
+        self._live_emg_y_min = y_min
+        self._live_emg_y_max = y_max
+        self._live_emg_graph_widget.setYRange(y_min, y_max, padding=0)
 
     def _handle_live_emg_data_plot_selection_changed (self, checked) -> None:
 
@@ -1006,9 +1207,10 @@ class MainWindow(QMainWindow):
         protocol_text: str = self._protocol_combo.currentText()
         ApplicationConfiguration.filtering_protocol = "ONLINE" if "ONLINE" in protocol_text else "OFFLINE"
 
-        #Reset the filter state so it will be re-initialized on the next OFFLINE data frame
+        #Reset the filter states so they will be re-initialized on the next OFFLINE data frame
         EmgDataFilter.sos = None
         EmgDataFilter.filter_state = None
+        EmgDataFilter.filter_state_unipolar = None
 
         #Rebuild the live EMG plot with updated legend names
         self._live_emg_data_plot_legend_names = self._get_live_emg_legend_names()
@@ -1086,10 +1288,13 @@ class MainWindow(QMainWindow):
         #Clear any previously added plot items (and their legend entries)
         self._live_emg_graph_widget.clear()
 
+        #Any stim markers from previous sessions were removed by clear(); reset the list
+        self._live_emg_stim_markers = []
+
         #Style the plot
         self._live_emg_graph_widget.setBackground('w')
-        self._live_emg_graph_widget.setYRange(-250, 250, padding = 0)
-        self._live_emg_graph_widget.setXRange(0, MainWindow.EMG_PLOTTING_SAMPLE_COUNT / ApplicationConfiguration.sample_rate, padding = 0)
+        self._live_emg_graph_widget.setYRange(self._live_emg_y_min, self._live_emg_y_max, padding=0)
+        self._live_emg_graph_widget.setXRange(-MainWindow.LIVE_EMG_WINDOW_SECONDS, 0, padding=0)
         self._live_emg_graph_widget.getPlotItem().setLabel('bottom', 'Time (s)')
         self._live_emg_graph_widget.addLegend(offset=(0, 0))
 
@@ -1098,7 +1303,7 @@ class MainWindow(QMainWindow):
         pen_1 = pg.mkPen(color = (255, 0, 0), width = 2)
         pen_2 = pg.mkPen(color = (0, 255, 0), width = 2)
         #self._live_emg_x_data = list(range(0, len(self._emg_signal_data_raw)))
-        self._live_emg_x_data = [i / ApplicationConfiguration.sample_rate for i in range(0, len(self._emg_signal_data_raw))]
+        self._live_emg_x_data = [(i - len(self._emg_signal_data_raw)) / ApplicationConfiguration.sample_rate for i in range(0, len(self._emg_signal_data_raw))]
         self._live_emg_line_object_raw = self._live_emg_graph_widget.plot(self._live_emg_x_data, self._emg_signal_data_raw, pen = pen_0, name=self._live_emg_data_plot_legend_names[0])
         self._live_emg_line_object_filtered = self._live_emg_graph_widget.plot(self._live_emg_x_data, self._emg_signal_data_filtered, pen = pen_1, name=self._live_emg_data_plot_legend_names[1])
         self._live_emg_line_object_abs = self._live_emg_graph_widget.plot(self._live_emg_x_data, self._emg_signal_data_abs, pen = pen_2, name=self._live_emg_data_plot_legend_names[2])
@@ -1117,6 +1322,36 @@ class MainWindow(QMainWindow):
         self._live_emg_line_object_raw.setData(self._live_emg_x_data, self._emg_signal_data_raw)
         self._live_emg_line_object_filtered.setData(self._live_emg_x_data, self._emg_signal_data_filtered)
         self._live_emg_line_object_abs.setData(self._live_emg_x_data, self._emg_signal_data_abs)
+
+        #Update stim markers — remove markers drawn on the previous frame
+        for marker in self._live_emg_stim_markers:
+            try:
+                self._live_emg_graph_widget.removeItem(marker)
+            except Exception:
+                pass
+        self._live_emg_stim_markers = []
+
+        if self._stim_event_times_ms:
+            current_ms: int = int(datetime.now().timestamp() * 1000)
+
+            #Drop events that have scrolled off the left edge
+            self._stim_event_times_ms = [
+                t for t in self._stim_event_times_ms
+                if (t - current_ms) / 1000.0 >= -MainWindow.LIVE_EMG_WINDOW_SECONDS
+            ]
+
+            marker_y: float = self._live_emg_y_max * 0.85
+
+            for stim_ms in self._stim_event_times_ms:
+                x_pos: float = (stim_ms - current_ms) / 1000.0
+                stim_marker = pg.ScatterPlotItem(
+                    x=[x_pos], y=[marker_y],
+                    symbol='star', size=16,
+                    pen=pg.mkPen(color=(200, 0, 0), width=1.5),
+                    brush=pg.mkBrush(255, 0, 0, 220)
+                )
+                self._live_emg_graph_widget.addItem(stim_marker)
+                self._live_emg_stim_markers.append(stim_marker)
 
         
     #endregion

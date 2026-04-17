@@ -11,7 +11,7 @@ from PySide6 import QtCore
 from .stage import Stage
 from ..session_message import SessionMessage
 from ..application_configuration import ApplicationConfiguration
-from ..datafiles.emg_characterization_data_file import EmgCharacterizationDataFile, EmgCharacterizationHeader, EmgCharacterizationTrial
+from ..datafiles.emg_characterization_data_file import EmgCharacterizationDataFile, EmgCharacterizationHeader, EmgCharacterizationTrial, EmgTrialsPerHourData
 from ..datafiles.h_reflex_data_file_shared import HReflexDataFileEmgData
 from ..open_ephys_streamer import OpenEphysDataFrame
 
@@ -29,7 +29,7 @@ class EmgCharacterizationStage (Stage):
     TRIAL_INITIATION_PHASE_MAX_DURATION_MILLISECONDS: int = 2700
 
     #The minimum and maximum range for trial initiation
-    TRIAL_INITIATION_MIN_RANGE_MICROVOLTS: float = 5.0 #15.0
+    TRIAL_INITIATION_MIN_RANGE_MICROVOLTS: float = 15.0
     TRIAL_INITIATION_MAX_RANGE_MICROVOLTS: float = 300.0
 
     #endregion
@@ -84,6 +84,16 @@ class EmgCharacterizationStage (Stage):
         #Declare a variable to hold the mean of each trial
         self._trial_means: list[float] = []
 
+        #Declare a variable to hold the session start time (used for trials-per-hour calculation)
+        self._session_start_time: datetime = None
+
+        #Declare a variable to hold the grand mean of the most recently completed trial
+        self._last_bin_grand_mean: float = 0.0
+
+        #Initiation threshold bounds (settable at runtime via set_initiation_thresholds)
+        self._init_min_threshold: float = EmgCharacterizationStage.TRIAL_INITIATION_MIN_RANGE_MICROVOLTS
+        self._init_max_threshold: float = EmgCharacterizationStage.TRIAL_INITIATION_MAX_RANGE_MICROVOLTS
+
         #Instantiate a random-number generator and use the current time as a seed
         self._rng: Random = Random(datetime.now().timestamp())
 
@@ -106,6 +116,9 @@ class EmgCharacterizationStage (Stage):
 
         #Clear the list of trial means
         self._trial_means.clear()
+
+        #Record the session start time
+        self._session_start_time = datetime.now()
 
         #Get the current datetime
         current_datetime: datetime = datetime.now()
@@ -200,22 +213,25 @@ class EmgCharacterizationStage (Stage):
             #If the bin grand mean is within a pre-specified min or max range, then
             #we consider this a trial initiation.
             if ((self._current_trial_sample_count >= self._monitored_signal_sample_count) and
-                (bin_grand_mean >= EmgCharacterizationStage.TRIAL_INITIATION_MIN_RANGE_MICROVOLTS) and 
-                (bin_grand_mean <= EmgCharacterizationStage.TRIAL_INITIATION_MAX_RANGE_MICROVOLTS)):
+                (bin_grand_mean >= self._init_min_threshold) and
+                (bin_grand_mean <= self._init_max_threshold)):
 
                 #A trial has been initiatied...
 
                 #Add the grand mean to the list of trial means
                 self._trial_means.append(bin_grand_mean)
 
+                #Store for redraw when the user switches the trial plot dropdown
+                self._last_bin_grand_mean = bin_grand_mean
+
                 #Save the trial to the data file
                 self._save_trial(bin_grand_mean)
 
                 #Update the session plot
-                self._update_session_plot()
+                self.update_session_plot()
 
                 #Update the trial plot
-                self._update_trial_plot(bin_grand_mean)
+                self.update_trial_plot()
 
                 #Let's create a message object
                 message: SessionMessage = SessionMessage(f"Trial {len(self._trial_means)} initiated")
@@ -234,24 +250,36 @@ class EmgCharacterizationStage (Stage):
 
         return
 
-    def finalize (self) -> None:        
+    def finalize (self) -> None:
         if (self._fid is not None):
+            #Compute and save the trials-per-hour vs window-size curve before closing
+            self._save_trials_per_hour_data()
+
             #Close the data file for this session
             self._fid.close()
 
     def get_trial_plot_options (self) -> list[str]:
-        return ["Most recent trial"]
-    
+        return ["Histogram", "Most recent trial"]
+
     def get_session_plot_options (self) -> list[str]:
-        return ["Session history"]
+        return ["Session history", "Trials per hour"]
 
     def update_trial_plot (self) -> None:
-        #This stage will not support updating the plots from an external call.
-        pass
+        if self._trial_plot_index == 0:
+            self._update_histogram_plot()
+        else:
+            self._update_most_recent_trial_plot()
 
     def update_session_plot (self) -> None:
-        #This stage will not support updating the plots from an external call.
-        pass
+        if self._session_plot_index == 0:
+            self._update_session_plot()
+        else:
+            self._update_trials_per_hour_plot()
+
+    def set_initiation_thresholds (self, lb: float, ub: float) -> str:
+        self._init_min_threshold = lb
+        self._init_max_threshold = ub
+        return f"EMG Characterization thresholds set: lb={lb:.2f} µV, ub={ub:.2f} µV"
 
     #endregion
 
@@ -303,32 +331,141 @@ class EmgCharacterizationStage (Stage):
 
         pass
 
-    def _update_trial_plot (self, bin_grand_mean: float) -> None:
-        #Clear the plot
+    def _update_histogram_plot (self) -> None:
         self._trial_widget.clear()
-        self._trial_widget.getPlotItem().setLabel('bottom', 'Time (s)')
+        self._trial_widget.getPlotItem().setLabel('bottom', 'Grand mean (µV)')
+        self._trial_widget.getPlotItem().setLabel('left', 'Count')
+
+        if len(self._trial_means) < 2:
+            return
+
+        means_arr = np.array(self._trial_means)
+        n = len(means_arr)
+        mn = float(np.min(means_arr))
+        mx = float(np.max(means_arr))
+        q25, q50, q75 = np.percentile(means_arr, [25, 50, 75])
+
+        # Build bins: 1pct step, enforce minimum 100 bins (matches notebook logic)
+        q1_val = float(np.quantile(means_arr, 0.01)) if n > 1 else mn
+        step = q1_val - mn
+        if step <= 0:
+            step = (mx - mn) / 100.0 if (mx - mn) > 0 else max(0.1, abs(mx) * 0.01 if mx != 0 else 0.1)
+        edges = np.arange(mn - 0.5 * step, mx + 1.5 * step, step)
+        if edges.size < 2:
+            edges = np.linspace(mn - 0.5, mx + 0.5, 101)
+        hist_vals, hist_edges = np.histogram(means_arr, bins=edges)
+        if hist_vals.size < 100:
+            hist_vals, hist_edges = np.histogram(means_arr, bins=100, range=(mn, mx))
+
+        # Bars — steelblue fill, black outline
+        centers = (hist_edges[:-1] + hist_edges[1:]) / 2.0
+        widths  = hist_edges[1:] - hist_edges[:-1]
+        bar_item = pg.BarGraphItem(
+            x=centers, height=hist_vals, width=widths,
+            brush=(100, 149, 237), pen=pg.mkPen('k', width=0.5)
+        )
+        self._trial_widget.addItem(bar_item)
+
+        # Min / max — black dashed vertical lines
+        for val in [mn, mx]:
+            self._trial_widget.addItem(pg.InfiniteLine(
+                pos=val, angle=90, movable=False,
+                pen=pg.mkPen(color=(0, 0, 0), width=1, style=QtCore.Qt.DashLine)
+            ))
+
+        # Q1 / median / Q3 — orange dotted, purple dash-dot, orange dotted with value labels
+        orange = (255, 165, 0)
+        purple = (148, 0, 211)
+        quartile_specs = [
+            (q25, orange, QtCore.Qt.DotLine,     f'Q1={q25:.2f}'),
+            (q50, purple, QtCore.Qt.DashDotLine, f'Med={q50:.2f}'),
+            (q75, orange, QtCore.Qt.DotLine,     f'Q3={q75:.2f}'),
+        ]
+        for val, color, style, lbl in quartile_specs:
+            self._trial_widget.addItem(pg.InfiniteLine(
+                pos=val, angle=90, movable=False,
+                pen=pg.mkPen(color=color, width=1.5, style=style),
+                label=lbl,
+                labelOpts={'position': 0.85, 'color': color}
+            ))
+
+        self._trial_widget.getPlotItem().setTitle(
+            f'Histogram | n={n:,} | bins={len(hist_vals)}'
+        )
+
+        pass
+
+    def _update_most_recent_trial_plot (self) -> None:
+        self._trial_widget.clear()
+        self._trial_widget.getPlotItem().setLabel('bottom', 'Bin #')
         self._trial_widget.getPlotItem().setLabel('left', 'EMG (µV)')
+        self._trial_widget.getPlotItem().setTitle('Most Recent Trial')
 
-        #Plot the "raw" (absolute-valued) EMG data for this trial
-        pen = pg.mkPen(color=(0, 0, 0))
-        signal_xvals = [i / ApplicationConfiguration.sample_rate for i in range(0, len(self._monitored_signal))]
-        self._trial_widget.plot(signal_xvals, self._monitored_signal, pen = pen)
+        if len(self._trial_means) == 0:
+            return
 
-        #Plot the binned data
-        pen = pg.mkPen(color=(255, 0, 0), width = 2.0)
-        xvals = [i * EmgCharacterizationStage.bin_sample_count() / ApplicationConfiguration.sample_rate for i in range(0, len(self._bins))]
-        self._trial_widget.plot(xvals, self._bins, pen = pen)
+        #Bar chart — one bar per bin
+        x_centers = np.arange(len(self._bins), dtype=float)
+        bar_item = pg.BarGraphItem(x=x_centers, height=self._bins, width=0.8, brush=(70, 130, 180))
+        self._trial_widget.addItem(bar_item)
 
-        # Get the ViewBox object
-        view_box = self._trial_widget.getPlotItem().getViewBox()
+        #Horizontal dashed line for the grand mean
+        mean_pen = pg.mkPen(color=(255, 0, 0), width=2.0, style=QtCore.Qt.DashLine)
+        mean_line = pg.InfiniteLine(
+            pos=self._last_bin_grand_mean, angle=0, pen=mean_pen, movable=False,
+            label=f'Mean={self._last_bin_grand_mean:.2f}',
+            labelOpts={'position': 0.5, 'color': (200, 0, 0)}
+        )
+        self._trial_widget.addItem(mean_line)
 
-        # Get the Y-axis limits
-        y_min, y_max = view_box.viewRange()[1]
+        pass
 
-        #Plot the grand mean
-        text_item = pg.TextItem(f"Mean = {bin_grand_mean:.2f}", anchor = (0, 0), color = (0, 0, 0))
-        self._trial_widget.addItem(text_item)
-        text_item.setPos(0, y_max)
+    def _update_trials_per_hour_plot (self) -> None:
+        self._session_widget.clear()
+        self._session_widget.getPlotItem().setLabel('bottom', 'Window size (µV)')
+        self._session_widget.getPlotItem().setLabel('left', 'Trials per hour')
+        self._session_widget.getPlotItem().showGrid(x=True, y=True, alpha=0.4)
+
+        if len(self._trial_means) < 2 or self._session_start_time is None:
+            return
+
+        means_arr = np.array(self._trial_means)
+        sweep_centre = float(np.median(means_arr))
+        std = float(np.std(means_arr))
+
+        # Build 20 window sizes centred on the median, from a narrow to wide spread
+        n_steps = 20
+        min_hw = max(0.5, std * 0.1)
+        max_hw = std * 2.0
+        half_widths = np.linspace(min_hw, max_hw, n_steps)
+        window_sizes = [2.0 * hw for hw in half_widths]
+
+        # Session duration in hours
+        elapsed_s = (datetime.now() - self._session_start_time).total_seconds()
+        elapsed_hours = max(elapsed_s / 3600.0, 1e-9)
+
+        # Count how many observed trial means fall within each window
+        trials_per_hour = []
+        for hw in half_widths:
+            n = int(np.sum((means_arr >= sweep_centre - hw) & (means_arr <= sweep_centre + hw)))
+            trials_per_hour.append(n / elapsed_hours)
+
+        # Plot: steelblue line + circle markers (matches the "o-" style from the notebook)
+        steelblue = (70, 130, 180)
+        pen = pg.mkPen(color=steelblue, width=2)
+        self._session_widget.plot(
+            window_sizes,
+            trials_per_hour,
+            pen=pen,
+            symbol='o',
+            symbolBrush=steelblue,
+            symbolPen=pg.mkPen(color=steelblue),
+            symbolSize=8,
+        )
+
+        self._session_widget.getPlotItem().setTitle(
+            f'Trials/hr vs Window Size | Centre: {sweep_centre:.2f} \u00b5V'
+        )
 
         pass
 
@@ -351,6 +488,7 @@ class EmgCharacterizationStage (Stage):
                 EmgCharacterizationStage.TRIAL_INITIATION_MAX_RANGE_MICROVOLTS,
                 EmgCharacterizationStage.TRIAL_INITIATION_PHASE_MIN_DURATION_MILLISECONDS,
                 EmgCharacterizationStage.TRIAL_INITIATION_PHASE_MAX_DURATION_MILLISECONDS,
+                float(ApplicationConfiguration.sample_rate),
             )
 
             #Save the header object to the data file
@@ -408,5 +546,39 @@ class EmgCharacterizationStage (Stage):
         emg_data.save_to_file(self._fid)
 
         pass
+
+    def _save_trials_per_hour_data (self) -> None:
+        '''Computes the trials-per-hour vs window-size curve and writes it as a single block.'''
+        if self._fid is None:
+            return
+        if len(self._trial_means) < 2 or self._session_start_time is None:
+            return
+
+        means_arr = np.array(self._trial_means)
+        sweep_centre = float(np.median(means_arr))
+        std = float(np.std(means_arr))
+
+        n_steps = 20
+        min_hw = max(0.5, std * 0.1)
+        max_hw = std * 2.0
+        half_widths = np.linspace(min_hw, max_hw, n_steps)
+        window_sizes = np.array([2.0 * hw for hw in half_widths], dtype=np.float32)
+
+        elapsed_s = (datetime.now() - self._session_start_time).total_seconds()
+        elapsed_hours = max(elapsed_s / 3600.0, 1e-9)
+
+        tph_values = []
+        for hw in half_widths:
+            n = int(np.sum((means_arr >= sweep_centre - hw) & (means_arr <= sweep_centre + hw)))
+            tph_values.append(n / elapsed_hours)
+        trials_per_hour = np.array(tph_values, dtype=np.float32)
+
+        tph_data = EmgTrialsPerHourData(
+            sweep_centre_uv=sweep_centre,
+            elapsed_hours=elapsed_hours,
+            window_sizes=window_sizes,
+            trials_per_hour=trials_per_hour
+        )
+        tph_data.save_to_file(self._fid)
 
     #endregion

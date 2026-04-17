@@ -40,6 +40,8 @@ class OpenEphysDataFrame:
     filtered_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     abs_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     sync_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    unipolar_filtered_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    unipolar_abs_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
 
     #region Public methods
 
@@ -52,6 +54,9 @@ class OpenEphysDataFrame:
             #ch2 = ADC sync line  →  sync_data_block
             if (len(self.channel_data_blocks) >= 1):
                 self.diff_data_block = self.channel_data_blocks[0].data
+                #In ONLINE mode ch0 is the unipolar filtered signal
+                self.unipolar_filtered_data_block = self.channel_data_blocks[0].data
+                self.unipolar_abs_data_block = np.abs(self.channel_data_blocks[0].data)
 
             if (len(self.channel_data_blocks) >= 2):
                 self.filtered_data_block = self.channel_data_blocks[1].data
@@ -72,6 +77,10 @@ class OpenEphysDataFrame:
 
                 #Now take the absolute value of the data
                 self.abs_data_block = np.abs(self.filtered_data_block)
+
+                #Filter ch0 alone to produce the unipolar (non-differential) filtered signal
+                self.unipolar_filtered_data_block = EmgDataFilter.filter_unipolar(self.channel_data_blocks[0].data)
+                self.unipolar_abs_data_block = np.abs(self.unipolar_filtered_data_block)
 
             if (len(self.channel_data_blocks) >= 3):
                 #Extract the ADC sync line (channel index 2) used for precise stim-onset alignment.
