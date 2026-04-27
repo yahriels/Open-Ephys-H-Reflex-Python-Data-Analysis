@@ -1,0 +1,63 @@
+%% Here is the section of my script that I'm using in MATLAB. I'm taking out the top 3 xcorr ICs in my data right now so you might not want to do that
+ 
+%% FastICA ECG Removal
+d_hp=designfilt('highpassiir','FilterOrder',4,'HalfPowerFrequency',20,'SampleRate',5120);
+d_lp=designfilt('lowpassiir','FilterOrder',4,'HalfPowerFrequency',100,'SampleRate',5120);
+effective_fs_emg=EMG.info.effective_srate;
+effective_fs_ecg=EEG.info.effective_srate;
+emg_time = linspace(0,(length(Grid_Groups{3,1})/effective_fs_emg),length(Grid_Groups{3,1}));
+ecg_time = linspace(0,(length(ECG)/effective_fs_ecg),length(ECG));
+ECG_upsampled = interp1(ecg_time, ECG, emg_time, 'linear','extrap');
+ECG_Upsamp_Norm=normalize(ECG_upsampled,"zscore","robust");
+if mean(ECG_Upsamp_Norm)<0
+    ECG_upsampled=ECG_upsampled.*-1;
+end
+ECG_hp=filtfilt(d_hp,ECG_upsampled.');    
+ECG_lp=filtfilt(d_lp,ECG_hp);
+ECG_hp=ECG_hp.';
+ECG_lp=ECG_lp.';
+mean_ECG=mean(ECG_hp);
+mean_ECG_bp=mean(ECG_lp);
+ECG_hp_mean=ECG_hp-mean_ECG;
+ECG_bp_mean=abs(ECG_lp-mean_ECG_bp);
+length_bl=length(ECG_bp_mean);
+Five_sec_bl=5120*5;
+for ECGidx=1:1:length(Grid_Data_filt)
+    [EMGica, A, W] = fastica(Grid_Data_filt{1,ECGidx},'g','tanh');        
+    
+    
+    for coridx=1:1:size(EMGica,1)
+        tempICvect_hp=filtfilt(d_hp,EMGica(coridx,:));
+        tempICvect_lp=filtfilt(d_lp,tempICvect_hp);
+        tempICvect_lp=tempICvect_lp.';
+        tempICAmean_bp=mean(tempICvect_lp);
+        tempICvect_mean_bp=abs(tempICvect_lp-tempICAmean_bp).';
+        ECG_bp_mean_bl=ECG_bp_mean(:,1:Five_sec_bl);
+        tempICvect_mean_bp_bl=tempICvect_mean_bp(:,1:Five_sec_bl);
+        [r_mean_bp_bl{coridx,1},lags_mean_bp_bl{coridx,1}]=xcorr(ECG_bp_mean_bl,tempICvect_mean_bp_bl,'normalized');
+        clear tempICAmean tempICvect_mean tempICvect_hp tempICvect_lp tempICAmean_bp tempICvect_mean_bp
+    end
+    
+    for coridx=1:1:size(EMGica,1)
+        r_max_bl(coridx,1)=max(abs(r_mean_bp_bl{coridx,1}));
+    end
+    
+    z_rmx_bl=zscore(r_max_bl);
+    TopZ_bl=find(z_rmx_bl>=2);
+    Top3_bl=maxk(r_max_bl,3,1);
+    Top3_bl_backup{1,ECGidx}=maxk(r_max_bl,3,1);
+    LikelyIC1_bl=find(Top3_bl(1)==r_max_bl);
+    LikelyIC2_bl=find(Top3_bl(2)==r_max_bl);
+    LikelyIC3_bl=find(Top3_bl(3)==r_max_bl);
+    Lik_bl=[LikelyIC1_bl LikelyIC2_bl LikelyIC3_bl];
+    A_clean=A;
+    A_clean_bl=A_clean;
+    for cleanidx=1:1:length(Lik_bl)
+        Clean_Z_bl=Lik_bl(cleanidx);
+        A_clean_bl(:,Clean_Z_bl)=A_clean_bl(:,Clean_Z_bl).*0;    
+    end
+    EMG_clean_bl=A_clean_bl*EMGica;
+    Grid_Data_filt{1,ECGidx}=[];
+    Grid_Data_filt{1,ECGidx}=EMG_clean_bl;
+    clear EMGica A W EMG_clean A_clean TopZ z_rmx r_max r_mean lags_mean r_mean_bp lags_mean_bp Clean_Z
+end
