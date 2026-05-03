@@ -836,6 +836,43 @@ def plot_background_emg_views(trials, emg_blocks, monitoring_window_ms: float = 
     _draw(slider.value)
 
 
+def _apply_tiered_ticks(ax, axis: str = 'both'):
+    """Three-tier tick sizing: labelled (major) big, midpoint minor medium,
+    other minor small. Caller is responsible for setting major ticks; minor
+    ticks are auto-populated via AutoMinorLocator(10) only if not preset.
+    """
+    from matplotlib.ticker import AutoMinorLocator
+
+    axes_iter = []
+    if axis in ('x', 'both'):
+        axes_iter.append(ax.xaxis)
+    if axis in ('y', 'both'):
+        axes_iter.append(ax.yaxis)
+
+    for axis_obj in axes_iter:
+        if axis_obj.get_minorticklocs().size == 0:
+            axis_obj.set_minor_locator(AutoMinorLocator(10))
+
+    ax.tick_params(axis=axis, which='major', length=10, width=1.8)
+    ax.tick_params(axis=axis, which='minor', length=3,  width=0.8)
+
+    ax.figure.canvas.draw()
+
+    for axis_obj in axes_iter:
+        major_locs = axis_obj.get_majorticklocs()
+        if len(major_locs) < 2:
+            continue
+        step = float(major_locs[1] - major_locs[0])
+        mid = step / 2.0
+        tol = abs(step) * 1e-3 + 1e-9
+        for tick in axis_obj.get_minor_ticks():
+            rel = (tick.get_loc() - major_locs[0]) % step
+            if abs(rel - mid) < tol:
+                for line in (tick.tick1line, tick.tick2line):
+                    line.set_markersize(6)
+                    line.set_markeredgewidth(1.2)
+
+
 def plot_hrs2_analysis(trials, header,
                        pre_avg_ms: float = 2.0, post_avg_ms: float = 15.0,
                        n_per_page: int = 6,
@@ -1262,11 +1299,13 @@ def plot_hrs2_analysis(trials, header,
     ax.text(current_at_Hmax_norm + 0.02, H_max + 2, 'b', fontsize=12, color='black')
     ax.text(normalized_currents[idx_Hmax] - 0.08, H_max + 2, 'a', fontsize=12, color='black')
 
-    ax.set_xlabel('Current (normalized to current at 50% Mmax)')
-    ax.set_ylabel('H and M wave amplitude (% of Mmax)')
-    ax.set_title(f'HRS2 Normalized Recruitment Curve - {header.subject_id}')
+    ax.set_xlabel('Current (normalized to current at 50% Mmax)', fontsize=18)
+    ax.set_ylabel('H and M wave amplitude (% of Mmax)', fontsize=18)
+    ax.set_title(f'HRS2 Normalized Recruitment Curve - {header.subject_id}',
+                 fontsize=15)
     ax.legend()
     ax.grid(True, alpha=0.3)
+    _apply_tiered_ticks(ax)
     plt.tight_layout()
     plt.show()
 
@@ -1278,14 +1317,17 @@ def plot_hrs2_analysis(trials, header,
     ax.errorbar(positions + 0.2, h_means, yerr=h_sems, fmt='o-', color='green',
                 label='H-wave mean ± SEM', capsize=3)
 
-    ax.set_xticks(positions)
-    tick_labels = [f'{a:.1f}' if i % 10 == 0 else '' for i, a in enumerate(sorted_amps)]
-    ax.set_xticklabels(tick_labels)
-    ax.set_xlabel('Stimulation Amplitude (mA)')
-    ax.set_ylabel('Peak Amplitude (µV)')
-    ax.set_title(f'HRS2 Recruitment Curve - {header.subject_id}')
+    labelled_idx = list(range(0, len(sorted_amps), 10))
+    other_idx    = [i for i in range(len(sorted_amps)) if i not in labelled_idx]
+    ax.set_xticks(labelled_idx)
+    ax.set_xticklabels([f'{sorted_amps[i]:.1f}' for i in labelled_idx])
+    ax.set_xticks(other_idx, minor=True)
+    ax.set_xlabel('Stimulation Amplitude (mA)', fontsize=18)
+    ax.set_ylabel('Peak Amplitude (µV)', fontsize=18)
+    ax.set_title(f'HRS2 Recruitment Curve - {header.subject_id}', fontsize=15)
     ax.legend()
     ax.grid(True, alpha=0.3)
+    _apply_tiered_ticks(ax)
     plt.tight_layout()
     plt.show()
 
@@ -1394,6 +1436,8 @@ def analyze_global_background(trials, emg_blocks, header,
     if show_plots:
         fig, ax = plt.subplots(figsize=(11, 4))
         ax.hist(bg_signal, bins=300, color='steelblue', edgecolor='none', alpha=0.8)
+        ax.axvline(bg_mean, color='red', linestyle='-', linewidth=2.0,
+                   label=f'Global grand mean = {bg_mean:.2f} µV')
         for val, lbl, col in [(bg_q1, 'Q1', 'orange'),
                               (bg_med, 'Median', 'purple'),
                               (bg_q3, 'Q3', 'darkorange')]:
@@ -1606,6 +1650,8 @@ def plot_threshold_sweep(sweep_results, state, trials, header):
         mid_row = rows[len(rows) // 2]
         ax3.axvspan(mid_row['min_uv'], mid_row['max_uv'], alpha=0.25, color=col,
                     label=f"{label} ±{mid_row['hw']} µV → {mid_row['n_accepted']} trials")
+    ax3.axvline(state['bg_mean'], color='black', linestyle='-', linewidth=2.0,
+                label=f"Global grand mean = {state['bg_mean']:.2f} µV")
     ax3.axvline(state['trial_min_th'].mean(), color='red', linestyle='--', linewidth=1.5,
                 label=f"Recorded min-thresh ({state['trial_min_th'].mean():.2f})")
     ax3.axvline(state['trial_max_th'].mean(), color='darkred', linestyle='--', linewidth=1.5,
@@ -1617,6 +1663,11 @@ def plot_threshold_sweep(sweep_results, state, trials, header):
     plt.tight_layout()
     plt.show()
 
+    print(f"\nGlobal EMG grand mean = {state['bg_mean']:.3f} µV  "
+          f"(std = {state['bg_std']:.3f}, Q1 = {state['bg_q1']:.3f}, "
+          f"median = {state['bg_med']:.3f}, Q3 = {state['bg_q3']:.3f})")
+    print("This is the divisor used downstream for normalising M-/H-wave sizes.")
+
     print(f"\n{'Centre':>10} {'±hw (µV)':>10} {'Min (µV)':>10} {'Max (µV)':>10} "
           f"{'Accepted':>10} {'vs Actual':>12}")
     print("-" * 67)
@@ -1626,6 +1677,506 @@ def plot_threshold_sweep(sweep_results, state, trials, header):
             print(f"{label:>10} {r['hw']:>10} {r['min_uv']:>10.2f} {r['max_uv']:>10.2f} "
                   f"{r['n_accepted']:>10} {ratio_s:>12}")
         print()
+
+
+def compute_trial_responses(trials, bg_divisor,
+                            m_start_ms: float = 2.0, m_end_ms: float = 4.0,
+                            h_start_ms: float = 6.0, h_end_ms: float = 10.0,
+                            pre_ms: float = 2.0, post_ms: float = 15.0,
+                            metric: str = 'ptp'):
+    """Per-trial M-/H-response sizes within each window, plus the same sizes
+    normalised by ``bg_divisor``.
+
+    bg_divisor:
+        scalar -- single global EMG grand mean (recommended; same divisor for
+                  every trial, e.g. ``state['bg_mean']``)
+        array  -- per-trial background, one value per trial, shape (n_trials,)
+
+    metric:
+        'ptp'  -- peak-to-peak  =  max(emg) - min(emg)        (default)
+        'peak' -- absolute peak =  max(|emg|)
+
+    Returns a dict with 1-D arrays of length ``len(trials)``:
+        m_size, h_size  -- response size in µV (per ``metric``)
+        m_norm, h_norm  -- size / bg_divisor  (NaN where divisor <= 0)
+    plus the divisor and window/metric used for downstream labelling.
+    """
+    if metric not in ('ptp', 'peak'):
+        raise ValueError(f"metric must be 'ptp' or 'peak', got {metric!r}")
+
+    def _size(values):
+        if metric == 'ptp':
+            return float(np.ptp(values))
+        return float(np.max(np.abs(values)))
+
+    n = len(trials)
+    m_size = np.full(n, np.nan)
+    h_size = np.full(n, np.nan)
+    for i, trial in enumerate(trials):
+        t_ms, emg, _, _ = get_trial_window(trial, pre_ms, post_ms)
+        m_mask = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+        h_mask = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
+        if np.any(m_mask):
+            m_size[i] = _size(emg[m_mask])
+        if np.any(h_mask):
+            h_size[i] = _size(emg[h_mask])
+
+    bg_arr = np.atleast_1d(np.asarray(bg_divisor, dtype=float))
+    if bg_arr.size == 1:
+        d = float(bg_arr.item())
+        safe_bg = d if d > 0 else float('nan')
+        bg_for_return = d
+    else:
+        if bg_arr.size != n:
+            raise ValueError(
+                f"bg_divisor array length {bg_arr.size} != n_trials {n}")
+        safe_bg = np.where(bg_arr > 0, bg_arr, np.nan)
+        bg_for_return = bg_arr
+
+    return {
+        'm_size': m_size, 'h_size': h_size,
+        'm_norm': m_size / safe_bg, 'h_norm': h_size / safe_bg,
+        'bg_divisor': bg_for_return,
+        'm_start_ms': m_start_ms, 'm_end_ms': m_end_ms,
+        'h_start_ms': h_start_ms, 'h_end_ms': h_end_ms,
+        'pre_ms': pre_ms, 'post_ms': post_ms,
+        'metric': metric,
+    }
+
+
+def print_response_stats(responses, header, label_prefix: str = ''):
+    """Pretty-print descriptive statistics (n, mean, median, std, var, sem,
+    min, max) for the raw and normalised M-/H-response sizes.
+
+    Pass ``label_prefix='Peak-to-peak'`` or ``'Peak amplitude'`` to disambiguate
+    when both metrics are computed in the same notebook.
+    """
+    metric = responses.get('metric', '?')
+    pref = f"{label_prefix} " if label_prefix else ''
+    bg_div = responses.get('bg_divisor', None)
+    bg_str = (f"{bg_div:.3f} µV (scalar)"
+              if isinstance(bg_div, float)
+              else f"per-trial array (n={len(bg_div) if bg_div is not None else '?'})")
+
+    print(f"=== {header.subject_id} — {pref}response statistics  "
+          f"(metric={metric}, bg_divisor={bg_str}) ===")
+    for desc, arr in [
+        ('M-size (raw, µV)', responses['m_size']),
+        ('H-size (raw, µV)', responses['h_size']),
+        ('M-norm (size / bg)', responses['m_norm']),
+        ('H-norm (size / bg)', responses['h_norm']),
+    ]:
+        a = np.asarray(arr, dtype=float)
+        valid = a[~np.isnan(a)]
+        if len(valid) == 0:
+            print(f"  {desc}: no valid data")
+            continue
+        std = float(np.std(valid))
+        sem = std / np.sqrt(len(valid)) if len(valid) > 0 else float('nan')
+        print(f"  {desc}:")
+        print(f"    n      = {len(valid)}")
+        print(f"    mean   = {np.mean(valid):.4f}")
+        print(f"    median = {np.median(valid):.4f}")
+        print(f"    std    = {std:.4f}")
+        print(f"    var    = {np.var(valid):.4f}")
+        print(f"    sem    = {sem:.4f}")
+        print(f"    min    = {np.min(valid):.4f}")
+        print(f"    max    = {np.max(valid):.4f}")
+    print()
+
+
+def compute_response_variability_sweep(trial_bg_gm, responses,
+                                        sweep_centres,
+                                        half_widths_uv=None,
+                                        metric: str = 'std'):
+    """For each (centre, half-width) window over the trial-background axis,
+    compute variability of the normalized M and H sizes across trials whose
+    background falls in [centre - hw, centre + hw].
+
+    metric:
+        'std' -- standard deviation of m_norm / h_norm  (default)
+        'cv'  -- coefficient of variation (std / mean)
+
+    Returns dict keyed by centre label. Each value is a list of dicts with:
+        hw, n, m_var, h_var, m_mean, h_mean, indices  (indices into trials)
+    """
+    if half_widths_uv is None:
+        half_widths_uv = [5, 10, 20, 30, 50, 75, 100, 150]
+
+    bg = np.asarray(trial_bg_gm, dtype=float)
+    m_n = np.asarray(responses['m_norm'], dtype=float)
+    h_n = np.asarray(responses['h_norm'], dtype=float)
+
+    def _stat(vals):
+        if len(vals) < 2:
+            return float('nan'), (float(vals[0]) if len(vals) == 1 else float('nan'))
+        std = float(np.std(vals))
+        mean = float(np.mean(vals))
+        if metric == 'cv':
+            return (std / mean if mean != 0 else float('nan')), mean
+        return std, mean
+
+    results: dict = {}
+    for label, centre in sweep_centres.items():
+        rows = []
+        for hw in half_widths_uv:
+            in_win = (bg >= centre - hw) & (bg <= centre + hw)
+            indices = np.where(in_win)[0]
+            mv = m_n[in_win]; mv = mv[~np.isnan(mv)]
+            hv = h_n[in_win]; hv = hv[~np.isnan(hv)]
+            m_var, m_mean = _stat(mv)
+            h_var, h_mean = _stat(hv)
+            rows.append({
+                'hw': hw, 'n': int(len(indices)),
+                'm_var': m_var, 'h_var': h_var,
+                'm_mean': m_mean, 'h_mean': h_mean,
+                'indices': indices.tolist(),
+            })
+        results[label] = rows
+    return results
+
+
+def plot_response_variability_sweep(variability_results, header,
+                                     n_markers: int = 10,
+                                     metric_label: str = 'std'):
+    """Plot Q1/Median/Q3 variability curves (M and H) vs threshold half-width,
+    with ``n_markers`` equally-spaced vertical reference lines. Returns the
+    list of marker half-widths so the viewer can slot them in.
+    """
+    import matplotlib.pyplot as plt
+    if not variability_results:
+        print("No variability results to plot.")
+        return []
+
+    first_label = next(iter(variability_results))
+    hws_all = [r['hw'] for r in variability_results[first_label]]
+    if n_markers >= 2 and len(hws_all) > 1:
+        marker_hws = list(np.linspace(min(hws_all), max(hws_all), n_markers))
+    else:
+        marker_hws = list(hws_all[:n_markers])
+
+    colours = {'Q1': 'darkorange', 'Median': 'purple', 'Q3': 'steelblue'}
+    palette = ['darkorange', 'purple', 'steelblue', 'teal', 'crimson']
+
+    def _col(label, i):
+        return colours.get(label, palette[i % len(palette)])
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+
+    for i, (label, rows) in enumerate(variability_results.items()):
+        col = _col(label, i)
+        hws_i = [r['hw'] for r in rows]
+        m_vars = [r['m_var'] for r in rows]
+        h_vars = [r['h_var'] for r in rows]
+        ax.plot(hws_i, m_vars, 'o-', label=f'M-wave  ({label} centre)',
+                color=col, linewidth=2.0)
+        ax.plot(hws_i, h_vars, 's--', label=f'H-wave  ({label} centre)',
+                color=col, linewidth=1.5, alpha=0.85)
+
+    ymin, ymax = ax.get_ylim()
+    for k, hw in enumerate(marker_hws):
+        ax.axvline(hw, color='gray', linestyle=':', linewidth=1.0, alpha=0.7)
+        ax.text(hw, ymax - (ymax - ymin) * 0.03, f'm{k}',
+                color='gray', fontsize=8, ha='center', va='top')
+
+    ax.set_xlabel('Threshold half-width  (EMG Window Size, µV)')
+    ax.set_ylabel(f'Avg M-/H-Wave Size Variability  ({metric_label} of size/background)')
+    ax.set_title(f'Response Variability vs EMG Window Size — {header.subject_id}')
+    ax.legend(fontsize=9, loc='best')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    return marker_hws
+
+
+def compute_quartile_bins(trial_bg_gm, responses, state,
+                          metric: str = 'std'):
+    """For each centre (Q1 / Median / Q3) compute variability stats over ALL
+    trials in that quartile range:
+        Q1     -> bg <= state['gm_q1']                        (lower 25%)
+        Median -> state['gm_q1'] <= bg <= state['gm_q3']      (interquartile, middle 50%)
+        Q3     -> bg >= state['gm_q3']                        (upper 25%)
+
+    Returns the same shape as ``compute_response_variability_sweep`` but with
+    one row per centre. Each row carries ``lo`` / ``hi`` (true range bounds)
+    and ``description`` so the print/viewer code can label it correctly.
+    """
+    bg = np.asarray(trial_bg_gm, dtype=float)
+    m_n = np.asarray(responses['m_norm'], dtype=float)
+    h_n = np.asarray(responses['h_norm'], dtype=float)
+
+    q1_v = float(state['gm_q1'])
+    q3_v = float(state['gm_q3'])
+    bg_min = float(np.nanmin(bg))
+    bg_max = float(np.nanmax(bg))
+
+    quartile_ranges = {
+        'Q1':     (bg_min, q1_v,   'Lower quartile (bg ≤ Q1)'),
+        'Median': (q1_v,   q3_v,   'Interquartile range (Q1 ≤ bg ≤ Q3)'),
+        'Q3':     (q3_v,   bg_max, 'Upper quartile (bg ≥ Q3)'),
+    }
+
+    def _stat(vals):
+        if len(vals) < 2:
+            return float('nan'), (float(vals[0]) if len(vals) == 1 else float('nan'))
+        std = float(np.std(vals))
+        mean = float(np.mean(vals))
+        if metric == 'cv':
+            return (std / mean if mean != 0 else float('nan')), mean
+        return std, mean
+
+    results: dict = {}
+    for label, (lo, hi, desc) in quartile_ranges.items():
+        in_win = (bg >= lo) & (bg <= hi)
+        indices = np.where(in_win)[0]
+        mv = m_n[in_win]; mv = mv[~np.isnan(mv)]
+        hv = h_n[in_win]; hv = hv[~np.isnan(hv)]
+        m_var, m_mean = _stat(mv)
+        h_var, h_mean = _stat(hv)
+        results[label] = [{
+            'hw': (hi - lo) / 2.0,
+            'lo': lo, 'hi': hi,
+            'description': desc,
+            'n': int(len(indices)),
+            'm_var': m_var, 'h_var': h_var,
+            'm_mean': m_mean, 'h_mean': h_mean,
+            'indices': indices.tolist(),
+        }]
+    return results
+
+
+def plot_response_variability_combined(ptp_results, peak_results, header,
+                                         n_markers: int = 10):
+    """Stacked 2-panel figure for the merged Section 6:
+        top    -- peak-to-peak variability (Q1/Median/Q3 × M/H)
+        bottom -- peak amplitude variability (Q1/Median/Q3 × M/H)
+
+    Same x-axis (threshold half-width) on both panels with shared markers.
+    Returns the list of marker half-widths.
+    """
+    import matplotlib.pyplot as plt
+    if not ptp_results or not peak_results:
+        print("Empty results.")
+        return []
+
+    first_label = next(iter(ptp_results))
+    hws_all = [r['hw'] for r in ptp_results[first_label]]
+    if n_markers >= 2 and len(hws_all) > 1:
+        marker_hws = list(np.linspace(min(hws_all), max(hws_all), n_markers))
+    else:
+        marker_hws = list(hws_all[:n_markers])
+
+    colours = {'Q1': 'darkorange', 'Median': 'purple', 'Q3': 'steelblue'}
+    palette = ['darkorange', 'purple', 'steelblue', 'teal', 'crimson']
+
+    def _col(label, i):
+        return colours.get(label, palette[i % len(palette)])
+
+    fig, axes = plt.subplots(2, 1, figsize=(13, 10), sharex=True)
+
+    for ax, results, title in [(axes[0], ptp_results, 'Peak-to-peak'),
+                                (axes[1], peak_results, 'Peak amplitude')]:
+        for i, (label, rows) in enumerate(results.items()):
+            col = _col(label, i)
+            hws_i = [r['hw'] for r in rows]
+            m_vars = [r['m_var'] for r in rows]
+            h_vars = [r['h_var'] for r in rows]
+            ax.plot(hws_i, m_vars, 'o-', label=f'M ({label})',
+                    color=col, linewidth=2.0)
+            ax.plot(hws_i, h_vars, 's--', label=f'H ({label})',
+                    color=col, linewidth=1.5, alpha=0.85)
+
+        ymin, ymax = ax.get_ylim()
+        for k, hw in enumerate(marker_hws):
+            ax.axvline(hw, color='gray', linestyle=':', linewidth=1.0, alpha=0.7)
+            ax.text(hw, ymax - (ymax - ymin) * 0.03, f'm{k}',
+                    color='gray', fontsize=8, ha='center', va='top')
+
+        ax.set_ylabel(f'{title} Variability\n(std of size / background)')
+        ax.set_title(f'{title} — {header.subject_id}')
+        ax.legend(fontsize=8, loc='best', ncol=2)
+        ax.grid(True, alpha=0.3)
+
+    axes[1].set_xlabel('Threshold half-width  (EMG Window Size, µV)')
+    plt.suptitle('M-/H-Wave Size Variability vs EMG Window Size', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+    return marker_hws
+
+
+def print_variability_summary(variability_results, sweep_centres, header,
+                              metric_name: str = 'ptp'):
+    """Section-5b-style table of a variability sweep, one row per (centre, hw).
+
+    Columns: Centre, ±hw (µV), Min (µV), Max (µV), n, M-var, H-var, M-mean, H-mean.
+    Use after computing ``variability_results`` at marker half-widths to get a
+    table with one row per marker per centre (e.g. 10 markers × 3 centres = 30 rows).
+    """
+    if not variability_results:
+        return
+    print(f"\n=== {header.subject_id} — {metric_name} variability summary ===")
+    print(f"{'Centre':>10} {'±hw (µV)':>10} {'Min (µV)':>10} {'Max (µV)':>10} "
+          f"{'n':>6} {'M-var':>10} {'H-var':>10} {'M-mean':>10} {'H-mean':>10}")
+    print("-" * 100)
+    for label, centre in sweep_centres.items():
+        for r in variability_results.get(label, []):
+            if 'lo' in r and 'hi' in r:
+                min_uv = float(r['lo'])
+                max_uv = float(r['hi'])
+            else:
+                min_uv = max(0.0, centre - r['hw'])
+                max_uv = centre + r['hw']
+            print(f"{label:>10} {r['hw']:>10.1f} {min_uv:>10.2f} {max_uv:>10.2f} "
+                  f"{r['n']:>6} {r['m_var']:>10.3f} {r['h_var']:>10.3f} "
+                  f"{r['m_mean']:>10.3f} {r['h_mean']:>10.3f}")
+        print()
+
+
+def view_variability_bin(variability_results, marker_hws, trials, header,
+                          pre_ms: float = 2.0, post_ms: float = 15.0,
+                          m_start_ms: float = 2.0, m_end_ms: float = 4.0,
+                          h_start_ms: float = 6.0, h_end_ms: float = 10.0,
+                          max_overlay: int = 200,
+                          bg_mean: float = None,
+                          quartile_results=None):
+    """Interactive bin browser: pick a centre + marker → see the trials whose
+    background falls in [centre ± marker_hw].
+
+    Prints bin stats + trial indices and overlays the bipolar EMG of those
+    trials (capped at ``max_overlay``) with average and M/H windows shaded.
+
+    bg_mean: if given, draws ±``bg_mean`` horizontal reference lines on the
+             bipolar overlay so each response can be compared to the global
+             EMG grand mean.
+    quartile_results: optional dict from ``compute_quartile_bins``. When
+             provided, a 'Show all in quartile' toggle appears; turning it on
+             switches the bin source from the marker grid to the entire
+             quartile range for the selected centre.
+    """
+    import matplotlib.pyplot as plt
+    from ipywidgets import Dropdown, IntSlider, ToggleButton, Output, VBox, HBox
+    from IPython.display import display
+
+    if not variability_results or not marker_hws:
+        print("No variability data or markers.")
+        return
+
+    centre_labels = list(variability_results.keys())
+    centre_dd = Dropdown(options=centre_labels, value=centre_labels[0],
+                         description='Centre:', layout={'width': '200px'})
+    marker_slider = IntSlider(
+        value=len(marker_hws) // 2, min=0, max=len(marker_hws) - 1, step=1,
+        description='Marker:', layout={'width': '450px'},
+        continuous_update=False)
+    has_quartile = quartile_results is not None
+    quartile_toggle = ToggleButton(
+        value=False, description='Show all in quartile',
+        tooltip='Use the full quartile range instead of the marker bin',
+        layout={'width': '220px'},
+        disabled=not has_quartile,
+    )
+    out = Output()
+
+    def _draw(centre, m_idx, q_mode):
+        with out:
+            out.clear_output(wait=True)
+            if q_mode and has_quartile:
+                row = quartile_results[centre][0]
+            else:
+                target_hw = marker_hws[m_idx]
+                rows = variability_results[centre]
+                hws = np.array([r['hw'] for r in rows], dtype=float)
+                best = int(np.argmin(np.abs(hws - target_hw)))
+                row = rows[best]
+            indices = row['indices']
+
+            if q_mode and has_quartile:
+                lo = float(row.get('lo', 0.0))
+                hi = float(row.get('hi', 0.0))
+                desc = row.get('description', f'{centre} quartile')
+                print(f"Centre = {centre}  |  ALL trials in quartile  |  "
+                      f"range = [{lo:.2f}, {hi:.2f}] µV")
+                print(f"  {desc}")
+                title = (f'{header.subject_id} — Centre={centre}, '
+                         f'quartile range [{lo:.1f}, {hi:.1f}] µV, '
+                         f'n={row["n"]} trials')
+            else:
+                print(f"Centre = {centre}  |  marker {m_idx}  |  "
+                      f"target hw = {marker_hws[m_idx]:.1f} µV  |  "
+                      f"closest sweep hw = {row['hw']} µV")
+                title = (f'{header.subject_id} — Centre={centre}, '
+                         f'hw={row["hw"]} µV, n={row["n"]} trials')
+
+            print(f"  Trials in window: {row['n']}")
+            print(f"  M-wave  (size / bg):  mean = {row['m_mean']:.3f}   "
+                  f"variability = {row['m_var']:.3f}")
+            print(f"  H-wave  (size / bg):  mean = {row['h_mean']:.3f}   "
+                  f"variability = {row['h_var']:.3f}")
+            preview = indices[:50]
+            print(f"  Trial indices ({len(indices)}): {preview}"
+                  f"{' …' if len(indices) > len(preview) else ''}")
+
+            if not indices:
+                return
+
+            fig, ax = plt.subplots(figsize=(14, 5))
+            ax.axhline(0, color='black', linewidth=0.5, alpha=0.4)
+            ax.axvspan(m_start_ms, m_end_ms, color='blue', alpha=0.15, label='M window')
+            ax.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.15, label='H window')
+            if bg_mean is not None and bg_mean > 0:
+                ax.axhline(bg_mean, color='black', linestyle='--', linewidth=1.2,
+                           label=f'±global mean ({bg_mean:.1f} µV)')
+                ax.axhline(-bg_mean, color='black', linestyle='--', linewidth=1.2)
+
+            shown = indices[:max_overlay]
+            t_ref = None
+            stack = []
+            for idx in shown:
+                t_ms, emg, _, _ = get_trial_window(trials[idx], pre_ms, post_ms)
+                if t_ref is None:
+                    t_ref = t_ms
+                if len(emg) == len(t_ref):
+                    ax.plot(t_ref, emg, color='red', alpha=0.15, linewidth=0.6)
+                    stack.append(emg)
+
+            if stack:
+                arr = np.full((len(stack), len(t_ref)), np.nan)
+                for k, emg in enumerate(stack):
+                    n = min(len(emg), len(t_ref))
+                    arr[k, :n] = emg[:n]
+                avg = np.nanmean(arr, axis=0)
+                ax.plot(t_ref, avg, color='black', linewidth=2.5, label='Average')
+
+            extra = f' (showing first {max_overlay} of {len(indices)})' \
+                    if len(indices) > max_overlay else ''
+            ax.set_xlabel('Time re: stim onset (ms)')
+            ax.set_ylabel('Bipolar EMG (µV)')
+            ax.set_title(title + extra)
+            ax.legend(loc='upper right', fontsize=9)
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.show()
+
+    def _on_centre(c):
+        if c['name'] == 'value':
+            _draw(c['new'], marker_slider.value, quartile_toggle.value)
+
+    def _on_marker(c):
+        if c['name'] == 'value':
+            _draw(centre_dd.value, c['new'], quartile_toggle.value)
+
+    def _on_toggle(c):
+        if c['name'] == 'value':
+            marker_slider.disabled = bool(c['new'])
+            _draw(centre_dd.value, marker_slider.value, c['new'])
+
+    centre_dd.observe(_on_centre, names='value')
+    marker_slider.observe(_on_marker, names='value')
+    quartile_toggle.observe(_on_toggle, names='value')
+
+    display(VBox([HBox([centre_dd, marker_slider, quartile_toggle]), out]))
+    _draw(centre_dd.value, marker_slider.value, quartile_toggle.value)
 
 
 def classify_trials(trials, file_version=0,
