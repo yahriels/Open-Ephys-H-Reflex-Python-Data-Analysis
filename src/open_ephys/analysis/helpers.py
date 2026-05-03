@@ -568,6 +568,1066 @@ def get_trial_context_window(trial: 'MhRecTrial',
     return t_s, emg_cat, onset_in_window, adc_cat
 
 
+def compute_background_bins(trial,
+                            emg_blocks,
+                            monitoring_window_ms: float = 2500.0,
+                            bin_ms: float = BIN_DURATION_MS,
+                            sample_rate: float = SAMPLE_RATE):
+    """Reconstruct the pre-stim |EMG| bins that the live H-Reflex App used to
+    decide whether to initiate a recruitment-curve trial.
+
+    Walks back through ``emg_blocks`` from the trial's wall-clock trigger time,
+    collects ``monitoring_window_ms`` of ``abs_val`` ending at the trigger, splits
+    into ``bin_ms``-wide bins, and returns ``(bins, grand_mean)``.
+
+    ``trial.trigger_wall_time_ms`` and ``block.ts_open_ephys_sent`` are both Unix
+    millisecond timestamps (see ``HReflexDataFileEmgData`` and
+    ``mh_recruitment_curve_data_file``). We match on those, then use sample-count
+    arithmetic to look back. Returns ``(None, nan)`` if the trigger time can't be
+    located in the block stream.
+
+    Mirrors ``MhRecruitmentCurveStage_TrialInitiationData.process()`` in the app.
+    """
+    if not emg_blocks:
+        return None, float('nan')
+
+    trigger_ms = int(getattr(trial, 'trigger_wall_time_ms', 0) or 0)
+    if trigger_ms <= 0:
+        return None, float('nan')
+
+    bin_samp = int(bin_ms * sample_rate / 1000.0)
+    n_bins = int(monitoring_window_ms / bin_ms)
+    if bin_samp <= 0 or n_bins <= 0:
+        return None, float('nan')
+    needed = n_bins * bin_samp
+
+    trig_idx = None
+    best_diff = None
+    for i, blk in enumerate(emg_blocks):
+        blk_ms = int(blk.ts_open_ephys_sent)
+        if blk_ms > trigger_ms:
+            break
+        diff = trigger_ms - blk_ms
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            trig_idx = i
+
+    if trig_idx is None:
+        return None, float('nan')
+
+    trig_blk = emg_blocks[trig_idx]
+    ms_into_block = trigger_ms - int(trig_blk.ts_open_ephys_sent)
+    sample_offset = int(round(ms_into_block * sample_rate / 1000.0))
+    sample_offset = max(0, min(sample_offset, len(trig_blk.abs_val)))
+
+    segments: list[np.ndarray] = [trig_blk.abs_val[:sample_offset]]
+    collected = len(segments[0])
+    j = trig_idx - 1
+    while collected < needed and j >= 0:
+        chunk = emg_blocks[j].abs_val
+        segments.insert(0, chunk)
+        collected += len(chunk)
+        j -= 1
+
+    if collected < bin_samp:
+        return None, float('nan')
+
+    abs_signal = np.concatenate(segments)
+    if len(abs_signal) > needed:
+        abs_signal = abs_signal[-needed:]
+    n_bins_actual = len(abs_signal) // bin_samp
+    if n_bins_actual <= 0:
+        return None, float('nan')
+
+    abs_signal = abs_signal[-n_bins_actual * bin_samp:]
+    bins = abs_signal.reshape(n_bins_actual, bin_samp).mean(axis=1)
+    grand_mean = float(bins.mean())
+    return bins, grand_mean
+
+
+def print_hrs1_summary(header, trials, emg_blocks, file_path: str = "") -> None:
+    """Print a human-readable summary of an .hrs1 file's header, trials, and EMG blocks."""
+    print("=== HRS1 Header ===")
+    if file_path:
+        print(f"  File:               {os.path.basename(file_path)}")
+    print(f"  File version:       {header.file_version}")
+    print(f"  Subject ID:         {header.subject_id}")
+    print(f"  Session datetime:   {header.session_datetime}")
+    print(f"  Stage name:         {header.stage_name}")
+    print(f"  Stage description:  {header.stage_description}")
+    print(f"  Stage type:         {header.stage_type}")
+    print(f"  Trial init uV min:  {header.trial_initiation_uv_min}")
+    print(f"  Trial init uV max:  {header.trial_initiation_uv_max}")
+    print(f"  Trial init phase min ms: {header.trial_initiation_phase_min_ms}")
+    print(f"  Trial init phase max ms: {header.trial_initiation_phase_max_ms}")
+    print(f"  Bin duration ms:    {header.bin_duration_ms}")
+    print(f"  Sample rate:        {header.sample_rate} Hz")
+    tph = header.trials_per_hour_data
+    if tph is not None:
+        print(f"  Trials/hr data: centre={tph.sweep_centre_uv:.2f} µV, "
+              f"elapsed={tph.elapsed_hours:.3f} h, {len(tph.window_sizes)} window sizes")
+    else:
+        print("  Trials-per-hour data: not present in file")
+    print(f"\n  Trials found:       {len(trials)}")
+    print(f"  EMG data blocks:    {len(emg_blocks)}")
+
+    if len(trials) > 0:
+        t0 = trials[0]
+        print("\n=== First Trial ===")
+        print(f"  End datetime:       {t0.trial_end_datetime}")
+        print(f"  Start index:        {t0.trial_start_index}")
+        print(f"  Grand mean:         {t0.grand_mean:.4f}")
+        print(f"  Bins count:         {len(t0.bins)}")
+        print(f"  Monitored signal N: {len(t0.monitored_signal)}")
+
+    if len(emg_blocks) > 0:
+        b0 = emg_blocks[0]
+        n_raw = len(b0.raw_channels[0]) if b0.raw_channels else 0
+        print("\n=== First EMG Block ===")
+        print(f"  Channel names:      {b0.channel_names}")
+        print(f"  Raw channels:       {len(b0.raw_channels)} x {n_raw} samples")
+        print(f"  Diff samples:       {len(b0.diff)}")
+        print(f"  Filtered samples:   {len(b0.filtered)}")
+        print(f"  Abs samples:        {len(b0.abs_val)}")
+
+
+def print_hrs2_summary(header, trials, emg_blocks, file_path: str = "") -> None:
+    """Print a human-readable summary of an .hrs2 file's header, trials, and EMG blocks."""
+    if header is None:
+        print("No HRS2 file loaded.")
+        return
+
+    fv_descs = {
+        0: "v0: trial_data only",
+        1: "v1: + ADC sync_data",
+        2: "v2: + timing/sync debug fields",
+        3: "v3: + unipolar_trial_data",
+    }
+    fv_desc = fv_descs.get(header.file_version, f"v{header.file_version}")
+
+    print("=== HRS2 Header ===")
+    if file_path:
+        print(f"  File:               {os.path.basename(file_path)}")
+    print(f"  File version:       {header.file_version}  ({fv_desc})")
+    print(f"  Subject ID:         {header.subject_id}")
+    print(f"  Session start time: {header.session_start_time}")
+    print(f"  Stage name:         {header.stage_name}")
+    print(f"  Stage description:  {header.stage_description}")
+    print(f"  Stage type:         {header.stage_type}")
+    print(f"\n  Trials found:       {len(trials)}")
+    print(f"  EMG data blocks:    {len(emg_blocks)}")
+
+    if len(emg_blocks) > 0:
+        b0 = emg_blocks[0]
+        n_raw = len(b0.raw_channels[0]) if b0.raw_channels else 0
+        print("\n=== First EMG Block ===")
+        print(f"  Channel names:  {b0.channel_names}")
+        print(f"  Raw channels:   {len(b0.raw_channels)} x {n_raw} samples")
+        print(f"  Diff samples:   {len(b0.diff)}")
+
+
+def plot_amplitude_distribution(trials, header):
+    """Histogram of stim amplitudes used across an HRS2 session."""
+    import matplotlib.pyplot as plt
+    if not trials:
+        print("No trials to plot.")
+        return
+
+    amp_counts: dict = defaultdict(int)
+    for t in trials:
+        amp_counts[round(t.stimulation_amplitude_ma, 2)] += 1
+
+    amplitudes = sorted(amp_counts.keys())
+    counts = [amp_counts[a] for a in amplitudes]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(amplitudes, counts, width=0.01,
+           color='steelblue', edgecolor='black', alpha=0.7)
+    ax.set_xlabel('Stimulation Intensity (mA)', fontsize=12)
+    ax.set_ylabel('Count / Number of Repeats', fontsize=12)
+    ax.set_title(f'Stimulation Intensities Distribution - {header.subject_id}',
+                 fontsize=14)
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.show()
+
+
+def plot_background_emg_views(trials, emg_blocks, monitoring_window_ms: float = 2500.0):
+    """Interactive 'Most recent background' bar chart + 'Background EMG Level' scatter.
+
+    Mirrors the H-Reflex App recruitment-curve trial plot widgets:
+      _update_most_recent_background_plot  (bar chart of pre-stim |EMG| bins)
+      _update_emg_level_plot               (scatter of grand means per trial)
+    """
+    import matplotlib.pyplot as plt
+    from ipywidgets import IntSlider, Output, VBox, HBox
+    from IPython.display import display
+
+    if len(trials) == 0:
+        print("No HRS2 trials to plot.")
+        return
+
+    bins_per_trial = []
+    grand_means = []
+    for trial in trials:
+        bins, gm = compute_background_bins(
+            trial, emg_blocks, monitoring_window_ms=monitoring_window_ms)
+        bins_per_trial.append(bins)
+        grand_means.append(gm)
+
+    valid_idx = [i for i, gm in enumerate(grand_means) if not np.isnan(gm)]
+    if not valid_idx:
+        print("Could not reconstruct any background windows from emg_blocks.")
+        return
+
+    out = Output()
+    slider = IntSlider(value=valid_idx[-1], min=0, max=len(trials) - 1, step=1,
+                       description='Trial:', layout={'width': '600px'},
+                       continuous_update=False)
+
+    def _draw(idx):
+        with out:
+            out.clear_output(wait=True)
+            fig, (ax_bg, ax_lvl) = plt.subplots(1, 2, figsize=(15, 5))
+
+            bins = bins_per_trial[idx]
+            if bins is None:
+                ax_bg.text(0.5, 0.5, f'Trial {idx}: no background reconstructed',
+                           ha='center', va='center', transform=ax_bg.transAxes)
+            else:
+                gm = grand_means[idx]
+                x = np.arange(len(bins))
+                ax_bg.bar(x, bins, width=0.8, color=(70/255, 130/255, 180/255))
+                ax_bg.axhline(gm, color='red', linestyle='--', linewidth=2,
+                              label=f'Mean={gm:.2f}')
+                ax_bg.legend(loc='upper right')
+            ax_bg.set_xlabel('Bin #')
+            ax_bg.set_ylabel('EMG (µV)')
+            ax_bg.set_title(f'Most Recent Background  (Trial {idx})')
+            ax_bg.grid(True, alpha=0.3, axis='y')
+
+            ax_lvl.scatter(valid_idx, [grand_means[i] for i in valid_idx],
+                           s=40, color=(0, 0, 200/255),
+                           edgecolor='black', linewidth=0.4)
+            if not np.isnan(grand_means[idx]):
+                ax_lvl.scatter([idx], [grand_means[idx]], s=160, marker='*',
+                               color='gold', edgecolor='black', linewidth=0.6,
+                               zorder=5, label=f'Selected (Trial {idx})')
+            tr = trials[idx]
+            ax_lvl.axhline(tr.min_initiation_threshold, color=(0, 160/255, 0),
+                           linestyle='--', linewidth=1.5,
+                           label=f'Min thresh: {tr.min_initiation_threshold:.1f}')
+            ax_lvl.axhline(tr.max_initiation_threshold, color=(200/255, 0, 0),
+                           linestyle='--', linewidth=1.5,
+                           label=f'Max thresh: {tr.max_initiation_threshold:.1f}')
+            ax_lvl.set_xlabel('Trial #')
+            ax_lvl.set_ylabel('EMG Mean (µV)')
+            ax_lvl.set_title('Background EMG Level')
+            ax_lvl.legend(loc='upper right', fontsize=9)
+            ax_lvl.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.show()
+
+    slider.observe(lambda c: _draw(c['new']) if c['name'] == 'value' else None,
+                   names='value')
+    print(f"Reconstructed background bins for {len(valid_idx)}/{len(trials)} trials "
+          f"(window={monitoring_window_ms} ms).")
+    display(VBox([HBox([slider]), out]))
+    _draw(slider.value)
+
+
+def plot_hrs2_analysis(trials, header,
+                       pre_avg_ms: float = 2.0, post_avg_ms: float = 15.0,
+                       n_per_page: int = 6,
+                       m_start_ms: float = 2.0, m_end_ms: float = 4.0,
+                       h_start_ms: float = 6.0, h_end_ms: float = 10.0):
+    """Interactive averaged-waveform paged grid + zoom + recruitment curve.
+
+    Each page shows ``n_per_page`` panels, one per stimulation amplitude, with raw
+    bipolar trials, average bipolar, optional |bipolar|/unipolar overlays, ADC sync
+    overlay, M/H wave region shading, and peak markers/labels. Click to select an
+    amplitude in the dropdown; double-click to zoom. Following the grid we plot
+    the normalized recruitment curve and the raw mean ± SEM curve.
+    """
+    import matplotlib.pyplot as plt
+    import scipy.stats as stats
+    from scipy.interpolate import interp1d
+    from ipywidgets import (Button, Output, HBox, VBox, Dropdown, Label,
+                            Checkbox, ToggleButton, FloatText, HTML)
+    from IPython.display import display
+
+    if len(trials) == 0:
+        print("No HRS2 trials to group.")
+        return
+
+    _groups: dict = defaultdict(list)
+    for _trial in trials:
+        _key = round(_trial.stimulation_amplitude_ma, 2)
+        _t_win, _bip_win, _adc_win, _stim_end = get_trial_window(
+            _trial, pre_avg_ms, post_avg_ms)
+        _t_uni, _uni_win, _, _ = get_trial_window(
+            _trial, pre_avg_ms, post_avg_ms, use_unipolar=True)
+        _groups[_key].append((_t_win, _bip_win, _adc_win, _uni_win, _stim_end))
+
+    _sorted_amps = sorted(_groups.keys())
+
+    def _pad_rows(rows, n_pts):
+        p = np.full((len(rows), n_pts), np.nan)
+        for k, a in enumerate(rows):
+            if a is not None and len(a) > 0:
+                _n = min(len(a), n_pts)
+                p[k, :_n] = np.asarray(a[:_n], dtype=float)
+        return p
+
+    _amp_data = []
+    for _amp in _sorted_amps:
+        _wins  = _groups[_amp]
+        _t_ref = _wins[0][0]
+        _np    = len(_t_ref)
+
+        _pb  = _pad_rows([w[1] for w in _wins], _np)
+        _pa  = _pad_rows([w[2] for w in _wins], _np)
+        _pu  = _pad_rows([w[3] for w in _wins], _np)
+        _pab = np.abs(_pb)
+        _pau = np.abs(_pu)
+
+        _avg_b  = np.nanmean(_pb,  axis=0)
+        _avg_a  = np.nanmean(_pa,  axis=0)
+        _avg_u  = np.nanmean(_pu,  axis=0)
+        _avg_ab = np.abs(_avg_b)
+        _avg_au = np.abs(_avg_u)
+
+        _se = [w[4] for w in _wins if w[4] is not None]
+        _mse = float(np.mean(_se)) if _se else 0.5
+
+        _mm = (_t_ref >= m_start_ms) & (_t_ref <= m_end_ms)
+        _hm = (_t_ref >= h_start_ms) & (_t_ref <= h_end_ms)
+        _mi = int(np.argmax(_avg_ab[_mm])) if _mm.any() else 0
+        _hi = int(np.argmax(_avg_ab[_hm])) if _hm.any() else 0
+        _m_t   = float(_t_ref[_mm][_mi])  if _mm.any() else m_start_ms
+        _m_a   = float(_avg_ab[_mm][_mi]) if _mm.any() else float('nan')
+        _m_bip = float(_avg_b[_mm][_mi])  if _mm.any() else float('nan')
+        _h_t   = float(_t_ref[_hm][_hi])  if _hm.any() else h_start_ms
+        _h_a   = float(_avg_ab[_hm][_hi]) if _hm.any() else float('nan')
+        _h_bip = float(_avg_b[_hm][_hi])  if _hm.any() else float('nan')
+
+        _amp_data.append({
+            'amp': _amp, 't_ref': _t_ref, 'n': len(_wins),
+            'mean_stim_end': _mse,
+            'padded_bip': _pb,  'avg_bip': _avg_b,
+            'padded_adc': _pa,  'avg_adc': _avg_a,
+            'padded_uni': _pu,  'avg_uni': _avg_u,
+            'padded_abs_bip': _pab, 'avg_abs_bip': _avg_ab,
+            'padded_abs_uni': _pau, 'avg_abs_uni': _avg_au,
+            'm_peak_time': _m_t, 'm_peak_amp': _m_a, 'm_peak_bip': _m_bip,
+            'h_peak_time': _h_t, 'h_peak_amp': _h_a, 'h_peak_bip': _h_bip,
+        })
+
+    _show_sigs = {'val': set()}
+    _ylim_auto = {'val': True}
+    _ylim_man  = {'lo': -5000.0, 'hi': 5500.0}
+
+    def _get_ylim():
+        if _ylim_auto['val']:
+            _arrays = [d['padded_bip'] for d in _amp_data]
+            for _sig in ('abs_bip', 'uni', 'abs_uni'):
+                if _sig in _show_sigs['val']:
+                    _arrays += [d[f'padded_{_sig}'] for d in _amp_data]
+            _all = np.concatenate([a.flatten() for a in _arrays])
+            _all = _all[~np.isnan(_all)]
+            if len(_all) == 0:
+                return (-1000.0, 1500.0)
+            _lo, _hi = float(np.nanmin(_all)), float(np.nanmax(_all))
+            _pad = max(0.08 * (_hi - _lo), 1.0)
+            return (_lo - _pad, _hi + _pad)
+        return (_ylim_man['lo'], _ylim_man['hi'])
+
+    def _draw_avg_panel(ax, d, small=True):
+        lw  = 0.8 if small else 1.5
+        fsz = 8   if small else 11
+        t   = d['t_ref']
+        end_ms = d['mean_stim_end']
+        _text_off = 150 if small else 220
+        sigs = _show_sigs['val']
+
+        ax.axhline(0, color='black', linewidth=0.6, linestyle='-', alpha=0.4, zorder=1)
+
+        for _row in d['padded_bip']:
+            ax.plot(t, _row, color='red', alpha=0.6, linewidth=lw * 0.7)
+        ax.plot(t, d['avg_bip'], color='black', linewidth=lw * 2.5, label='Avg Bipolar')
+
+        if 'abs_bip' in sigs:
+            for _row in d['padded_abs_bip']:
+                ax.plot(t, _row, color='gray', alpha=0.25, linewidth=lw * 0.5)
+            ax.plot(t, d['avg_abs_bip'], color='gray', linewidth=lw * 1.8,
+                    label='|Bipolar| avg')
+
+        if 'uni' in sigs:
+            for _row in d['padded_uni']:
+                ax.plot(t, _row, color='orange', alpha=0.35, linewidth=lw * 0.5)
+            ax.plot(t, d['avg_uni'], color='orange', linewidth=lw * 1.8,
+                    label='Avg Unipolar')
+
+        if 'abs_uni' in sigs:
+            for _row in d['padded_abs_uni']:
+                ax.plot(t, _row, color='purple', alpha=0.25, linewidth=lw * 0.5)
+            ax.plot(t, d['avg_abs_uni'], color='purple', linewidth=lw * 1.8,
+                    label='|Unipolar| avg')
+
+        if 'adc' in sigs:
+            _ax2 = ax.twinx()
+            for _row in d['padded_adc']:
+                _ax2.plot(t, _row, color='green', alpha=0.25, linewidth=lw * 0.4)
+            _ax2.plot(t, d['avg_adc'], color='green', linewidth=lw * 1.8,
+                      label='ADC sync')
+            _ax2.set_ylabel('ADC (V)', color='green', fontsize=fsz - 1)
+            _ax2.tick_params(axis='y', labelcolor='green', labelsize=fsz - 2)
+
+        ax.axvspan(0, end_ms, color='red', alpha=0.20)
+        ax.axvline(0,      color='red', linestyle='--', linewidth=lw)
+        ax.axvline(end_ms, color='red', linestyle='--', linewidth=lw)
+
+        ax.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.3)
+        ax.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.3)
+
+        m_t, m_a = d['m_peak_time'], d['m_peak_amp']
+        h_t, h_a = d['h_peak_time'], d['h_peak_amp']
+        m_bip = d.get('m_peak_bip', m_a)
+        h_bip = d.get('h_peak_bip', h_a)
+        _msize = 8 if small else 14
+        ax.axvline(m_t, color='blue',  linestyle=':', linewidth=lw * 1.2,
+                   label=f'M-peak: {m_a:.1f} uV')
+        ax.axvline(h_t, color='green', linestyle=':', linewidth=lw * 1.2,
+                   label=f'H-peak: {h_a:.1f} uV')
+        ax.plot(m_t, m_bip, '*', color='blue',  markersize=_msize, zorder=6,
+                markeredgecolor='darkblue', markeredgewidth=0.5)
+        ax.plot(h_t, h_bip, '*', color='green', markersize=_msize, zorder=6,
+                markeredgecolor='darkgreen', markeredgewidth=0.5)
+        if not np.isnan(m_bip):
+            ax.text(m_t, m_bip + _text_off, f'{m_a:.1f} uV',
+                    color='blue', fontsize=fsz - 1, ha='center')
+        if not np.isnan(h_bip):
+            ax.text(h_t, h_bip + _text_off, f'{h_a:.1f} uV',
+                    color='green', fontsize=fsz - 1, ha='center')
+
+        ax.set_xlim(-pre_avg_ms, post_avg_ms)
+        ax.set_ylim(_get_ylim())
+        ax.set_xlabel('Time re: onset (ms)', fontsize=fsz)
+        ax.set_ylabel('EMG (uV)', fontsize=fsz)
+        ax.tick_params(labelsize=fsz - 1)
+        ax.grid(True, alpha=0.3)
+        _min_ms = int(np.floor(t[0]))
+        _max_ms = int(np.ceil(t[-1]))
+        ax.set_xticks(np.arange(_min_ms, _max_ms + 1, 1))
+        if not small:
+            ax.legend(fontsize=fsz - 2, loc='upper right')
+
+    _pages    = [_amp_data[i:i+n_per_page] for i in range(0, len(_amp_data), n_per_page)]
+    _cur_page = {'idx': 0}
+    _out      = Output()
+    _amp_drop = Dropdown(description='Amplitude:')
+
+    def _plot_page(page_idx):
+        with _out:
+            _out.clear_output(wait=True)
+            page = _pages[page_idx]
+            n    = len(page)
+
+            _amp_drop.options = [
+                (f"{d['amp']:.2f} mA (n={d['n']})", page_idx * n_per_page + i)
+                for i, d in enumerate(page)
+            ]
+            if _amp_drop.options:
+                _amp_drop.value = _amp_drop.options[0][1]
+
+            fig, axs  = plt.subplots(2, 3, figsize=(15, 7))
+            _axs_flat = axs.flatten()
+
+            for j in range(n_per_page):
+                ax = _axs_flat[j]
+                if j < n:
+                    d = page[j]
+                    _draw_avg_panel(ax, d, small=True)
+                    ax.set_title(f"{d['amp']:.2f} mA  (n={d['n']})", fontsize=24)
+                else:
+                    ax.axis('off')
+
+            _n_start = n_per_page * page_idx + 1
+            _n_end   = min(n_per_page * (page_idx + 1), len(_amp_data))
+            fig.suptitle(
+                f"{header.subject_id}    "
+                f"Amplitudes {_n_start}-{_n_end} of {len(_amp_data)}"
+                f"  (Page {page_idx+1}/{len(_pages)})",
+                fontsize=11
+            )
+            plt.tight_layout()
+            plt.show()
+
+            try:
+                def _on_click(event):
+                    if event.inaxes is None:
+                        return
+                    for k, ax in enumerate(_axs_flat):
+                        if event.inaxes is ax and k < n:
+                            if getattr(event, 'dblclick', False):
+                                _show_zoom(page_idx * n_per_page + k)
+                            else:
+                                _amp_drop.value = page_idx * n_per_page + k
+                            break
+                fig.canvas.mpl_connect('button_press_event', _on_click)
+            except Exception:
+                pass
+
+    def _show_zoom(amp_idx):
+        d = _amp_data[amp_idx]
+        with _out:
+            _out.clear_output(wait=True)
+            fig, ax = plt.subplots(figsize=(13, 5))
+            _draw_avg_panel(ax, d, small=False)
+            ax.set_title(
+                f"Averaged Waveforms (n={d['n']}) | Stim Amp: {d['amp']:.2f} mA | "
+                f"{header.subject_id}  "
+                f"({header.session_start_time:%Y-%m-%d %H:%M})",
+                fontsize=12
+            )
+            plt.tight_layout()
+            plt.show()
+
+            _back_btn = Button(description='Back to grid', button_style='info')
+            _back_btn.on_click(lambda b: _plot_page(_cur_page['idx']))
+            display(_back_btn)
+
+    def _on_prev(b):
+        if _cur_page['idx'] > 0:
+            _cur_page['idx'] -= 1
+            _page_drop.value = _cur_page['idx']
+            _plot_page(_cur_page['idx'])
+
+    def _on_next(b):
+        if _cur_page['idx'] < len(_pages) - 1:
+            _cur_page['idx'] += 1
+            _page_drop.value = _cur_page['idx']
+            _plot_page(_cur_page['idx'])
+
+    def _on_page_change(change):
+        if change['name'] == 'value' and change['new'] != _cur_page['idx']:
+            _cur_page['idx'] = change['new']
+            _plot_page(_cur_page['idx'])
+
+    def _on_view(b):
+        try:
+            _show_zoom(int(_amp_drop.value))
+        except Exception as e:
+            print(f'Could not zoom amplitude: {e}')
+
+    def _make_sig_cb(key):
+        def _cb(change):
+            if change['new']:
+                _show_sigs['val'].add(key)
+            else:
+                _show_sigs['val'].discard(key)
+            _plot_page(_cur_page['idx'])
+        return _cb
+
+    def _on_auto_toggle(change):
+        _ylim_auto['val'] = bool(change['new'])
+        _ymin_box.disabled = bool(change['new'])
+        _ymax_box.disabled = bool(change['new'])
+        _plot_page(_cur_page['idx'])
+
+    def _on_ymin_change(change):
+        _ylim_man['lo'] = float(change['new'])
+        if not _ylim_auto['val']:
+            _plot_page(_cur_page['idx'])
+
+    def _on_ymax_change(change):
+        _ylim_man['hi'] = float(change['new'])
+        if not _ylim_auto['val']:
+            _plot_page(_cur_page['idx'])
+
+    _prev_btn  = Button(description='Prev',           button_style='')
+    _next_btn  = Button(description='Next',           button_style='primary')
+    _page_drop = Dropdown(
+        options=[(f'Page {i+1}', i) for i in range(len(_pages))],
+        description='Page:', layout={'width': '130px'}
+    )
+    _view_btn  = Button(description='View amplitude', button_style='info')
+
+    _cb_adc     = Checkbox(value=False, description='ADC sync (green)',    indent=False,
+                           layout={'width': '185px'})
+    _cb_abs_bip = Checkbox(value=False, description='|Bipolar| (gray)',    indent=False,
+                           layout={'width': '175px'})
+    _cb_uni     = Checkbox(value=False, description='Unipolar (orange)',   indent=False,
+                           layout={'width': '185px'})
+    _cb_abs_uni = Checkbox(value=False, description='|Unipolar| (purple)', indent=False,
+                           layout={'width': '195px'})
+
+    _auto_toggle = ToggleButton(
+        value=True, description='Auto y-scale',
+        button_style='success',
+        tooltip='Auto-scale shared y-axis from visible signals'
+    )
+    _ymin_box = FloatText(value=-5000.0, description='Y min:',
+                          disabled=True, layout={'width': '145px'})
+    _ymax_box = FloatText(value=5500.0,  description='Y max:',
+                          disabled=True, layout={'width': '145px'})
+
+    _prev_btn.on_click(_on_prev)
+    _next_btn.on_click(_on_next)
+    _page_drop.observe(_on_page_change, names='value')
+    _view_btn.on_click(_on_view)
+    _cb_adc.observe(_make_sig_cb('adc'), names='value')
+    _cb_abs_bip.observe(_make_sig_cb('abs_bip'), names='value')
+    _cb_uni.observe(_make_sig_cb('uni'), names='value')
+    _cb_abs_uni.observe(_make_sig_cb('abs_uni'), names='value')
+    _auto_toggle.observe(_on_auto_toggle, names='value')
+    _ymin_box.observe(_on_ymin_change, names='value')
+    _ymax_box.observe(_on_ymax_change, names='value')
+
+    _nav_row = HBox([_prev_btn, _next_btn, _page_drop,
+                     Label('  '), _amp_drop, _view_btn])
+    _sig_row = HBox([
+        VBox([
+            HTML('<b>Signal overlays:</b>'),
+            HBox([_cb_adc, _cb_abs_bip, _cb_uni, _cb_abs_uni]),
+        ]),
+        Label('   '),
+        VBox([_auto_toggle, _ymin_box, _ymax_box]),
+    ])
+
+    print(f"Loaded {len(_amp_data)} amplitude groups across {len(_pages)} page(s).")
+    print("Double-click a subplot to zoom in. Ctrl-click to select multiple signals.")
+
+    display(VBox([_nav_row, _sig_row, _out]))
+    _plot_page(0)
+
+    # ---- Recruitment Curve ----
+    _PRE_RC  = max(m_start_ms, h_start_ms) + 1.0
+    _POST_RC = h_end_ms + 2.0
+
+    m_wave_dict: dict = defaultdict(list)
+    h_wave_dict: dict = defaultdict(list)
+
+    for trial in trials:
+        amp_key = round(trial.stimulation_amplitude_ma, 2)
+        t_ms, emg, _, _ = get_trial_window(trial, _PRE_RC, _POST_RC)
+
+        m_mask = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+        if np.any(m_mask):
+            m_wave_dict[amp_key].append(np.max(np.abs(emg[m_mask])))
+
+        h_mask = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
+        if np.any(h_mask):
+            h_wave_dict[amp_key].append(np.max(np.abs(emg[h_mask])))
+
+    sorted_amps = sorted(set(m_wave_dict.keys()) | set(h_wave_dict.keys()))
+    m_wave_data = [m_wave_dict.get(a, [0]) for a in sorted_amps]
+    h_wave_data = [h_wave_dict.get(a, [0]) for a in sorted_amps]
+
+    m_means = np.array([np.mean(v) for v in m_wave_data])
+    h_means = np.array([np.mean(v) for v in h_wave_data])
+    m_sems  = np.array([stats.sem(v) if len(v) > 1 else 0 for v in m_wave_data])
+    h_sems  = np.array([stats.sem(v) if len(v) > 1 else 0 for v in h_wave_data])
+
+    M_max = np.max(m_means) if np.max(m_means) > 0 else 1
+    m_means_norm = (m_means / M_max) * 100
+    h_means_norm = (h_means / M_max) * 100
+    m_sems_norm  = (m_sems  / M_max) * 100
+    h_sems_norm  = (h_sems  / M_max) * 100
+
+    interp_func = interp1d(m_means_norm, sorted_amps, kind='linear',
+                           bounds_error=False, fill_value='extrapolate')
+    try:
+        current_at_50 = float(interp_func(50))
+    except Exception:
+        current_at_50 = sorted_amps[np.argmax(m_means_norm >= 50)]
+
+    normalized_currents = np.array(sorted_amps) / current_at_50
+
+    H_max = np.max(h_means_norm)
+    idx_Hmax = int(np.argmax(h_means_norm))
+    current_at_Hmax_norm = normalized_currents[idx_Hmax]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.errorbar(normalized_currents - 0.02, m_means_norm, yerr=m_sems_norm,
+                fmt='o-', color='blue',  label='M-wave (% Mmax)', capsize=3)
+    ax.errorbar(normalized_currents + 0.02, h_means_norm, yerr=h_sems_norm,
+                fmt='o-', color='green', label='H-wave (% Mmax)', capsize=3)
+
+    ax.axhline(H_max, color='green', linestyle='--', linewidth=1,
+               label=f'H_max = {H_max:.1f}% Mmax')
+    ax.axvline(current_at_Hmax_norm, color='gray', linestyle='--', linewidth=1,
+               label=f'Current at H_max = {current_at_Hmax_norm:.2f}x')
+
+    ax.text(current_at_Hmax_norm + 0.02, H_max + 2, 'b', fontsize=12, color='black')
+    ax.text(normalized_currents[idx_Hmax] - 0.08, H_max + 2, 'a', fontsize=12, color='black')
+
+    ax.set_xlabel('Current (normalized to current at 50% Mmax)')
+    ax.set_ylabel('H and M wave amplitude (% of Mmax)')
+    ax.set_title(f'HRS2 Normalized Recruitment Curve - {header.subject_id}')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    positions = np.arange(len(sorted_amps))
+
+    ax.errorbar(positions - 0.2, m_means, yerr=m_sems, fmt='o-', color='blue',
+                label='M-wave mean ± SEM', capsize=3)
+    ax.errorbar(positions + 0.2, h_means, yerr=h_sems, fmt='o-', color='green',
+                label='H-wave mean ± SEM', capsize=3)
+
+    ax.set_xticks(positions)
+    tick_labels = [f'{a:.1f}' if i % 10 == 0 else '' for i, a in enumerate(sorted_amps)]
+    ax.set_xticklabels(tick_labels)
+    ax.set_xlabel('Stimulation Amplitude (mA)')
+    ax.set_ylabel('Peak Amplitude (µV)')
+    ax.set_title(f'HRS2 Recruitment Curve - {header.subject_id}')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    print(f"M_max = {M_max:.2f} µV")
+    print(f"H_max = {np.max(h_means):.2f} µV ({H_max:.1f}% of M_max)")
+    print(f"Current at 50% M_max = {current_at_50:.2f} mA")
+    print(f"Current at H_max = {sorted_amps[idx_Hmax]:.2f} mA "
+          f"({current_at_Hmax_norm:.2f}x normalized)")
+
+
+def analyze_global_background(trials, emg_blocks, header,
+                              sample_rate: float = SAMPLE_RATE,
+                              blank_pre_ms: float = 5.0,
+                              blank_post_ms: float = 20.0,
+                              min_valid_frac: float = 0.7,
+                              bin_samples: int = BIN_SAMPLES,
+                              show_plots: bool = True):
+    """Post-hoc global windowing: stitch continuous |EMG|, blank around stims,
+    compute background statistics, extract per-trial pre-stim grand means.
+
+    Sections 4a-4d of Post_Hoc_Global_Windowing.ipynb in one call. Returns a
+    state dict consumed by ``run_threshold_sweep`` / ``plot_threshold_sweep``.
+    """
+    import matplotlib.pyplot as plt
+
+    if not emg_blocks:
+        print("No HRS2 EMG blocks available — skipping.")
+        return None
+
+    # ---- 4a: Sort and stitch blocks ----
+    print("=" * 70)
+    print("Section 4a: Reconstructing continuous signal from HRS2 EMG blocks")
+    print("=" * 70)
+
+    sorted_blks = sorted(emg_blocks, key=lambda b: int(b.ts_open_ephys_sent))
+    first_oe = int(sorted_blks[0].ts_open_ephys_sent)
+    last_blk = sorted_blks[-1]
+    last_oe = int(last_blk.ts_open_ephys_sent) + len(last_blk.abs_val)
+    n_total = last_oe - first_oe
+    duration_s = n_total / sample_rate
+
+    continuous_abs_emg = np.zeros(n_total, dtype=np.float32)
+    for blk in sorted_blks:
+        i0 = int(blk.ts_open_ephys_sent) - first_oe
+        i1 = i0 + len(blk.abs_val)
+        if 0 <= i0 and i1 <= n_total:
+            continuous_abs_emg[i0:i1] = blk.abs_val
+    continuous_abs_emg = np.abs(continuous_abs_emg)
+
+    timestamps = np.arange(n_total, dtype=np.float64) / sample_rate
+
+    gap_samples = sum(
+        max(0, int(sorted_blks[k].ts_open_ephys_sent)
+               - (int(sorted_blks[k-1].ts_open_ephys_sent) + len(sorted_blks[k-1].abs_val)))
+        for k in range(1, len(sorted_blks))
+    )
+    print(f"  Blocks stitched : {len(sorted_blks):,}")
+    print(f"  Total samples   : {n_total:,}")
+    print(f"  Duration        : {duration_s:.1f} s  ({duration_s / 60:.1f} min)")
+    print(f"  OE sample range : {first_oe} – {last_oe}")
+    print(f"  Gap samples     : {gap_samples:,}  ({100 * gap_samples / n_total:.3f}% of total)")
+
+    # ---- 4b: Blank mask around stim events ----
+    print("\n" + "=" * 70)
+    print("Section 4b: Building blank mask around stimulation events")
+    print("=" * 70)
+
+    stim_rel = []
+    n_no_onset = 0
+    for tr in trials:
+        fid = int(getattr(tr, 'first_post_trigger_frame_sample_id', 0))
+        osi = int(getattr(tr, 'onset_sample_index', -1))
+        if fid > 0 and osi >= 0:
+            rel = fid + (osi - bin_samples) - first_oe
+            if 0 <= rel < n_total:
+                stim_rel.append(rel)
+            else:
+                n_no_onset += 1
+        else:
+            n_no_onset += 1
+
+    stim_times_s = np.array(stim_rel, dtype=np.float64) / sample_rate
+    blank_mask = build_blank_mask(timestamps, stim_times_s, sample_rate,
+                                  blank_pre_ms, blank_post_ms)
+    print(f"  Stim events mapped  : {len(stim_rel)} of {len(trials)}")
+    print(f"  Unmapped (no onset) : {n_no_onset}")
+    print(f"  Non-blanked samples : {blank_mask.sum():,}  ({100 * blank_mask.mean():.1f}%)")
+
+    # ---- 4c: Background EMG statistics ----
+    print("\n" + "=" * 70)
+    print("Section 4c: Background EMG statistics (non-blanked samples)")
+    print("=" * 70)
+
+    bg_signal = continuous_abs_emg[blank_mask]
+    bg_mean = float(np.mean(bg_signal))
+    bg_std = float(np.std(bg_signal))
+    bg_q1, bg_med, bg_q3 = (float(x) for x in np.percentile(bg_signal, [25, 50, 75]))
+
+    print(f"  n       : {len(bg_signal):,}")
+    print(f"  Mean    : {bg_mean:.3f} µV")
+    print(f"  Std     : {bg_std:.3f} µV")
+    print(f"  Q1      : {bg_q1:.3f} µV")
+    print(f"  Median  : {bg_med:.3f} µV")
+    print(f"  Q3      : {bg_q3:.3f} µV")
+
+    if show_plots:
+        fig, ax = plt.subplots(figsize=(11, 4))
+        ax.hist(bg_signal, bins=300, color='steelblue', edgecolor='none', alpha=0.8)
+        for val, lbl, col in [(bg_q1, 'Q1', 'orange'),
+                              (bg_med, 'Median', 'purple'),
+                              (bg_q3, 'Q3', 'darkorange')]:
+            ax.axvline(val, color=col, linestyle='--', linewidth=1.5,
+                       label=f'{lbl} = {val:.2f} µV')
+        ax.set_xlabel('Abs EMG amplitude (µV)')
+        ax.set_ylabel('Sample count (log scale)')
+        ax.set_yscale('log')
+        ax.set_title(
+            f'Background EMG distribution — {header.subject_id}\n'
+            f'(blanked ±{blank_pre_ms}/{blank_post_ms} ms around {len(stim_rel)} stims)'
+        )
+        ax.legend()
+        plt.tight_layout()
+        plt.show()
+
+    # ---- 4d: Per-trial pre-stim grand means ----
+    print("\n" + "=" * 70)
+    print("Section 4d: Per-trial pre-stim background grand means")
+    print("=" * 70)
+
+    trial_bg_gm = []
+    trial_min_th = []
+    trial_max_th = []
+    for tr in trials:
+        osi = int(getattr(tr, 'onset_sample_index', -1))
+        pre = tr.trial_data[:osi] if osi > 0 else tr.trial_data[:bin_samples]
+        if len(pre) > 0:
+            trial_bg_gm.append(float(np.mean(np.abs(pre))))
+        trial_min_th.append(float(tr.min_initiation_threshold))
+        trial_max_th.append(float(tr.max_initiation_threshold))
+
+    trial_bg_gm = np.array(trial_bg_gm, dtype=np.float64)
+    trial_min_th = np.array(trial_min_th, dtype=np.float64)
+    trial_max_th = np.array(trial_max_th, dtype=np.float64)
+
+    gm_q1, gm_med, gm_q3 = (float(x) for x in np.percentile(trial_bg_gm, [25, 50, 75]))
+
+    print(f"  Trials : {len(trial_bg_gm)}")
+    print(f"  Min={trial_bg_gm.min():.2f}  Q1={gm_q1:.2f}  Median={gm_med:.2f}  "
+          f"Q3={gm_q3:.2f}  Max={trial_bg_gm.max():.2f}")
+    print(f"  Recorded thresholds (mean): "
+          f"[{trial_min_th.mean():.2f}, {trial_max_th.mean():.2f}] µV")
+
+    if show_plots:
+        fig, ax = plt.subplots(figsize=(11, 4))
+        ax.hist(trial_bg_gm, bins=80, color='mediumseagreen',
+                edgecolor='black', linewidth=0.4, alpha=0.85)
+        ax.axvline(gm_q1, color='orange', linestyle=':', linewidth=1.5,
+                   label=f'Q1 = {gm_q1:.2f} µV')
+        ax.axvline(gm_med, color='purple', linestyle='-.', linewidth=1.5,
+                   label=f'Median = {gm_med:.2f} µV')
+        ax.axvline(gm_q3, color='darkorange', linestyle=':', linewidth=1.5,
+                   label=f'Q3 = {gm_q3:.2f} µV')
+        ax.axvline(trial_min_th.mean(), color='red', linestyle='--', linewidth=1.5,
+                   label=f'Recorded min-thresh = {trial_min_th.mean():.2f} µV')
+        ax.axvline(trial_max_th.mean(), color='darkred', linestyle='--', linewidth=1.5,
+                   label=f'Recorded max-thresh = {trial_max_th.mean():.2f} µV')
+        ax.set_xlabel('Pre-stim grand mean (µV)')
+        ax.set_ylabel('Trial count')
+        ax.set_title(
+            f'Per-trial pre-stim background grand mean — {header.subject_id}  '
+            f'(n = {len(trial_bg_gm)})\n'
+            f'(window = |trial_data[:onset_sample_index]|)'
+        )
+        ax.legend(fontsize=8)
+        plt.tight_layout()
+        plt.show()
+
+    return {
+        'continuous_abs_emg': continuous_abs_emg,
+        'timestamps': timestamps,
+        'sample_rate': sample_rate,
+        'blank_mask': blank_mask,
+        'first_oe': first_oe,
+        'n_total': n_total,
+        'duration_s': duration_s,
+        'gap_samples': gap_samples,
+        'stim_rel': stim_rel,
+        'n_no_onset': n_no_onset,
+        'bg_mean': bg_mean, 'bg_std': bg_std,
+        'bg_q1': bg_q1, 'bg_med': bg_med, 'bg_q3': bg_q3,
+        'trial_bg_gm': trial_bg_gm,
+        'trial_min_th': trial_min_th,
+        'trial_max_th': trial_max_th,
+        'gm_q1': gm_q1, 'gm_med': gm_med, 'gm_q3': gm_q3,
+        'blank_pre_ms': blank_pre_ms,
+        'blank_post_ms': blank_post_ms,
+        'min_valid_frac': min_valid_frac,
+    }
+
+
+def run_threshold_sweep(state, sweep_centres=None,
+                        half_widths_uv=None,
+                        seed: int = 42,
+                        min_ms: int = TRIAL_INIT_MIN_MS,
+                        max_ms: int = TRIAL_INIT_MAX_MS,
+                        n_trials: int = 0):
+    """Section 5a: walk the continuous background with sweep_trials() across
+    a grid of (centre ± half-width) threshold windows.
+
+    ``state`` is the dict returned by ``analyze_global_background``.
+    Defaults sweep_centres to {Q1, Median, Q3} of the per-trial pre-stim
+    distribution and half_widths_uv to [5, 10, 20, 30, 50, 75, 100, 150].
+    Returns sweep_results dict keyed by centre label.
+    """
+    if state is None:
+        print("No state — run analyze_global_background first.")
+        return None
+
+    if sweep_centres is None:
+        sweep_centres = {'Q1': state['gm_q1'],
+                         'Median': state['gm_med'],
+                         'Q3': state['gm_q3']}
+    if half_widths_uv is None:
+        half_widths_uv = [5, 10, 20, 30, 50, 75, 100, 150]
+
+    print("=" * 70)
+    print("Section 5a: Running post-hoc threshold sweep")
+    print("=" * 70)
+    print(f"Signal duration : {state['duration_s']:.1f} s | "
+          f"Non-blanked: {100 * state['blank_mask'].mean():.1f}%")
+    print(f"Background stats: mean={state['bg_mean']:.2f}  "
+          f"Q1={state['gm_q1']:.2f}  Med={state['gm_med']:.2f}  "
+          f"Q3={state['gm_q3']:.2f} µV\n")
+
+    sweep_results: dict = {}
+    for centre_label, centre_val in sweep_centres.items():
+        sweep_results[centre_label] = []
+        for hw in half_widths_uv:
+            min_uv = max(0.0, centre_val - hw)
+            max_uv = centre_val + hw
+            accepted = sweep_trials(
+                state['continuous_abs_emg'], state['timestamps'],
+                state['blank_mask'], state['sample_rate'],
+                min_ms=min_ms, max_ms=max_ms,
+                min_uv=min_uv, max_uv=max_uv,
+                min_valid_fraction=state['min_valid_frac'],
+                seed=seed,
+            )
+            sweep_results[centre_label].append({
+                'hw': hw, 'min_uv': min_uv, 'max_uv': max_uv,
+                'n_accepted': len(accepted),
+            })
+
+        row_str = '  '.join(
+            f'±{r["hw"]}→{r["n_accepted"]}' for r in sweep_results[centre_label]
+        )
+        print(f"  {centre_label:6s} (centre={centre_val:.2f} µV):  {row_str}")
+
+    if n_trials:
+        print(f"\n  Actual HRS2 trials recorded during session: {n_trials}")
+    return sweep_results
+
+
+def plot_threshold_sweep(sweep_results, state, trials, header):
+    """Section 5b: visualise sweep results + summary table.
+
+    Three panels: accepted vs half-width, accepted/actual ratio, threshold
+    windows overlaid on the per-trial background histogram. Then prints a
+    formatted summary table.
+    """
+    import matplotlib.pyplot as plt
+    if not sweep_results:
+        print("No sweep results to plot.")
+        return
+
+    n_actual = len(trials)
+    colours = {'Q1': 'darkorange', 'Median': 'purple', 'Q3': 'steelblue'}
+    palette = ['darkorange', 'purple', 'steelblue', 'teal', 'crimson']
+
+    def _colour(label, i):
+        return colours.get(label, palette[i % len(palette)])
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+    ax = axes[0]
+    for i, (label, rows) in enumerate(sweep_results.items()):
+        hws = [r['hw'] for r in rows]
+        ns = [r['n_accepted'] for r in rows]
+        ax.plot(hws, ns, 'o-', label=label, color=_colour(label, i), linewidth=1.8)
+    ax.axhline(n_actual, color='gray', linestyle='--', linewidth=1.5,
+               label=f'Actual ({n_actual} trials)')
+    ax.set_xlabel('Threshold half-width (µV)')
+    ax.set_ylabel('Accepted virtual trials (post-hoc)')
+    ax.set_title('Post-Hoc Sweep: Accepted Trials vs Threshold Window Width')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    ax2 = axes[1]
+    for i, (label, rows) in enumerate(sweep_results.items()):
+        hws = [r['hw'] for r in rows]
+        ratio = [r['n_accepted'] / max(n_actual, 1) for r in rows]
+        ax2.plot(hws, ratio, 'o-', label=label, color=_colour(label, i), linewidth=1.8)
+    ax2.axhline(1.0, color='gray', linestyle='--', linewidth=1.5, label='1× actual')
+    ax2.set_xlabel('Threshold half-width (µV)')
+    ax2.set_ylabel('Accepted / Actual ratio')
+    ax2.set_title('Post-Hoc Sweep: Accepted / Actual Ratio')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.suptitle(f'{header.subject_id} — Post-Hoc Threshold Sweep', fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+    fig2, ax3 = plt.subplots(figsize=(13, 5))
+    ax3.hist(state['trial_bg_gm'], bins=80, color='lightgray', edgecolor='black',
+             linewidth=0.5, alpha=0.9, label='Per-trial pre-stim BG')
+    for i, (label, rows) in enumerate(sweep_results.items()):
+        col = _colour(label, i)
+        mid_row = rows[len(rows) // 2]
+        ax3.axvspan(mid_row['min_uv'], mid_row['max_uv'], alpha=0.25, color=col,
+                    label=f"{label} ±{mid_row['hw']} µV → {mid_row['n_accepted']} trials")
+    ax3.axvline(state['trial_min_th'].mean(), color='red', linestyle='--', linewidth=1.5,
+                label=f"Recorded min-thresh ({state['trial_min_th'].mean():.2f})")
+    ax3.axvline(state['trial_max_th'].mean(), color='darkred', linestyle='--', linewidth=1.5,
+                label=f"Recorded max-thresh ({state['trial_max_th'].mean():.2f})")
+    ax3.set_xlabel('Pre-stim grand mean (µV)')
+    ax3.set_ylabel('Trial count')
+    ax3.set_title(f'Threshold Windows vs Background Distribution — {header.subject_id}')
+    ax3.legend(fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+    print(f"\n{'Centre':>10} {'±hw (µV)':>10} {'Min (µV)':>10} {'Max (µV)':>10} "
+          f"{'Accepted':>10} {'vs Actual':>12}")
+    print("-" * 67)
+    for label, rows in sweep_results.items():
+        for r in rows:
+            ratio_s = f"{r['n_accepted'] / max(n_actual, 1):.2f}×"
+            print(f"{label:>10} {r['hw']:>10} {r['min_uv']:>10.2f} {r['max_uv']:>10.2f} "
+                  f"{r['n_accepted']:>10} {ratio_s:>12}")
+        print()
+
+
 def classify_trials(trials, file_version=0,
                     bin_samples=BIN_SAMPLES, record_samples=TRIAL_RECORD_SAMPLES,
                     onset_threshold=STIM_ONSET_THRESHOLD, end_threshold=STIM_END_THRESHOLD):
