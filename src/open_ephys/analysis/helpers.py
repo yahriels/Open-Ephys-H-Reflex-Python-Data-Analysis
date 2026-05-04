@@ -2831,3 +2831,147 @@ def run_trial_initiation_simulation(
         print("=" * 80)
 
     return all_trials, statistics
+
+
+# ====================================================================
+# RESPIRATION_OFFLINE NOTEBOOK HELPERS
+# ====================================================================
+# Generic loaders + an interactive segmented-viewer widget. Used by
+# Respiration_offline.ipynb. Complements the existing DATA LOADING
+# UTILITIES section above by accepting arbitrary channel indices and
+# arbitrary signal stacks.
+
+import matplotlib.pyplot as plt
+from ipywidgets import Button, Output, VBox
+from open_ephys.analysis import Session
+
+
+def load_session_recording(session_dir, recordnode_idx=0, recording_idx=0, verbose=True):
+    """Load a Session and pick a (record_node, recording).
+
+    Returns (session, recording, record_node_name, experiment_name, recording_name).
+    record_node_name / experiment_name / recording_name are derived from the
+    actual recording.directory path so they reflect what was loaded.
+    """
+    session   = Session(session_dir)
+    recording = session.recordnodes[recordnode_idx].recordings[recording_idx]
+    parts     = recording.directory.split(os.sep)
+    record_node_name, experiment_name, recording_name = parts[-3], parts[-2], parts[-1]
+    if verbose:
+        print(f"Session: {session_dir}")
+        print(f"Loaded:  {recording.directory}")
+        print(f"  record node: {record_node_name}")
+        print(f"  experiment:  {experiment_name}")
+        print(f"  recording:   {recording_name}")
+    return session, recording, record_node_name, experiment_name, recording_name
+
+
+def load_continuous(recording, stream_idx=0, verbose=True):
+    """Pull continuous-stream samples + metadata from an Open Ephys recording.
+
+    Returns (timestamps, data, sample_rate, channel_names).
+    """
+    stream     = recording.continuous[stream_idx]
+    metadata   = stream.metadata
+    timestamps = stream.timestamps
+    data = stream.get_samples(start_sample_index=0, end_sample_index=timestamps.shape[0])
+    if verbose:
+        print(f"Sample rate: {metadata.sample_rate} Hz")
+        print(f"Channels ({metadata.num_channels}): {metadata.channel_names}")
+        print(f"Data shape: {data.shape}")
+    return timestamps, data, metadata.sample_rate, metadata.channel_names
+
+
+def bandpass_filter_emg(data, ch1_idx, ch2_idx, sample_rate,
+                        lowcut=100.0, highcut=1000.0, order=2):
+    """Bandpass-filter two EMG channels (and their differential) with `lfilter`.
+
+    Returns (emg1_filtered, emg2_filtered, differential_filtered).
+    """
+    emg1_raw     = data[:, ch1_idx]
+    emg2_raw     = data[:, ch2_idx]
+    differential = emg2_raw - emg1_raw
+    nyq = sample_rate / 2
+    b, a = butter(order, [lowcut / nyq, highcut / nyq], btype='bandpass')
+    return (lfilter(b, a, emg1_raw),
+            lfilter(b, a, emg2_raw),
+            lfilter(b, a, differential))
+
+
+def plot_full_trace(timestamps, signal, title, ylabel="Amplitude (μV)",
+                    label=None, color="purple", figsize=(15, 4), ylim=None):
+    """Single full-trace line plot with a zero baseline."""
+    plt.figure(figsize=figsize)
+    plt.plot(timestamps, signal, label=(label or title), color=color)
+    plt.axhline(0, color="black", linestyle="--", linewidth=0.5)
+    plt.title(title)
+    plt.xlabel("Time (s)")
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.legend()
+    if ylim is not None:
+        plt.ylim(*ylim)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_emg_full_traces(timestamps, differential_filt, emg1, emg2, directory):
+    """Three stacked full-trace plots: filtered differential, EMG1, EMG2."""
+    plot_full_trace(timestamps, differential_filt,
+                    title=f"{directory} Filtered Differential EMG Signal (EMG1 - EMG2)",
+                    label="Filtered EMG1 - EMG2")
+    plot_full_trace(timestamps, emg1, title="EMG1 Raw", label="EMG1")
+    plot_full_trace(timestamps, emg2, title="EMG2 Raw", label="EMG2")
+
+
+def make_segment_viewer(timestamps, signals, labels,
+                        segment_duration_s=10, title_prefix="",
+                        figsize=(15, 4), color="purple"):
+    """Build a Prev/Next ipywidgets viewer that shows one fixed-duration window
+    at a time, with one stacked plot per (signal, label) pair.
+
+    Returns a VBox; caller wraps in `display(...)`.
+    """
+    if len(signals) != len(labels):
+        raise ValueError("signals and labels must be the same length")
+    total_time   = timestamps[-1] - timestamps[0]
+    num_segments = int(np.ceil(total_time / segment_duration_s))
+    state = {"idx": 0}
+    out   = Output()
+
+    def _draw(idx):
+        start_t = timestamps[0] + idx * segment_duration_s
+        end_t   = min(start_t + segment_duration_s, timestamps[-1])
+        mask    = (timestamps >= start_t) & (timestamps < end_t)
+        local_t = timestamps[mask] - start_t
+        prefix  = f"{title_prefix}, " if title_prefix else ""
+        for sig, lbl in zip(signals, labels):
+            plt.figure(figsize=figsize)
+            plt.plot(local_t, sig[mask], label=lbl, color=color)
+            plt.axhline(0, color="black", linestyle="--", linewidth=0.5)
+            plt.title(f"{prefix}{lbl}, Segment {idx + 1}/{num_segments}, "
+                      f"Time: {start_t:.1f}-{end_t:.1f}s")
+            plt.xlabel("Time (s)")
+            plt.ylabel("Amplitude (μV)")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+
+    def _step(delta):
+        new_idx = max(0, min(num_segments - 1, state["idx"] + delta))
+        if new_idx == state["idx"]:
+            return
+        state["idx"] = new_idx
+        with out:
+            out.clear_output(wait=True)
+            _draw(state["idx"])
+
+    next_btn = Button(description="Next")
+    prev_btn = Button(description="Previous")
+    next_btn.on_click(lambda _b: _step(+1))
+    prev_btn.on_click(lambda _b: _step(-1))
+
+    with out:
+        _draw(state["idx"])
+    return VBox([prev_btn, next_btn, out])
