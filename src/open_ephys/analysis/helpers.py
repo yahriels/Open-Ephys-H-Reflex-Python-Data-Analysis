@@ -1119,13 +1119,279 @@ def plot_amplitude_distribution(trials, header):
     plt.show()
 
 
-def plot_background_emg_views(trials, emg_blocks, monitoring_window_ms: float = 2500.0,
+def compute_snr_analysis(trials, header,
+                         m_start_ms: float = 2.0, m_end_ms: float = 4.0,
+                         h_start_ms: float = 6.0, h_end_ms: float = 10.0,
+                         bg_pre_ms: float = 15.0,
+                         sample_rate: float = SAMPLE_RATE):
+    """Compute and plot signal-to-noise ratio for M-wave, H-wave, and H:M ratio.
+
+    For each trial:
+      rms_m   = RMS of trial_data within [m_start_ms, m_end_ms]
+      rms_h   = RMS of trial_data within [h_start_ms, h_end_ms]
+      hm      = rms_h / rms_m
+      rms_bg  = RMS of trial_data within [-bg_pre_ms, 0)  (pre-stim background)
+
+    SNR values (dimensionless):
+      snr_m  = rms_m  / rms_bg
+      snr_h  = rms_h  / rms_bg
+      snr_hm = hm     / rms_bg
+
+    Prints a per-group summary table and produces a 3-panel histogram figure.
+    Trials are grouped by stimulation amplitude; overall (all-trial) stats are
+    always printed and plotted.
+    """
+    import matplotlib.pyplot as plt
+
+    if not trials:
+        print("No trials.")
+        return
+
+    ms_ps = 1000.0 / sample_rate
+    bin_s = int(BIN_DURATION_MS * sample_rate / 1000)
+    rec_s = int(TRIAL_RECORD_MS  * sample_rate / 1000)
+    pre_window = max(bg_pre_ms + 2.0, 5.0)   # load enough pre-stim data
+
+    snr_m_all, snr_h_all, snr_hm_all = [], [], []
+    amp_labels = []
+
+    for trial in trials:
+        t_ms, emg, _, _, _ = get_trial_window(
+            trial, pre_window, max(h_end_ms + 2.0, 20.0),
+            ms_per_sample=ms_ps, bin_samples=bin_s, record_samples=rec_s)
+
+        m_mask  = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+        h_mask  = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
+        bg_mask = (t_ms >= -bg_pre_ms) & (t_ms < 0)
+
+        def _rms(sig, mask):
+            seg = sig[mask]
+            return float(np.sqrt(np.mean(seg ** 2))) if mask.any() and len(seg) > 0 else np.nan
+
+        rms_m  = _rms(emg, m_mask)
+        rms_h  = _rms(emg, h_mask)
+        rms_bg = _rms(emg, bg_mask)
+
+        if rms_bg > 0 and np.isfinite(rms_bg):
+            snr_m_all.append(rms_m  / rms_bg if np.isfinite(rms_m)  else np.nan)
+            snr_h_all.append(rms_h  / rms_bg if np.isfinite(rms_h)  else np.nan)
+            hm = (rms_h / rms_m) if (np.isfinite(rms_m) and rms_m > 0
+                                      and np.isfinite(rms_h)) else np.nan
+            snr_hm_all.append(hm / rms_bg if np.isfinite(hm) else np.nan)
+        else:
+            snr_m_all.append(np.nan)
+            snr_h_all.append(np.nan)
+            snr_hm_all.append(np.nan)
+        amp_labels.append(round(trial.stimulation_amplitude_ma, 2))
+
+    snr_m_all  = np.array(snr_m_all,  dtype=float)
+    snr_h_all  = np.array(snr_h_all,  dtype=float)
+    snr_hm_all = np.array(snr_hm_all, dtype=float)
+
+    def _stats(arr):
+        v = arr[np.isfinite(arr)]
+        if len(v) == 0:
+            return dict(n=0, mean=np.nan, median=np.nan, std=np.nan, cv=np.nan)
+        mu = float(np.mean(v))
+        sd = float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
+        return dict(n=len(v), mean=mu, median=float(np.median(v)),
+                    std=sd, cv=sd / mu if mu != 0 else np.nan)
+
+    sid = getattr(header, 'subject_id', '')
+    print(f"SNR Analysis — {sid}")
+    print(f"  M window : {m_start_ms}–{m_end_ms} ms")
+    print(f"  H window : {h_start_ms}–{h_end_ms} ms")
+    print(f"  BG window: -{bg_pre_ms:.0f}–0 ms (pre-stim)")
+    print()
+    hdr = f"{'Metric':<18} {'n':>5} {'Mean':>9} {'Median':>9} {'SD':>9} {'CV':>7}"
+    print(hdr)
+    print("-" * len(hdr))
+    for label, arr in [("SNR_M  (M/BG)",    snr_m_all),
+                       ("SNR_H  (H/BG)",    snr_h_all),
+                       ("SNR_HM (H:M/BG)",  snr_hm_all)]:
+        s = _stats(arr)
+        print(f"  {label:<16} {s['n']:>5}  {s['mean']:>8.3f}  {s['median']:>8.3f}"
+              f"  {s['std']:>8.3f}  {s['cv']:>6.3f}")
+
+    # ── figure: 3-panel histogram ─────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    configs = [
+        (snr_m_all,  "SNR_M\n(RMS_M / RMS_BG)",   "steelblue"),
+        (snr_h_all,  "SNR_H\n(RMS_H / RMS_BG)",   "darkorange"),
+        (snr_hm_all, "SNR_H:M\n(H:M ratio / RMS_BG)", "mediumseagreen"),
+    ]
+    for ax, (arr, ylabel, color) in zip(axes, configs):
+        v = arr[np.isfinite(arr)]
+        if len(v) == 0:
+            ax.text(0.5, 0.5, 'No valid data', ha='center', va='center',
+                    transform=ax.transAxes)
+        else:
+            ax.hist(v, bins=40, color=color, edgecolor='black', alpha=0.75)
+            mu, sd = float(np.mean(v)), float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
+            ax.axvline(mu, color='red', linestyle='--', linewidth=2,
+                       label=f'Mean {mu:.3f}')
+            ax.axvline(float(np.median(v)), color='black', linestyle=':', linewidth=1.5,
+                       label=f'Median {float(np.median(v)):.3f}')
+            ax.legend(fontsize=8)
+        ax.set_xlabel(ylabel, fontsize=10)
+        ax.set_ylabel('Trial count')
+        ax.grid(True, alpha=0.3, axis='y')
+
+    fig.suptitle(
+        f'Signal-to-Noise Ratio — {sid}\n'
+        f'M: {m_start_ms}–{m_end_ms} ms  |  H: {h_start_ms}–{h_end_ms} ms  |  '
+        f'BG: -{bg_pre_ms:.0f}–0 ms',
+        fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+    return dict(snr_m=snr_m_all, snr_h=snr_h_all, snr_hm=snr_hm_all,
+                amp_labels=amp_labels)
+
+
+def compute_mra_snr_analysis(trials, header,
+                              m_start_ms: float = 2.0, m_end_ms: float = 4.0,
+                              h_start_ms: float = 6.0, h_end_ms: float = 10.0,
+                              bg_pre_ms: float = 15.0,
                               sample_rate: float = SAMPLE_RATE):
+    """Compute and plot SNR using Mean Rectified Average (MRA) instead of RMS.
+
+    For each trial:
+      mra_m   = mean(|trial_data|) within [m_start_ms, m_end_ms]
+      mra_h   = mean(|trial_data|) within [h_start_ms, h_end_ms]
+      hm      = mra_h / mra_m
+      mra_bg  = mean(|trial_data|) within [-bg_pre_ms, 0)  (pre-stim background)
+
+    SNR values (dimensionless):
+      snr_m  = mra_m  / mra_bg
+      snr_h  = mra_h  / mra_bg
+      snr_hm = hm     / mra_bg
+
+    Prints a summary table and produces a 3-panel histogram figure.
+    """
+    import matplotlib.pyplot as plt
+
+    if not trials:
+        print("No trials.")
+        return
+
+    ms_ps = 1000.0 / sample_rate
+    bin_s = int(BIN_DURATION_MS * sample_rate / 1000)
+    rec_s = int(TRIAL_RECORD_MS  * sample_rate / 1000)
+    pre_window = max(bg_pre_ms + 2.0, 5.0)
+
+    snr_m_all, snr_h_all, snr_hm_all = [], [], []
+    amp_labels = []
+
+    for trial in trials:
+        t_ms, emg, _, _, _ = get_trial_window(
+            trial, pre_window, max(h_end_ms + 2.0, 20.0),
+            ms_per_sample=ms_ps, bin_samples=bin_s, record_samples=rec_s)
+
+        m_mask  = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+        h_mask  = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
+        bg_mask = (t_ms >= -bg_pre_ms) & (t_ms < 0)
+
+        def _mra(sig, mask):
+            seg = sig[mask]
+            return float(np.mean(np.abs(seg))) if mask.any() and len(seg) > 0 else np.nan
+
+        mra_m  = _mra(emg, m_mask)
+        mra_h  = _mra(emg, h_mask)
+        mra_bg = _mra(emg, bg_mask)
+
+        if mra_bg > 0 and np.isfinite(mra_bg):
+            snr_m_all.append(mra_m  / mra_bg if np.isfinite(mra_m)  else np.nan)
+            snr_h_all.append(mra_h  / mra_bg if np.isfinite(mra_h)  else np.nan)
+            hm = (mra_h / mra_m) if (np.isfinite(mra_m) and mra_m > 0
+                                      and np.isfinite(mra_h)) else np.nan
+            snr_hm_all.append(hm / mra_bg if np.isfinite(hm) else np.nan)
+        else:
+            snr_m_all.append(np.nan)
+            snr_h_all.append(np.nan)
+            snr_hm_all.append(np.nan)
+        amp_labels.append(round(trial.stimulation_amplitude_ma, 2))
+
+    snr_m_all  = np.array(snr_m_all,  dtype=float)
+    snr_h_all  = np.array(snr_h_all,  dtype=float)
+    snr_hm_all = np.array(snr_hm_all, dtype=float)
+
+    def _stats(arr):
+        v = arr[np.isfinite(arr)]
+        if len(v) == 0:
+            return dict(n=0, mean=np.nan, median=np.nan, std=np.nan, cv=np.nan)
+        mu = float(np.mean(v))
+        sd = float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
+        return dict(n=len(v), mean=mu, median=float(np.median(v)),
+                    std=sd, cv=sd / mu if mu != 0 else np.nan)
+
+    sid = getattr(header, 'subject_id', '')
+    print(f"MRA-SNR Analysis — {sid}")
+    print(f"  M window : {m_start_ms}–{m_end_ms} ms")
+    print(f"  H window : {h_start_ms}–{h_end_ms} ms")
+    print(f"  BG window: -{bg_pre_ms:.0f}–0 ms (pre-stim)")
+    print()
+    hdr = f"{'Metric':<20} {'n':>5} {'Mean':>9} {'Median':>9} {'SD':>9} {'CV':>7}"
+    print(hdr)
+    print("-" * len(hdr))
+    for label, arr in [("MRA-SNR_M  (M/BG)",   snr_m_all),
+                       ("MRA-SNR_H  (H/BG)",   snr_h_all),
+                       ("MRA-SNR_HM (H:M/BG)", snr_hm_all)]:
+        s = _stats(arr)
+        print(f"  {label:<18} {s['n']:>5}  {s['mean']:>8.3f}  {s['median']:>8.3f}"
+              f"  {s['std']:>8.3f}  {s['cv']:>6.3f}")
+
+    # ── figure: 3-panel histogram ─────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    configs = [
+        (snr_m_all,  "MRA-SNR_M\n(MRA_M / MRA_BG)",    "royalblue"),
+        (snr_h_all,  "MRA-SNR_H\n(MRA_H / MRA_BG)",    "tomato"),
+        (snr_hm_all, "MRA-SNR_H:M\n(H:M ratio / MRA_BG)", "mediumorchid"),
+    ]
+    for ax, (arr, ylabel, color) in zip(axes, configs):
+        v = arr[np.isfinite(arr)]
+        if len(v) == 0:
+            ax.text(0.5, 0.5, 'No valid data', ha='center', va='center',
+                    transform=ax.transAxes)
+        else:
+            ax.hist(v, bins=40, color=color, edgecolor='black', alpha=0.75)
+            mu = float(np.mean(v))
+            med = float(np.median(v))
+            ax.axvline(mu,  color='red',   linestyle='--', linewidth=2,
+                       label=f'Mean {mu:.3f}')
+            ax.axvline(med, color='black', linestyle=':',  linewidth=1.5,
+                       label=f'Median {med:.3f}')
+            ax.legend(fontsize=8)
+        ax.set_xlabel(ylabel, fontsize=10)
+        ax.set_ylabel('Trial count')
+        ax.grid(True, alpha=0.3, axis='y')
+
+    fig.suptitle(
+        f'MRA Signal-to-Noise Ratio — {sid}\n'
+        f'M: {m_start_ms}–{m_end_ms} ms  |  H: {h_start_ms}–{h_end_ms} ms  |  '
+        f'BG: -{bg_pre_ms:.0f}–0 ms',
+        fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+    return dict(snr_m=snr_m_all, snr_h=snr_h_all, snr_hm=snr_hm_all,
+                amp_labels=amp_labels)
+
+
+def plot_background_emg_views(trials, emg_blocks,
+                              monitoring_window_ms: float = 2500.0,
+                              sample_rate: float = SAMPLE_RATE,
+                              bin_duration_ms: float = BIN_DURATION_MS):
     """Interactive 'Most recent background' bar chart + 'Background EMG Level' scatter.
 
     Mirrors the H-Reflex App recruitment-curve trial plot widgets:
       _update_most_recent_background_plot  (bar chart of pre-stim |EMG| bins)
       _update_emg_level_plot               (scatter of grand means per trial)
+
+    For file_version >= 5 trials the stored background_bins / background_emg_mean
+    are used directly (actual values the app evaluated).  For older trials the bins
+    are reconstructed from emg_blocks as before.  Pass bin_duration_ms from
+    hrs1_header.bin_duration_ms so the window label is accurate.
     """
     import matplotlib.pyplot as plt
     from ipywidgets import IntSlider, Output, VBox, HBox
@@ -1136,18 +1402,53 @@ def plot_background_emg_views(trials, emg_blocks, monitoring_window_ms: float = 
         return
 
     bins_per_trial = []
-    grand_means = []
-    for trial in trials:
-        bins, gm = compute_background_bins(
-            trial, emg_blocks, monitoring_window_ms=monitoring_window_ms,
-            sample_rate=sample_rate)
-        bins_per_trial.append(bins)
-        grand_means.append(gm)
+    grand_means    = []
+    window_ms_list = []   # actual monitoring window per trial
+    sources        = []   # "stored" or "reconstructed"
 
+    for trial in trials:
+        stored_bins = getattr(trial, 'background_bins', None)
+        stored_gm   = getattr(trial, 'background_emg_mean', None)
+        if stored_bins is not None and len(stored_bins) > 0:
+            bins_per_trial.append(stored_bins)
+            grand_means.append(float(stored_gm) if stored_gm is not None else float(np.mean(stored_bins)))
+            window_ms_list.append(len(stored_bins) * bin_duration_ms)
+            sources.append("stored")
+        else:
+            bins, gm = compute_background_bins(
+                trial, emg_blocks, monitoring_window_ms=monitoring_window_ms,
+                sample_rate=sample_rate)
+            bins_per_trial.append(bins)
+            grand_means.append(gm)
+            window_ms_list.append(monitoring_window_ms if bins is not None else float('nan'))
+            sources.append("reconstructed")
+
+    n_stored = sources.count("stored")
+    n_recon  = sources.count("reconstructed")
     valid_idx = [i for i, gm in enumerate(grand_means) if not np.isnan(gm)]
     if not valid_idx:
-        print("Could not reconstruct any background windows from emg_blocks.")
+        print("Could not obtain background bins for any trial.")
         return
+
+    print(f"{n_stored} trials used stored bins  |  {n_recon} trials reconstructed from emg_blocks.")
+
+    # Pre-compute box-plot stats for every valid trial (done once, not per draw).
+    # Whiskers = min/max bin value; box = Q1–Q3; median line = median bin value.
+    bxp_stats = {}
+    for i in valid_idx:
+        b = bins_per_trial[i]
+        if b is not None and len(b) > 0:
+            bxp_stats[i] = {
+                'med':    float(np.median(b)),
+                'q1':     float(np.percentile(b, 25)),
+                'q3':     float(np.percentile(b, 75)),
+                'whislo': float(np.min(b)),
+                'whishi': float(np.max(b)),
+                'fliers': [],
+            }
+
+    # Scale box width so boxes don't overlap for large trial counts.
+    box_w = min(0.8, max(0.15, 200.0 / max(1, len(valid_idx))))
 
     out = Output()
     slider = IntSlider(value=valid_idx[-1], min=0, max=len(trials) - 1, step=1,
@@ -1159,29 +1460,52 @@ def plot_background_emg_views(trials, emg_blocks, monitoring_window_ms: float = 
             out.clear_output(wait=True)
             fig, (ax_bg, ax_lvl) = plt.subplots(1, 2, figsize=(15, 5))
 
-            bins = bins_per_trial[idx]
+            bins   = bins_per_trial[idx]
+            win_ms = window_ms_list[idx]
+            src    = sources[idx]
             if bins is None:
-                ax_bg.text(0.5, 0.5, f'Trial {idx}: no background reconstructed',
+                ax_bg.text(0.5, 0.5, f'Trial {idx}: no background data available',
                            ha='center', va='center', transform=ax_bg.transAxes)
             else:
                 gm = grand_means[idx]
-                x = np.arange(len(bins))
+                x  = np.arange(len(bins))
                 ax_bg.bar(x, bins, width=0.8, color=(70/255, 130/255, 180/255))
                 ax_bg.axhline(gm, color='red', linestyle='--', linewidth=2,
-                              label=f'Mean={gm:.2f}')
+                              label=f'Mean = {gm:.2f} µV')
                 ax_bg.legend(loc='upper right')
-            ax_bg.set_xlabel('Bin #')
+                win_lbl = f'{win_ms:.0f} ms' if not np.isnan(win_ms) else '? ms'
+                ax_bg.set_title(f'Most Recent Background  (Trial {idx},'
+                                f' window={win_lbl}, {src})')
+            ax_bg.set_xlabel(f'Bin #  ({bin_duration_ms:.0f} ms each)')
             ax_bg.set_ylabel('EMG (µV)')
-            ax_bg.set_title(f'Most Recent Background  (Trial {idx})')
             ax_bg.grid(True, alpha=0.3, axis='y')
 
-            ax_lvl.scatter(valid_idx, [grand_means[i] for i in valid_idx],
-                           s=40, color=(0, 0, 200/255),
-                           edgecolor='black', linewidth=0.4)
-            if not np.isnan(grand_means[idx]):
-                ax_lvl.scatter([idx], [grand_means[idx]], s=160, marker='*',
-                               color='gold', edgecolor='black', linewidth=0.6,
-                               zorder=5, label=f'Selected (Trial {idx})')
+            # --- Background EMG Level: box-and-whisker per trial ---
+            # Draw all non-selected trials in blue.
+            bg_stats = [bxp_stats[i] for i in valid_idx if i != idx and i in bxp_stats]
+            bg_pos   = [i               for i in valid_idx if i != idx and i in bxp_stats]
+            if bg_stats:
+                ax_lvl.bxp(bg_stats, positions=bg_pos, widths=box_w,
+                           showfliers=False, patch_artist=True,
+                           boxprops=dict(facecolor=(70/255, 130/255, 180/255, 0.5),
+                                         edgecolor=(0, 0, 200/255), linewidth=0.6),
+                           whiskerprops=dict(color=(0, 0, 200/255), linewidth=0.8),
+                           capprops=dict(color=(0, 0, 200/255), linewidth=0.8),
+                           medianprops=dict(color='red', linewidth=1.0))
+
+            # Draw selected trial highlighted in gold.
+            if idx in bxp_stats and not np.isnan(grand_means[idx]):
+                ax_lvl.bxp([bxp_stats[idx]], positions=[idx], widths=box_w * 1.4,
+                           showfliers=False, patch_artist=True,
+                           boxprops=dict(facecolor=(255/255, 215/255, 0, 0.6),
+                                         edgecolor='goldenrod', linewidth=2.0),
+                           whiskerprops=dict(color='goldenrod', linewidth=2.0),
+                           capprops=dict(color='goldenrod', linewidth=2.0),
+                           medianprops=dict(color='darkred', linewidth=2.0))
+                # Proxy artist for legend entry
+                ax_lvl.plot([], [], color='goldenrod', linewidth=2,
+                            label=f'Selected (Trial {idx})')
+
             tr = trials[idx]
             ax_lvl.axhline(tr.min_initiation_threshold, color=(0, 160/255, 0),
                            linestyle='--', linewidth=1.5,
@@ -1190,8 +1514,8 @@ def plot_background_emg_views(trials, emg_blocks, monitoring_window_ms: float = 
                            linestyle='--', linewidth=1.5,
                            label=f'Max thresh: {tr.max_initiation_threshold:.1f}')
             ax_lvl.set_xlabel('Trial #')
-            ax_lvl.set_ylabel('EMG Mean (µV)')
-            ax_lvl.set_title('Background EMG Level')
+            ax_lvl.set_ylabel('EMG (µV)')
+            ax_lvl.set_title('Background EMG Level  (box=Q1–Q3, whiskers=min/max)')
             ax_lvl.legend(loc='upper right', fontsize=9)
             ax_lvl.grid(True, alpha=0.3)
 
@@ -1200,10 +1524,111 @@ def plot_background_emg_views(trials, emg_blocks, monitoring_window_ms: float = 
 
     slider.observe(lambda c: _draw(c['new']) if c['name'] == 'value' else None,
                    names='value')
-    print(f"Reconstructed background bins for {len(valid_idx)}/{len(trials)} trials "
-          f"(window={monitoring_window_ms} ms).")
     display(VBox([HBox([slider]), out]))
     _draw(slider.value)
+
+
+def plot_actual_trial_timeline(trials, header=None):
+    """Plot the actual HRS2 trial timeline and ITI distribution, and print trial rate.
+
+    Panel 1: Trial number vs time (hours from session start).
+    Panel 2: Inter-trial interval (ITI) distribution histogram.
+
+    Timestamps come from trigger_wall_time_ms (file_version >= 2) when non-zero,
+    otherwise from the start_time datetime field on each trial.
+    """
+    import matplotlib.pyplot as plt
+
+    if not trials:
+        print("No HRS2 trials to plot.")
+        return
+
+    # --- extract times as seconds from the first trial ---
+    def _trial_sec(t):
+        twms = getattr(t, 'trigger_wall_time_ms', 0)
+        if twms and twms > 0:
+            return twms / 1000.0
+        if t.start_time is not None:
+            return t.start_time.timestamp()
+        return None
+
+    raw_secs = [_trial_sec(t) for t in trials]
+    if all(s is None for s in raw_secs):
+        print("No usable timestamps found on trials.")
+        return
+
+    # normalise to zero at the first trial
+    valid_secs = [s for s in raw_secs if s is not None]
+    t0 = min(valid_secs)
+    rel_secs  = [s - t0 if s is not None else float('nan') for s in raw_secs]
+    rel_hours = [s / 3600.0 for s in rel_secs]
+
+    trial_nums = list(range(1, len(trials) + 1))
+
+    # ITI in seconds between consecutive valid trials
+    valid_pairs = [(rel_secs[i], rel_secs[i - 1])
+                   for i in range(1, len(rel_secs))
+                   if not (np.isnan(rel_secs[i]) or np.isnan(rel_secs[i - 1]))]
+    iti_s  = [a - b for a, b in valid_pairs]
+    iti_ms = [x * 1000.0 for x in iti_s]
+
+    # --- recording duration and trial rate ---
+    duration_s = max(valid_secs) - min(valid_secs)
+    duration_h = duration_s / 3600.0
+    n_trials   = len([s for s in rel_secs if not np.isnan(s)])
+    rate_per_h = n_trials / duration_h if duration_h > 0 else float('nan')
+
+    print(f"Actual trial timeline ({n_trials} trials)")
+    print(f"  Recording span : {duration_s:.1f} s  ({duration_h:.3f} h)")
+    print(f"  Trial rate     : {rate_per_h:.1f} trials / hour")
+    if iti_ms:
+        print(f"  ITI — mean: {np.mean(iti_ms):.0f} ms  |  "
+              f"median: {np.median(iti_ms):.0f} ms  |  "
+              f"min: {np.min(iti_ms):.0f} ms  |  "
+              f"max: {np.max(iti_ms):.0f} ms")
+
+    # --- figure ---
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Panel 1: timeline
+    ax1.plot(rel_hours, trial_nums, 'o-', markersize=4, linewidth=1, color='steelblue')
+    ax1.set_xlabel('Time from first trial (h)')
+    ax1.set_ylabel('Trial number')
+    title1 = 'Trial Timeline — Actual Initiation Times'
+    if header is not None:
+        sid = getattr(header, 'subject_id', '')
+        if sid:
+            title1 += f'\n{sid}'
+    ax1.set_title(title1)
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2: ITI distribution (log-scale x-axis)
+    if iti_ms:
+        _iti_arr = np.array(iti_ms)
+        _iti_pos = _iti_arr[_iti_arr > 0]
+        if len(_iti_pos) > 0:
+            _bins = np.logspace(np.log10(_iti_pos.min()),
+                                np.log10(_iti_pos.max()), 41)
+            ax2.hist(_iti_pos, bins=_bins, color='steelblue', edgecolor='black', alpha=0.75)
+        ax2.axvline(np.mean(iti_ms), color='red', linestyle='--', linewidth=2,
+                    label=f'Mean {np.mean(iti_ms):.0f} ms')
+        ax2.axvline(np.median(iti_ms), color='orange', linestyle='--', linewidth=2,
+                    label=f'Median {np.median(iti_ms):.0f} ms')
+        ax2.set_xscale('log')
+        ax2.legend(fontsize=9)
+    else:
+        ax2.text(0.5, 0.5, 'Insufficient trials for ITI', ha='center',
+                 va='center', transform=ax2.transAxes)
+    ax2.set_xlabel('Inter-Trial Interval (ms, log scale)')
+    ax2.set_ylabel('Count')
+    ax2.set_title('Inter-Trial Interval Distribution')
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    fig.suptitle(f'Actual HRS2 Trials  |  Rate: {rate_per_h:.1f} trials/h  '
+                 f'|  Duration: {duration_h:.3f} h  ({n_trials} trials)',
+                 fontsize=11)
+    plt.tight_layout()
+    plt.show()
 
 
 def _apply_tiered_ticks(ax, axis: str = 'both'):
@@ -4734,6 +5159,623 @@ def classify_trials(trials, file_version=0,
     return results
 
 
+def find_adc_pulses_in_stream(emg_blocks,
+                              threshold: float = STIM_ONSET_THRESHOLD,
+                              min_gap_samples: int = 500):
+    """Scan all continuous EMG blocks in order and return the OE sample index of
+    each ADC rising edge (low→high crossing above threshold).
+
+    Parameters
+    ----------
+    emg_blocks       : list[EmgDataBlock]
+    threshold        : crossing threshold in volts; uses STIM_ONSET_THRESHOLD by default
+    min_gap_samples  : minimum spacing between consecutive pulses — suppresses
+                       double-counts from long stim pulses or ringing
+
+    Returns
+    -------
+    list[int]  OE sample indices of detected rising edges, in chronological order.
+               Index N in this list corresponds to the (N+1)th stimulation event.
+    """
+    rising_edges = []
+    prev_was_high = False
+    last_edge_oe  = None
+
+    for blk in emg_blocks:
+        adc_idx = None
+        for ci, cn in enumerate(blk.channel_names):
+            if 'ADC' in cn.upper() and ci < len(blk.raw_channels):
+                adc_idx = ci
+                break
+        if adc_idx is None:
+            if len(blk.raw_channels) >= 3:
+                adc_idx = 2
+            else:
+                prev_was_high = False
+                continue
+
+        blk_start = int(blk.ts_open_ephys_sent)
+        adc_abs   = np.abs(np.asarray(blk.raw_channels[adc_idx], dtype=float))
+        is_high   = adc_abs >= threshold
+
+        if len(is_high) == 0:
+            continue
+
+        # Vectorised rising-edge detection (incorporates cross-block state)
+        prev_arr    = np.empty(len(is_high), dtype=bool)
+        prev_arr[0] = prev_was_high
+        prev_arr[1:] = is_high[:-1]
+
+        for i in np.where((~prev_arr) & is_high)[0]:
+            oe = blk_start + int(i)
+            if last_edge_oe is None or (oe - last_edge_oe) >= min_gap_samples:
+                rising_edges.append(oe)
+                last_edge_oe = oe
+
+        prev_was_high = bool(is_high[-1])
+
+    return rising_edges
+
+
+def detect_and_correct_failed_trials(hrs2_trials, hrs2_header, hrs2_emg_blocks,
+                                     pre_ms: float = 2.0,
+                                     post_ms: float = 15.0,
+                                     m_start_ms: float = 2.5,
+                                     m_end_ms: float = 4.5,
+                                     h_start_ms: float = 6.0,
+                                     h_end_ms: float = 9.0,
+                                     sample_rate: float = None,
+                                     ctx_pre_s: float = 10.0,
+                                     ctx_post_s: float = 10.0):
+    """Classify HRS2 trials for ADC-sync failures, realign each failed trial to the
+    true stim onset, and display an interactive per-trial context viewer plus a
+    corrected-waveform grid.
+
+    Primary onset strategy: count all ADC rising edges in the continuous stream —
+    edge #N corresponds to trial #N (0-indexed). This handles cases where the true
+    ADC pulse lies *before* the app's sensed onset (which only searches forward).
+    Falls back to a forward/backward context-window search when the pulse count
+    is out of range or disagrees strongly.
+
+    Parameters
+    ----------
+    hrs2_trials     : list[MhRecTrial]
+    hrs2_header     : MhRecHeader
+    hrs2_emg_blocks : list[EmgDataBlock]  continuous recording blocks
+    pre_ms          : ms before true onset to display in corrected window
+    post_ms         : ms after  true onset to display in corrected window
+    m_start_ms/end  : M-wave window (ms re: true onset)
+    h_start_ms/end  : H-wave window (ms re: true onset)
+    sample_rate     : override Hz; None → header.sample_rate or SAMPLE_RATE
+    ctx_pre_s       : seconds of context to pull before sensed onset (default 10 s)
+    ctx_post_s      : seconds of context to pull after  sensed onset (default 10 s)
+
+    Returns
+    -------
+    trial_report : list[dict]
+    failed       : list[dict]
+    passed       : list[dict]
+    realigned    : list[dict]   Keys: trial_num, amp_ma, t_orig, emg_orig,
+                                      t_corr, emg_corr, delay_ms,
+                                      delay_ms_count, delay_ms_ctx, ctx_data
+    """
+    import math
+    from IPython.display import display as _display
+    from ipywidgets import Button, Output, HBox, VBox, Label
+
+    trial_report = classify_trials(hrs2_trials, file_version=hrs2_header.file_version)
+    failed = [r for r in trial_report if r['failed']]
+    passed = [r for r in trial_report if not r['failed']]
+
+    v2 = hrs2_header.file_version >= 2
+    print(f"File version : {hrs2_header.file_version}  "
+          f"({'pre-computed fields used' if v2 else 'fields derived from sync_data'})")
+    print(f"Total trials : {len(trial_report)}")
+    print(f"Passed       : {len(passed)}")
+    print(f"Failed       : {len(failed)}")
+
+    if failed:
+        print()
+        hdr = (f"{'Trial':>6}  {'Amp':>6}  {'ADC peak':>9}  {'Noise std':>10}  "
+               f"{'Stim dur ms':>11}  {'Discarded':>9}  Reason")
+        print(hdr)
+        print("-" * len(hdr))
+        for r in failed:
+            reason = ("no sync data" if not r['has_sync']
+                      else f"ADC peak {r['adc_peak']:.3f} V < {STIM_ONSET_THRESHOLD} V threshold")
+            dur_str  = f"{r['stim_duration_ms']:.2f}" if r['stim_duration_ms'] else "—"
+            disc_str = str(r['n_pre_trigger_frames_discarded']) if v2 else "n/a"
+            print(f"{r['idx']+1:>6}  {r['amp_ma']:>6.2f}  {r['adc_peak']:>9.3f}  "
+                  f"{r['adc_noise_std']:>10.4f}  {dur_str:>11}  {disc_str:>9}  {reason}")
+    else:
+        print("\nNo failed trials — all trials passed ADC-sync check.")
+        return trial_report, failed, passed, []
+
+    _sr     = float(sample_rate or getattr(hrs2_header, 'sample_rate', None) or SAMPLE_RATE)
+    _ms_per = 1000.0 / _sr
+    _bin_s  = int(round(BIN_DURATION_MS / _ms_per))
+
+    # ---- Scan full stream for all ADC rising edges ----
+    print("\nScanning ADC stream for all stim pulses ...")
+    all_pulse_oe = find_adc_pulses_in_stream(hrs2_emg_blocks,
+                                             threshold=STIM_ONSET_THRESHOLD,
+                                             min_gap_samples=int(0.1 * _sr))
+    n_trials = len(hrs2_trials)
+    print(f"  ADC pulses found in stream : {len(all_pulse_oe)}")
+    print(f"  Trials in file             : {n_trials}")
+    if len(all_pulse_oe) != n_trials:
+        print(f"  NOTE: counts differ — pulse-count matching may be imprecise for some trials.")
+
+    # ---- Per-trial realignment ----
+    realigned = []
+    for r in failed:
+        tr     = hrs2_trials[r['idx']]
+        trial_n = r['idx']  # 0-based
+
+        t_orig, emg_orig, _, _, _ = get_trial_window(
+            tr, pre_ms, post_ms, ms_per_sample=_ms_per, bin_samples=_bin_s
+        )
+
+        # -- Primary: pulse-count approach (bidirectional, pre/post onset) --
+        delay_ms_count = None
+        if trial_n < len(all_pulse_oe):
+            first_id = getattr(tr, 'first_post_trigger_frame_sample_id', 0)
+            osi      = getattr(tr, 'onset_sample_index', -1)
+            if first_id > 0 and osi >= 0:
+                onset_oe = int(first_id) + (osi - _bin_s)
+                pulse_oe = all_pulse_oe[trial_n]
+                delay_ms_count = (pulse_oe - onset_oe) / _sr * 1000.0
+
+        # -- Fallback: context window search (nearest rising edge to sensed onset) --
+        delay_ms_ctx = None
+        ctx = get_trial_context_window(tr, hrs2_emg_blocks,
+                                       pre_s=ctx_pre_s, post_s=ctx_post_s,
+                                       sample_rate=_sr, bin_samples=_bin_s)
+        if ctx is not None:
+            _t_s, _, _onset_i, _adc_c = ctx
+            if _adc_c is not None:
+                _adc_abs = np.abs(_adc_c)
+                _is_hi   = _adc_abs >= STIM_ONSET_THRESHOLD
+                _prev_hi = np.concatenate([[False], _is_hi[:-1]])
+                _edges   = np.where((~_prev_hi) & _is_hi)[0]
+                if len(_edges) > 0:
+                    _nearest = _edges[np.argmin(np.abs(_edges.astype(int) - _onset_i))]
+                    delay_ms_ctx = float(_t_s[_nearest]) * 1000.0
+
+        # Use pulse-count delay when available; fall back to context search
+        delay_ms = delay_ms_count if delay_ms_count is not None else delay_ms_ctx
+
+        # -- Slice corrected window from trial_data --
+        emg_corr = t_corr = None
+        if delay_ms is not None:
+            _delay_samp = int(round(delay_ms * _sr / 1000.0))
+            _td = np.array(tr.trial_data)
+
+            if getattr(tr, 'onset_detected', 0) == 1 and getattr(tr, 'onset_sample_index', -1) >= 0:
+                _align_i = int(tr.onset_sample_index)
+            elif len(tr.sync_data) > 1:
+                _align_i = detect_stim_onset(tr.sync_data, _bin_s)
+            else:
+                _align_i = _bin_s
+
+            _true_onset = _align_i + _delay_samp
+            _pre_samp   = int(round(pre_ms  * _sr / 1000.0))
+            _post_samp  = int(round(post_ms * _sr / 1000.0))
+            _s = _true_onset - _pre_samp
+            _e = _true_onset + _post_samp
+            if 0 <= _s and _e <= len(_td):
+                emg_corr = _td[_s:_e]
+                t_corr   = (np.arange(len(emg_corr)) - _pre_samp) * _ms_per
+
+        realigned.append(dict(
+            trial_num      = trial_n + 1,
+            amp_ma         = r['amp_ma'],
+            t_orig         = t_orig,
+            emg_orig       = emg_orig,
+            t_corr         = t_corr,
+            emg_corr       = emg_corr,
+            delay_ms       = delay_ms,
+            delay_ms_count = delay_ms_count,
+            delay_ms_ctx   = delay_ms_ctx,
+            ctx_data       = ctx,
+        ))
+
+    n_found = sum(1 for d in realigned if d['delay_ms'] is not None)
+    print(f"\nRealignment summary:")
+    print(f"  Resolved (pulse-count)  : {sum(1 for d in realigned if d['delay_ms_count'] is not None)}")
+    print(f"  Resolved (ctx fallback) : {sum(1 for d in realigned if d['delay_ms_count'] is None and d['delay_ms_ctx'] is not None)}")
+    print(f"  Unresolved              : {len(realigned) - n_found}")
+
+    # ---- Interactive context viewer ----
+    _state = {'idx': 0}
+    _out   = Output()
+    _lbl   = Label(value='')
+
+    def _update_lbl():
+        d = realigned[_state['idx']]
+        _lbl.value = (f"Failed trial {_state['idx']+1} / {len(realigned)}"
+                      f"  (trial #{d['trial_num']}, {d['amp_ma']:.2f} mA)")
+
+    def _draw_viewer(idx):
+        d   = realigned[idx]
+        r   = failed[idx]
+        ctx = d['ctx_data']
+        with _out:
+            _out.clear_output(wait=True)
+
+            print(f"Trial #{d['trial_num']}  |  {d['amp_ma']:.2f} mA  |  "
+                  f"onset_detected={getattr(hrs2_trials[r['idx']], 'onset_detected', '?')}")
+            if d['delay_ms_count'] is not None:
+                print(f"  Pulse-count  (ADC pulse #{r['idx']+1} in stream) : "
+                      f"{d['delay_ms_count']:+.2f} ms")
+            else:
+                print(f"  Pulse-count  : unavailable (stream count / trial index mismatch)")
+            if d['delay_ms_ctx'] is not None:
+                print(f"  Ctx search   : {d['delay_ms_ctx']:+.2f} ms")
+            else:
+                print(f"  Ctx search   : not found")
+            if d['delay_ms'] is not None:
+                print(f"  → Applied correction : {d['delay_ms']:+.2f} ms")
+            else:
+                print(f"  → No correction applied")
+
+            if ctx is None:
+                print("  (Context window unavailable — no plot)")
+                return
+
+            t_s, emg_ctx, onset_i, adc_ctx = ctx
+            adc_abs = np.abs(adc_ctx) if adc_ctx is not None else None
+
+            cnt_t_s = d['delay_ms_count'] / 1000.0 if d['delay_ms_count'] is not None else None
+            ctx_t_s = d['delay_ms_ctx']   / 1000.0 if d['delay_ms_ctx']   is not None else None
+
+            fig, (ax_emg, ax_adc) = plt.subplots(
+                2, 1, figsize=(16, 6), sharex=True,
+                gridspec_kw={'height_ratios': [2, 1]},
+            )
+            ax_emg.plot(t_s, emg_ctx, color='black', linewidth=0.5, label='Filtered EMG')
+            ax_emg.axvline(0, color='red', linestyle='--', linewidth=1.2,
+                           label='Sensed onset (t = 0)')
+            if cnt_t_s is not None:
+                ax_emg.axvline(cnt_t_s, color='purple', linestyle='-', linewidth=1.5,
+                               label=f'Pulse-count onset ({d["delay_ms_count"]:+.1f} ms)')
+            if ctx_t_s is not None:
+                ax_emg.axvline(ctx_t_s, color='orange', linestyle=':', linewidth=1.2,
+                               label=f'Ctx-search onset ({d["delay_ms_ctx"]:+.1f} ms)')
+            ax_emg.axvspan(-ctx_pre_s, 0,           color='blue',  alpha=0.04)
+            ax_emg.axvspan(0,          ctx_post_s,  color='green', alpha=0.04)
+            ax_emg.set_ylabel('EMG (µV)')
+            ax_emg.set_title(
+                f"Trial #{d['trial_num']}  |  {d['amp_ma']:.2f} mA  |  "
+                f"±{ctx_pre_s:.0f} s context  —  {hrs2_header.subject_id}"
+            )
+            ax_emg.legend(fontsize=8, loc='upper right')
+            ax_emg.grid(True, alpha=0.3)
+
+            if adc_abs is not None:
+                ax_adc.plot(t_s, adc_abs, color='green', linewidth=0.6, label='|ADC| (V)')
+                ax_adc.axhline(STIM_ONSET_THRESHOLD, color='red', linestyle='--',
+                               linewidth=1.0, label=f'Threshold ({STIM_ONSET_THRESHOLD} V)')
+                ax_adc.axvline(0, color='red', linestyle='--', linewidth=1.2)
+                if cnt_t_s is not None:
+                    ax_adc.axvline(cnt_t_s, color='purple', linestyle='-', linewidth=1.5,
+                                   label=f'Pulse #{r["idx"]+1} ({d["delay_ms_count"]:+.1f} ms)')
+                    ax_adc.annotate(
+                        f'{d["delay_ms_count"]:+.1f} ms',
+                        xy=(cnt_t_s, STIM_ONSET_THRESHOLD),
+                        xytext=(cnt_t_s + 0.3, STIM_ONSET_THRESHOLD * 1.3),
+                        fontsize=8, color='purple',
+                        arrowprops=dict(arrowstyle='->', color='purple', lw=1.0),
+                    )
+                if ctx_t_s is not None:
+                    ax_adc.axvline(ctx_t_s, color='orange', linestyle=':', linewidth=1.2,
+                                   label=f'Ctx-search ({d["delay_ms_ctx"]:+.1f} ms)')
+                ax_adc.set_ylabel('|ADC| (V)')
+                ax_adc.legend(fontsize=8, loc='upper right')
+                ax_adc.grid(True, alpha=0.3)
+            else:
+                ax_adc.text(0.5, 0.5, 'ADC channel not available',
+                            transform=ax_adc.transAxes, ha='center', va='center', color='gray')
+
+            ax_adc.set_xlabel('Time re: sensed onset (s)')
+            plt.tight_layout()
+            plt.show()
+
+    def _on_prev(b):
+        if _state['idx'] > 0:
+            _state['idx'] -= 1
+            _update_lbl()
+            _draw_viewer(_state['idx'])
+
+    def _on_next(b):
+        if _state['idx'] < len(realigned) - 1:
+            _state['idx'] += 1
+            _update_lbl()
+            _draw_viewer(_state['idx'])
+
+    _prev_btn = Button(description='◀ Prev', button_style='')
+    _next_btn = Button(description='Next ▶', button_style='primary')
+    _prev_btn.on_click(_on_prev)
+    _next_btn.on_click(_on_next)
+    _update_lbl()
+    _display(VBox([HBox([_prev_btn, _next_btn, _lbl]), _out]))
+    _draw_viewer(0)
+
+    # ---- Corrected waveform grid ----
+    n_cols = 3
+    n_rows = math.ceil(len(realigned) / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(6 * n_cols, 4 * n_rows),
+                             squeeze=False)
+    for idx, d in enumerate(realigned):
+        ax = axes[idx // n_cols][idx % n_cols]
+        ax.plot(d['t_orig'], d['emg_orig'],
+                color='gray', alpha=0.7, linewidth=0.9, label='Original (misaligned)')
+        if d['emg_corr'] is not None:
+            ax.plot(d['t_corr'], d['emg_corr'],
+                    color='black', linewidth=1.1,
+                    label=f'Corrected ({d["delay_ms"]:+.1f} ms)')
+        ax.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.15, zorder=0)
+        ax.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.15, zorder=0)
+        ax.axvline(0, color='red', linestyle='--', linewidth=1.0, label='True onset')
+        delay_str = (f'{d["delay_ms"]:+.1f} ms' if d['delay_ms'] is not None else 'no pulse')
+        ax.set_title(f'Trial {d["trial_num"]} | {d["amp_ma"]:.2f} mA | {delay_str}', fontsize=8)
+        ax.set_xlabel('Time re: true onset (ms)', fontsize=7)
+        ax.set_ylabel('EMG (µV)', fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=6, loc='upper right')
+
+    for j in range(len(realigned), n_rows * n_cols):
+        axes[j // n_cols][j % n_cols].axis('off')
+
+    fig.suptitle(
+        f'Failed Trials — Realigned to True Stim Onset\n'
+        f'{hrs2_header.subject_id}  |  {len(realigned)} failed trial(s)',
+        fontsize=12
+    )
+    plt.tight_layout()
+    plt.show()
+
+    # ---- ADC Stream Pulse Map ----
+    # Compute onset_oe for every trial (not just failed ones) so we can build
+    # a full delay map: stream_pulse[i] vs trial[i] sensed onset.
+    trial_onset_oes = []
+    for _tr in hrs2_trials:
+        _fid = getattr(_tr, 'first_post_trigger_frame_sample_id', 0)
+        _osi = getattr(_tr, 'onset_sample_index', -1)
+        if _fid > 0 and _osi >= 0:
+            trial_onset_oes.append(int(_fid) + (_osi - _bin_s))
+        else:
+            trial_onset_oes.append(None)
+
+    # Delay for every trial using the pulse-count match (trial #i → stream pulse #i)
+    all_trial_delays_ms = []
+    for _i, _oe in enumerate(trial_onset_oes):
+        if _oe is not None and _i < len(all_pulse_oe):
+            all_trial_delays_ms.append((all_pulse_oe[_i] - _oe) / _sr * 1000.0)
+        else:
+            all_trial_delays_ms.append(None)
+
+    failed_set = {r['idx'] for r in failed}
+    n_extra_pulses = max(0, len(all_pulse_oe) - len(hrs2_trials))
+    n_missing      = max(0, len(hrs2_trials) - len(all_pulse_oe))
+
+    # Condensed summary: only print anomalous rows (|delay| > 5 ms)
+    _ANOMALY_MS = 5.0
+    _anomalous  = [(i, d) for i, d in enumerate(all_trial_delays_ms)
+                   if d is not None and abs(d) > _ANOMALY_MS]
+    print(f"\n{'='*72}")
+    print(f"ADC STREAM PULSE MAP")
+    print(f"  Stream pulses detected : {len(all_pulse_oe)}")
+    print(f"  Trials in file         : {len(hrs2_trials)}")
+    if n_extra_pulses:
+        print(f"  Extra pulses (no trial): {n_extra_pulses}")
+    if n_missing:
+        print(f"  Trials without a matched pulse: {n_missing}")
+    if _anomalous:
+        print(f"  Anomalous trials (|delay| > {_ANOMALY_MS} ms): {len(_anomalous)}")
+        print(f"\n  {'Trial#':>7}  {'Amp mA':>7}  {'Delay ms':>10}  {'Pulse OE':>12}  Status")
+        print(f"  {'-'*55}")
+        for _i, _d in _anomalous:
+            _amp = hrs2_trials[_i].stimulation_amplitude_ma
+            _st  = 'FAILED' if _i in failed_set else 'passed-anomalous'
+            print(f"  {_i+1:>7}  {_amp:>7.2f}  {_d:>+10.2f}  {all_pulse_oe[_i]:>12}  {_st}")
+    else:
+        print(f"  All delays within ±{_ANOMALY_MS} ms — pulse-count matching is consistent.")
+    print(f"{'='*72}")
+
+    # Scatter plot: delay_ms vs trial# for all trials
+    _xall      = [i + 1 for i, d in enumerate(all_trial_delays_ms) if d is not None]
+    _yall      = [d     for i, d in enumerate(all_trial_delays_ms) if d is not None]
+    _fail_mask = [(i in failed_set) for i, d in enumerate(all_trial_delays_ms) if d is not None]
+
+    _x_pass = [x for x, f in zip(_xall, _fail_mask) if not f]
+    _y_pass = [y for y, f in zip(_yall, _fail_mask) if not f]
+    _x_fail = [x for x, f in zip(_xall, _fail_mask) if     f]
+    _y_fail = [y for y, f in zip(_yall, _fail_mask) if     f]
+
+    fig_sm, ax_sm = plt.subplots(figsize=(14, 4))
+    if _x_pass:
+        ax_sm.scatter(_x_pass, _y_pass, color='steelblue', s=10, alpha=0.4,
+                      label='Passed trials')
+    if _x_fail:
+        ax_sm.scatter(_x_fail, _y_fail, color='red', s=40, zorder=5,
+                      label='Failed trials')
+    ax_sm.axhline(0, color='gray', linestyle='--', linewidth=0.8, label='Zero delay')
+    ax_sm.set_xlabel('Trial number')
+    ax_sm.set_ylabel('Stream pulse delay re: sensed onset (ms)')
+    ax_sm.set_title(
+        f'ADC Stream Pulse Map — {hrs2_header.subject_id}\n'
+        f'{len(all_pulse_oe)} stream pulses  ·  {len(hrs2_trials)} trials  '
+        f'(blue = passed, red = failed)'
+    )
+    ax_sm.legend(fontsize=8)
+    ax_sm.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # ---- Interactive stream-pulse viewer ----
+    # Step through every ADC rising edge detected in the continuous stream.
+    # Shows the ±ctx_pre_s/ctx_post_s context centred on the MATCHED TRIAL's
+    # sensed onset, with the stream pulse marked in purple.
+    # Other pulses visible in the same window are marked orange.
+    _ps    = {'idx': 0}
+    _pout  = Output()
+    _plbl  = Label(value='')
+
+    def _upd_plbl():
+        _pi = _ps['idx']
+        if _pi < len(hrs2_trials):
+            _d   = all_trial_delays_ms[_pi]
+            _st  = 'FAILED' if _pi in failed_set else 'passed'
+            _amp = hrs2_trials[_pi].stimulation_amplitude_ma
+            _ds  = f'{_d:+.1f} ms' if _d is not None else 'n/a'
+            _plbl.value = (f"Pulse {_pi+1}/{len(all_pulse_oe)}  →  "
+                           f"Trial #{_pi+1}  ({_amp:.2f} mA)  "
+                           f"delay={_ds}  [{_st}]")
+        else:
+            _plbl.value = (f"Pulse {_pi+1}/{len(all_pulse_oe)}  "
+                           f"→ extra pulse (no matched trial)")
+
+    def _draw_pview(_pi):
+        with _pout:
+            _pout.clear_output(wait=True)
+            _pulse_oe = all_pulse_oe[_pi]
+
+            # Which trial to use for the context window?
+            if _pi < len(hrs2_trials):
+                _tr_n = _pi
+            else:
+                # No direct match — use the trial whose onset_oe is nearest
+                _cands = [(j, oe) for j, oe in enumerate(trial_onset_oes)
+                          if oe is not None]
+                _tr_n  = (min(_cands, key=lambda x: abs(x[1] - _pulse_oe))[0]
+                          if _cands else 0)
+
+            _tr_obj    = hrs2_trials[_tr_n]
+            _onset_oe  = trial_onset_oes[_tr_n]
+            _d_ms      = all_trial_delays_ms[_tr_n] if _tr_n == _pi else None
+            _st        = 'FAILED' if _tr_n in failed_set else 'passed'
+
+            print(f"Stream pulse #{_pi+1}  →  Trial #{_tr_n+1}  |  "
+                  f"{_tr_obj.stimulation_amplitude_ma:.2f} mA  |  [{_st}]")
+            print(f"  Pulse OE sample       : {_pulse_oe}")
+            print(f"  Trial sensed onset OE : {_onset_oe}")
+            if _d_ms is not None:
+                print(f"  Delay (pulse − onset) : {_d_ms:+.2f} ms")
+
+            _ctx_p = get_trial_context_window(
+                _tr_obj, hrs2_emg_blocks,
+                pre_s=ctx_pre_s, post_s=ctx_post_s,
+                sample_rate=_sr, bin_samples=_bin_s,
+            )
+            if _ctx_p is None:
+                print("  (Context window unavailable — no plot)")
+                return
+
+            _t_p, _emg_p, _oi_p, _adc_p = _ctx_p
+            _adc_abs_p = np.abs(_adc_p) if _adc_p is not None else None
+
+            # Time of this stream pulse relative to the trial's sensed onset
+            _pt_s = ((_pulse_oe - _onset_oe) / _sr) if _onset_oe is not None else None
+
+            # Other stream pulses visible inside this context window
+            _ctx_s_oe = (_onset_oe - int(ctx_pre_s  * _sr)) if _onset_oe else None
+            _ctx_e_oe = (_onset_oe + int(ctx_post_s * _sr)) if _onset_oe else None
+            _others = []
+            if _ctx_s_oe is not None:
+                for _pj, _p_oe in enumerate(all_pulse_oe):
+                    if _pj == _pi:
+                        continue
+                    if _ctx_s_oe <= _p_oe <= _ctx_e_oe:
+                        _others.append((((_p_oe - _onset_oe) / _sr), _pj))
+
+            fig_p, (ax_ep, ax_ap) = plt.subplots(
+                2, 1, figsize=(16, 6), sharex=True,
+                gridspec_kw={'height_ratios': [2, 1]},
+            )
+            ax_ep.plot(_t_p, _emg_p, color='black', linewidth=0.5, label='Filtered EMG')
+            ax_ep.axvline(0, color='red', linestyle='--', linewidth=1.2,
+                          label=f'Trial #{_tr_n+1} sensed onset (t=0)')
+            if _pt_s is not None:
+                _lbl_p = (f'Stream pulse #{_pi+1} ({_d_ms:+.1f} ms)'
+                          if _d_ms is not None else f'Stream pulse #{_pi+1}')
+                ax_ep.axvline(_pt_s, color='purple', linestyle='-', linewidth=2.0,
+                              label=_lbl_p)
+            for (_ot_s, _pj) in _others:
+                ax_ep.axvline(_ot_s, color='orange', linestyle=':', linewidth=1.0, alpha=0.8)
+                ax_ep.text(_ot_s, 0.95, f'#{_pj+1}',
+                           transform=ax_ep.get_xaxis_transform(),
+                           color='orange', fontsize=7, ha='center', va='top')
+            ax_ep.axvspan(-ctx_pre_s, 0,           color='blue',  alpha=0.04)
+            ax_ep.axvspan(0,           ctx_post_s, color='green', alpha=0.04)
+            ax_ep.set_ylabel('EMG (µV)')
+            _ttl_d = f'  |  {_d_ms:+.1f} ms' if _d_ms is not None else ''
+            ax_ep.set_title(
+                f"Stream Pulse #{_pi+1}  →  Trial #{_tr_n+1}  |  "
+                f"{_tr_obj.stimulation_amplitude_ma:.2f} mA{_ttl_d}  |  "
+                f"[{_st}]  —  {hrs2_header.subject_id}"
+            )
+            ax_ep.legend(fontsize=8, loc='upper right')
+            ax_ep.grid(True, alpha=0.3)
+
+            if _adc_abs_p is not None:
+                ax_ap.plot(_t_p, _adc_abs_p, color='green', linewidth=0.6,
+                           label='|ADC| (V)')
+                ax_ap.axhline(STIM_ONSET_THRESHOLD, color='red', linestyle='--',
+                              linewidth=1.0, label=f'Threshold ({STIM_ONSET_THRESHOLD} V)')
+                ax_ap.axvline(0, color='red', linestyle='--', linewidth=1.2)
+                if _pt_s is not None:
+                    ax_ap.axvline(_pt_s, color='purple', linestyle='-', linewidth=2.0,
+                                  label=f'Pulse #{_pi+1}')
+                    _ann_txt = (f'{_d_ms:+.1f} ms' if _d_ms is not None
+                                else f'pulse #{_pi+1}')
+                    ax_ap.annotate(
+                        _ann_txt,
+                        xy=(_pt_s, STIM_ONSET_THRESHOLD),
+                        xytext=(_pt_s + 0.5, STIM_ONSET_THRESHOLD * 1.3),
+                        fontsize=8, color='purple',
+                        arrowprops=dict(arrowstyle='->', color='purple', lw=1.0),
+                    )
+                for (_ot_s, _pj) in _others:
+                    ax_ap.axvline(_ot_s, color='orange', linestyle=':', linewidth=1.0,
+                                  alpha=0.8)
+                ax_ap.set_ylabel('|ADC| (V)')
+                ax_ap.legend(fontsize=8, loc='upper right')
+                ax_ap.grid(True, alpha=0.3)
+            else:
+                ax_ap.text(0.5, 0.5, 'ADC channel not available',
+                           transform=ax_ap.transAxes, ha='center', va='center',
+                           color='gray')
+
+            ax_ap.set_xlabel('Time re: trial sensed onset (s)')
+            plt.tight_layout()
+            plt.show()
+
+    def _on_pp(b):
+        if _ps['idx'] > 0:
+            _ps['idx'] -= 1
+            _upd_plbl()
+            _draw_pview(_ps['idx'])
+
+    def _on_pn(b):
+        if _ps['idx'] < len(all_pulse_oe) - 1:
+            _ps['idx'] += 1
+            _upd_plbl()
+            _draw_pview(_ps['idx'])
+
+    _pp_btn = Button(description='◀ Prev pulse', button_style='')
+    _pn_btn = Button(description='Next pulse ▶', button_style='primary')
+    _pp_btn.on_click(_on_pp)
+    _pn_btn.on_click(_on_pn)
+    _upd_plbl()
+    _display(VBox([HBox([_pp_btn, _pn_btn, _plbl]), _pout]))
+    _draw_pview(0)
+
+    return trial_report, failed, passed, realigned
+
+
 # ====================================================================
 # DATA LOADING UTILITIES
 # ====================================================================
@@ -5487,6 +6529,7 @@ def simulate_trial_initiation_hrs(
 
     # ---- 5. 6-panel figure ----
     trial_times = [t.start_time for t in simulated_trials]
+    trial_times_hr = [t / 3600.0 for t in trial_times]
     trial_numbers = [t.trial_number for t in simulated_trials]
     gms = [t.grand_mean_uv for t in simulated_trials]
     mons = [t.monitoring_duration_ms for t in simulated_trials]
@@ -5496,8 +6539,8 @@ def simulate_trial_initiation_hrs(
 
     # Panel 1: Trial timeline
     ax1 = plt.subplot(3, 2, 1)
-    ax1.plot(trial_times, trial_numbers, 'o-', markersize=4, linewidth=1)
-    ax1.set_xlabel('Time (s)')
+    ax1.plot(trial_times_hr, trial_numbers, 'o-', markersize=4, linewidth=1)
+    ax1.set_xlabel('Time (h)')
     ax1.set_ylabel('Trial Number')
     ax1.set_title('Trial Timeline — When Trials Were Initiated')
     ax1.grid(True, alpha=0.3)
@@ -5533,11 +6576,11 @@ def simulate_trial_initiation_hrs(
 
     # Panel 4: Grand mean vs time
     ax4 = plt.subplot(3, 2, 4)
-    ax4.scatter(trial_times, gms, alpha=0.6, s=30,
-                c=range(len(trial_times)), cmap='viridis')
+    ax4.scatter(trial_times_hr, gms, alpha=0.6, s=30,
+                c=range(len(trial_times_hr)), cmap='viridis')
     ax4.axhline(min_init_uv, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
     ax4.axhline(max_init_uv, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-    ax4.set_xlabel('Time (s)')
+    ax4.set_xlabel('Time (h)')
     ax4.set_ylabel('Grand Mean EMG (µV)')
     ax4.set_title('Grand Mean EMG Over Time')
     ax4.grid(True, alpha=0.3)
@@ -5680,13 +6723,14 @@ def plot_full_trace(timestamps, signal, title, ylabel="Amplitude (μV)",
     plt.show()
 
 
-def plot_emg_full_traces(timestamps, differential_filt, emg1, emg2, directory):
+def plot_emg_full_traces(timestamps, differential_filt, emg1, emg2, directory,
+                         color="purple"):
     """Three stacked full-trace plots: filtered differential, EMG1, EMG2."""
     plot_full_trace(timestamps, differential_filt,
                     title=f"{directory} Filtered Differential EMG Signal (EMG1 - EMG2)",
-                    label="Filtered EMG1 - EMG2")
-    plot_full_trace(timestamps, emg1, title="EMG1 Raw", label="EMG1")
-    plot_full_trace(timestamps, emg2, title="EMG2 Raw", label="EMG2")
+                    label="Filtered EMG1 - EMG2", color=color)
+    plot_full_trace(timestamps, emg1, title="EMG1 Raw", label="EMG1", color=color)
+    plot_full_trace(timestamps, emg2, title="EMG2 Raw", label="EMG2", color=color)
 
 
 def make_segment_viewer(timestamps, signals, labels,
