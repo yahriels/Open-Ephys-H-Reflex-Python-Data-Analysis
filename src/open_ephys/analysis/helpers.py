@@ -831,265 +831,154 @@ def plot_hm_ratio_summary(trials_by_polarity, header,
                            h_start_ms: float = 6.0, h_end_ms: float = 10.0,
                            sample_rate: float = SAMPLE_RATE,
                            pre_ms: float = 2.0, post_ms: float = 15.0):
-    """Two-panel H:M ratio summary for one or more polarity groups.
+    """Bar-chart summary of M-wave MRA, H-wave MRA, and H:M ratio per polarity group.
 
-    For each polarity group two figures are produced:
+    Figure 1 — Grouped bar chart with M / H / H:M subplots
+        * Each subplot shows one bar per polarity group (mean ± SD error bar).
+        * Stats panel (whitespace): n, SD, CV per group for each metric.
 
-    Figure 1 — Box plot with individual dots
-        * One box per polarity group (or single box if only one group).
-        * Whiskers show mean ± 1 SD (not IQR).
-        * Individual trial H:M values overlaid as semi-transparent jittered dots.
-        * CV annotated on each box.
+    Figure 2 — H:M ratio by stimulation amplitude
+        * Bar per amplitude × polarity (mean ± SD), n labelled above each bar.
 
-    Figure 2 — Histogram with individual dots and quartile lines
-        * Histogram of H:M ratio values per group.
-        * Rug of individual trial dots at the bottom.
-        * Vertical lines: mean, mean ± 1 SD, 20th and 80th percentiles.
-        * SD and percentile values annotated.
-
-    H:M ratio = peak amplitude within H window / peak amplitude within M window,
-    where "peak amplitude" = max(|trial_data|) within the window.
+    All amplitudes use MRA (mean(|signal|)) within the M/H windows.
     """
     import matplotlib.pyplot as plt
-    from matplotlib.patches import FancyBboxPatch
+    import matplotlib.patches as _mpatches
 
-    # drop any group that has no trials before doing anything else
     trials_by_polarity = {k: v for k, v in trials_by_polarity.items() if v}
-
     if not trials_by_polarity:
         print("No trials.")
         return
 
-    colours = {'Normal (0)': '#2196F3', 'Reversed (1)': '#FF5722',
-               'All trials': '#4CAF50'}
+    colours = {'Normal (0)': '#2196F3', 'Reversed (1)': '#FF5722', 'All trials': '#4CAF50'}
     palette  = ['#2196F3', '#FF5722', '#4CAF50', '#9C27B0', '#FF9800']
 
     def _col(label, i):
         return colours.get(label, palette[i % len(palette)])
 
-    _ms_ps_hm = 1000.0 / sample_rate
-    _bin_s_hm = int(BIN_DURATION_MS * sample_rate / 1000)
-    _rec_s_hm = int(TRIAL_RECORD_MS  * sample_rate / 1000)
+    _ms_ps = 1000.0 / sample_rate
+    _bin_s = int(BIN_DURATION_MS * sample_rate / 1000)
+    _rec_s = int(TRIAL_RECORD_MS  * sample_rate / 1000)
 
-    def _hm_ratios(trials):
-        ratios = []
-        for trial in trials:
-            t_ms, emg, _, _, _ = get_trial_window(trial, pre_ms, post_ms,
-                                                   ms_per_sample=_ms_ps_hm,
-                                                   bin_samples=_bin_s_hm,
-                                                   record_samples=_rec_s_hm)
-            m_mask = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
-            h_mask = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
-            m_amp = float(np.max(np.abs(emg[m_mask]))) if m_mask.any() else np.nan
-            h_amp = float(np.max(np.abs(emg[h_mask]))) if h_mask.any() else np.nan
-            ratios.append(h_amp / m_amp if (np.isfinite(m_amp) and m_amp > 0
-                                            and np.isfinite(h_amp)) else np.nan)
-        return np.array(ratios, dtype=float)
+    groups = list(trials_by_polarity.keys())
+    n_grps = len(groups)
 
-    groups = list(trials_by_polarity.items())
-    group_ratios = [(lbl, _hm_ratios(trs)) for lbl, trs in groups]
+    # Per-trial MRA within M and H windows for every polarity group
+    group_stats: dict = {}
+    amp_ratio:   dict = {}
+    for lbl, trs in trials_by_polarity.items():
+        mv_all, hv_all, hm_all = [], [], []
+        amp_d: dict = defaultdict(list)
+        for tr in trs:
+            t_ms, emg, _, _, _ = get_trial_window(tr, pre_ms, post_ms,
+                                                   ms_per_sample=_ms_ps,
+                                                   bin_samples=_bin_s,
+                                                   record_samples=_rec_s)
+            mm = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+            hm = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
+            mv = float(np.nanmean(np.abs(emg[mm]))) if mm.any() else np.nan
+            hv = float(np.nanmean(np.abs(emg[hm]))) if hm.any() else np.nan
+            if np.isfinite(mv):
+                mv_all.append(mv)
+            if np.isfinite(hv):
+                hv_all.append(hv)
+            if np.isfinite(mv) and np.isfinite(hv) and mv > 0:
+                ratio = hv / mv
+                hm_all.append(ratio)
+                amp_d[round(tr.stimulation_amplitude_ma, 2)].append(ratio)
+        group_stats[lbl] = {'m': np.array(mv_all), 'h': np.array(hv_all), 'hm': np.array(hm_all)}
+        amp_ratio[lbl]   = amp_d
 
-    # ── Figure 1: Box plots with individual dots ──────────────────────────────
-    fig1, ax1 = plt.subplots(figsize=(max(5, 3 * len(groups) + 2), 6))
-    rng = np.random.default_rng(0)
+    # ── Figure 1: Grouped bar chart — M / H / H:M + stats panel ─────────────
+    fig, axes = plt.subplots(1, 4, figsize=(16, 5),
+                             gridspec_kw={'width_ratios': [3, 3, 3, 2.5]})
+    ax_m, ax_h, ax_hm, ax_txt = axes
+    x_pos  = np.arange(n_grps)
+    bar_w  = min(0.55, 0.8 / max(n_grps, 1))
 
-    bp_data   = []
-    bp_labels = []
-    for i, (label, ratios) in enumerate(group_ratios):
-        v = ratios[np.isfinite(ratios)]
-        bp_data.append(v)
-        bp_labels.append(label)
+    metrics = [
+        ('m',  ax_m,  'M-wave MRA (µV)', 'M-wave'),
+        ('h',  ax_h,  'H-wave MRA (µV)', 'H-wave'),
+        ('hm', ax_hm, 'H:M Ratio (MRA)', 'H:M Ratio'),
+    ]
+    stats_lines: list = []
+    for key, ax, ylabel, title in metrics:
+        stats_lines.append(f'── {title} ──')
+        for i, lbl in enumerate(groups):
+            v = group_stats[lbl][key]
+            v = v[np.isfinite(v)] if len(v) else v
+            mu = float(np.mean(v)) if len(v) else 0.0
+            sd = float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
+            cv = sd / mu if mu != 0 else float('nan')
+            col = _col(lbl, i)
+            ax.bar(i, mu, width=bar_w, color=col, alpha=0.78,
+                   yerr=sd, capsize=6,
+                   error_kw={'elinewidth': 2.2, 'ecolor': col, 'capthick': 2})
+            stats_lines.append(f'{lbl}\n  n={len(v)}  SD={sd:.3f}  CV={cv:.2f}')
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([lbl.replace(' (', '\n(') for lbl in groups], fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.set_title(title, fontsize=11, fontweight='bold')
+        ax.grid(True, axis='y', alpha=0.3)
+        ax.axhline(0, color='gray', linewidth=0.5, linestyle='--', alpha=0.4)
+        stats_lines.append('')
 
-    bp = ax1.boxplot(bp_data, labels=bp_labels, patch_artist=True,
-                     whiskerprops=dict(linewidth=0),
-                     capprops=dict(linewidth=0),
-                     medianprops=dict(color='white', linewidth=2.0),
-                     widths=0.5)
+    ax_txt.axis('off')
+    ax_txt.text(0.05, 0.97, '\n'.join(stats_lines),
+                transform=ax_txt.transAxes,
+                va='top', ha='left', fontsize=8.5, family='monospace',
+                bbox=dict(boxstyle='round,pad=0.5', fc='white', ec='#cccccc', alpha=0.95))
 
-    # collect annotations; draw after tight_layout so y_top is accurate
-    _annots1 = []
-    for i, (patch, (label, ratios)) in enumerate(zip(bp['boxes'], group_ratios)):
-        col = _col(label, i)
-        patch.set_facecolor(col)
-        patch.set_alpha(0.55)
-
-        v = ratios[np.isfinite(ratios)]
-        if len(v) < 2:
-            continue
-        mu, sd = float(np.mean(v)), float(np.std(v, ddof=1))
-        cv = sd / mu if mu != 0 else float('nan')
-
-        # SD whiskers drawn manually
-        ax1.plot([i + 1, i + 1], [mu - sd, mu + sd],
-                 color=col, linewidth=2.5, solid_capstyle='round', zorder=4)
-        ax1.plot([i + 0.85, i + 1.15], [mu - sd, mu - sd],
-                 color=col, linewidth=1.5, zorder=4)
-        ax1.plot([i + 0.85, i + 1.15], [mu + sd, mu + sd],
-                 color=col, linewidth=1.5, zorder=4)
-        ax1.plot(i + 1, mu, 'D', color='white', markeredgecolor=col,
-                 markersize=7, zorder=5)
-
-        # Individual dots — jittered
-        jitter = rng.uniform(-0.18, 0.18, size=len(v))
-        ax1.scatter(i + 1 + jitter, v, color=col, alpha=0.4, s=20, zorder=3,
-                    edgecolors='none')
-
-        _annots1.append((i + 1, len(v), sd, cv))
-
-    ax1.set_ylabel('H:M Ratio (peak |EMG|)', fontsize=11)
-    ax1.set_title(f'H:M Ratio — {header.subject_id}\n'
-                  f'M window: {m_start_ms}–{m_end_ms} ms  |  '
-                  f'H window: {h_start_ms}–{h_end_ms} ms', fontsize=11)
-    ax1.axhline(0, color='gray', linewidth=0.5, linestyle='--', alpha=0.5)
-    ax1.grid(True, axis='y', alpha=0.3)
-    plt.tight_layout()
-
-    # Draw annotations after tight_layout so ylim is final; va='top' keeps text inside axes
-    _y_rng1 = ax1.get_ylim()[1] - ax1.get_ylim()[0]
-    _y_ann1 = ax1.get_ylim()[1] - _y_rng1 * 0.02
-    for _xp, _n, _sd, _cv in _annots1:
-        ax1.text(_xp, _y_ann1,
-                 f'n={_n}\nSD={_sd:.3f}\nCV={_cv:.2f}',
-                 ha='center', va='top', fontsize=9,
-                 bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
-
-    plt.show()
-
-    # ── Figure 2: Histogram per group with rug and quartile lines ─────────────
-    ncols = len(groups)
-    fig2, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 5),
-                               sharey=False, squeeze=False)
-
-    for i, (label, ratios) in enumerate(group_ratios):
-        ax = axes[0][i]
-        col = _col(label, i)
-        v = ratios[np.isfinite(ratios)]
-        if len(v) < 2:
-            ax.text(0.5, 0.5, f'n={len(v)}\nInsufficient data',
-                    ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(label)
-            continue
-
-        mu  = float(np.mean(v))
-        sd  = float(np.std(v, ddof=1))
-        cv  = sd / mu if mu != 0 else float('nan')
-        p20 = float(np.percentile(v, 20))
-        p80 = float(np.percentile(v, 80))
-
-        counts, bin_edges, _ = ax.hist(v, bins=max(10, int(np.sqrt(len(v))) * 2),
-                                        color=col, alpha=0.55, edgecolor='white',
-                                        linewidth=0.6, label='H:M ratio')
-
-        y_rug = -float(np.max(counts)) * 0.06
-        jitter = rng.uniform(-abs(y_rug) * 0.3, abs(y_rug) * 0.3, size=len(v))
-        ax.scatter(v, np.full_like(v, y_rug) + jitter,
-                   color=col, alpha=0.45, s=18, zorder=3, edgecolors='none')
-
-        ymax = float(np.max(counts)) * 1.25
-        ax.set_ylim(y_rug * 1.8, ymax)
-
-        line_kw = dict(linewidth=1.8, solid_capstyle='round')
-        ax.axvline(mu,       color='black',  linestyle='-',  label=f'Mean={mu:.3f}', **line_kw)
-        ax.axvline(mu - sd,  color='dimgray', linestyle='--', label=f'−SD={mu - sd:.3f}', **line_kw)
-        ax.axvline(mu + sd,  color='dimgray', linestyle='--', label=f'+SD={mu + sd:.3f}', **line_kw)
-        ax.axvline(p20, color='steelblue', linestyle=':',
-                   label=f'20th pct={p20:.3f}', **line_kw)
-        ax.axvline(p80, color='tomato',    linestyle=':',
-                   label=f'80th pct={p80:.3f}', **line_kw)
-
-        ax.set_xlabel('H:M Ratio (peak |EMG|)', fontsize=10)
-        ax.set_ylabel('Trial count', fontsize=10)
-        ax.set_title(f'{label}  (n={len(v)})\n'
-                     f'Mean={mu:.3f}  SD={sd:.3f}  CV={cv:.2f}\n'
-                     f'20th={p20:.3f}  80th={p80:.3f}', fontsize=9)
-        ax.legend(fontsize=8, loc='upper right')
-        ax.grid(True, alpha=0.25)
-
-    fig2.suptitle(f'H:M Ratio Distribution — {header.subject_id}\n'
-                  f'M window: {m_start_ms}–{m_end_ms} ms  |  '
-                  f'H window: {h_start_ms}–{h_end_ms} ms', fontsize=11)
+    fig.suptitle(
+        f'M / H / H:M Summary (MRA)  —  {header.subject_id}\n'
+        f'M: {m_start_ms}–{m_end_ms} ms  |  H: {h_start_ms}–{h_end_ms} ms',
+        fontsize=11
+    )
     plt.tight_layout()
     plt.show()
 
-    # ── Figure 3: H:M ratio by stim amplitude, grouped by polarity ───────────
-    import matplotlib.patches as _mpatches
+    # ── Figure 2: H:M ratio by stim amplitude (bar + STD) ────────────────────
+    _all_amps = sorted({a for _d in amp_ratio.values() for a in _d})
+    if _all_amps:
+        _n_amps = len(_all_amps)
+        _bw2    = min(0.8 / n_grps, 0.35)
+        _offs   = (np.linspace(-0.4 + _bw2 / 2, 0.4 - _bw2 / 2, n_grps)
+                   if n_grps > 1 else np.array([0.0]))
 
-    # collect {polarity_label: {amplitude: [ratio, ...]}}
-    _amp_ratio: dict = {}
-    for (lbl, trs), (_, ratios) in zip(groups, group_ratios):
-        _ad: dict = defaultdict(list)
-        for trial, ratio in zip(trs, ratios):
-            if np.isfinite(ratio):
-                _ad[round(trial.stimulation_amplitude_ma, 2)].append(float(ratio))
-        _amp_ratio[lbl] = _ad
+        fig2, ax2 = plt.subplots(figsize=(max(10, _n_amps * n_grps * 0.9 + 3), 5))
 
-    _all_amps = sorted({a for _d in _amp_ratio.values() for a in _d})
-    _n_amps   = len(_all_amps)
-    _n_grps   = len(groups)
-
-    if _n_amps > 0:
-        _box_w  = 0.7 / _n_grps
-        _offs   = (np.linspace(-0.35 + _box_w / 2, 0.35 - _box_w / 2, _n_grps)
-                   if _n_grps > 1 else np.array([0.0]))
-
-        fig3, ax3 = plt.subplots(figsize=(max(10, _n_amps * _n_grps * 1.0 + 3), 6))
-
-        for gi, (lbl, _trs) in enumerate(groups):
+        for gi, lbl in enumerate(groups):
             col = _col(lbl, gi)
-            _ad  = _amp_ratio[lbl]
+            _ad  = amp_ratio[lbl]
             off  = float(_offs[gi])
-
-            _pos  = [ai + 1 + off for ai, amp in enumerate(_all_amps) if _ad.get(amp)]
-            _data = [_ad[amp]     for amp       in _all_amps            if _ad.get(amp)]
-            if not _data:
-                continue
-
-            _bp3 = ax3.boxplot(_data, positions=_pos, widths=_box_w * 0.82,
-                               patch_artist=True,
-                               whiskerprops=dict(linewidth=0),
-                               capprops=dict(linewidth=0),
-                               medianprops=dict(color='white', linewidth=2.0))
-            for _patch in _bp3['boxes']:
-                _patch.set_facecolor(col)
-                _patch.set_alpha(0.55)
-
             for ai, amp in enumerate(_all_amps):
                 _v = np.array(_ad.get(amp, []))
-                if len(_v) == 0:
+                if not len(_v):
                     continue
-                _xp  = ai + 1 + off
-                _mu  = float(np.mean(_v))
-                _sd  = float(np.std(_v, ddof=1)) if len(_v) > 1 else 0.0
-                _hw  = _box_w * 0.38
+                _xp = ai + 1 + off
+                _mu = float(np.mean(_v))
+                _sd = float(np.std(_v, ddof=1)) if len(_v) > 1 else 0.0
+                ax2.bar(_xp, _mu, width=_bw2 * 0.9, color=col, alpha=0.78,
+                        yerr=_sd, capsize=4,
+                        error_kw={'elinewidth': 1.8, 'ecolor': col, 'capthick': 1.5})
+                ax2.text(_xp, _mu + _sd + max(_mu * 0.03, 0.01),
+                         f'n={len(_v)}', ha='center', va='bottom', fontsize=6.5, color=col)
 
-                ax3.plot([_xp, _xp], [_mu - _sd, _mu + _sd],
-                         color=col, linewidth=2.5, solid_capstyle='round', zorder=4)
-                ax3.plot([_xp - _hw, _xp + _hw], [_mu - _sd, _mu - _sd],
-                         color=col, linewidth=1.5, zorder=4)
-                ax3.plot([_xp - _hw, _xp + _hw], [_mu + _sd, _mu + _sd],
-                         color=col, linewidth=1.5, zorder=4)
-                ax3.plot(_xp, _mu, 'D', color='white', markeredgecolor=col,
-                         markersize=5, zorder=5)
-
-                _jit = rng.uniform(-_hw * 0.6, _hw * 0.6, size=len(_v))
-                ax3.scatter(_xp + _jit, _v, color=col, alpha=0.4, s=14,
-                            zorder=3, edgecolors='none')
-
-        _legend_patches = [
-            _mpatches.Patch(color=_col(lbl, gi), alpha=0.75, label=lbl)
-            for gi, (lbl, _) in enumerate(groups)
-        ]
-        ax3.set_xticks(range(1, _n_amps + 1))
-        ax3.set_xticklabels([f'{a:.2f} mA' for a in _all_amps],
+        ax2.set_xticks(range(1, _n_amps + 1))
+        ax2.set_xticklabels([f'{a:.2f} mA' for a in _all_amps],
                             rotation=45, ha='right', fontsize=9)
-        ax3.set_ylabel('H:M Ratio (peak |EMG|)', fontsize=11)
-        ax3.set_title(f'H:M Ratio by Stimulation Amplitude — {header.subject_id}\n'
-                      f'M window: {m_start_ms}–{m_end_ms} ms  |  '
-                      f'H window: {h_start_ms}–{h_end_ms} ms', fontsize=11)
-        ax3.axhline(0, color='gray', linewidth=0.5, linestyle='--', alpha=0.5)
-        ax3.grid(True, axis='y', alpha=0.3)
-        if _n_grps > 1:
-            ax3.legend(handles=_legend_patches, fontsize=9, loc='upper left')
+        ax2.set_ylabel('H:M Ratio (MRA)', fontsize=11)
+        ax2.set_title(
+            f'H:M Ratio by Stimulation Amplitude — {header.subject_id}\n'
+            f'M: {m_start_ms}–{m_end_ms} ms  |  H: {h_start_ms}–{h_end_ms} ms',
+            fontsize=11
+        )
+        ax2.axhline(0, color='gray', linewidth=0.5, linestyle='--', alpha=0.5)
+        ax2.grid(True, axis='y', alpha=0.3)
+        if n_grps > 1:
+            patches = [_mpatches.Patch(color=_col(lbl, gi), alpha=0.78, label=lbl)
+                       for gi, lbl in enumerate(groups)]
+            ax2.legend(handles=patches, fontsize=9)
         plt.tight_layout()
         plt.show()
 
@@ -1706,6 +1595,7 @@ def plot_hrs2_analysis(trials, header,
     _pol_keys   = sorted(_pol_split.keys())
     _pol_labels = {0: 'Normal (0)', 1: 'Reversed (1)'}
     _active_pol = {'val': _pol_keys[0]}
+    _pol_change_hooks = []
 
     def _pad_rows(rows, n_pts):
         p = np.full((len(rows), n_pts), np.nan)
@@ -2098,6 +1988,8 @@ def plot_hrs2_analysis(trials, header,
             _page_drop.options = [(f'Page {i+1}', i) for i in range(len(_vst['pages']))]
             _page_drop.value = 0
             _plot_page(0)
+            for _hook in _pol_change_hooks:
+                _hook(change['new'])
         _pol_tog.observe(_on_pol_change, names='value')
         _top_rows.append(HBox([HTML('<b>Stim polarity:</b>  '), _pol_tog]))
 
@@ -2153,98 +2045,86 @@ def plot_hrs2_analysis(trials, header,
             'h_stds':  np.array([np.std(v, ddof=1) if len(v) > 1 else 0.0 for v in _hls]),
         }
 
-    # reference polarity for normalization (normal preferred, i.e. key 0)
-    _ref_pk  = 0 if 0 in _rc_data else _pol_keys[0]
-    _ref_rc  = _rc_data[_ref_pk]
-    M_max    = float(np.max(_ref_rc['m_means'])) if np.max(_ref_rc['m_means']) > 0 else 1.0
-    _ref_norm = (_ref_rc['m_means'] / M_max) * 100
-    _ref_sa   = np.array(_ref_rc['sorted_amps'])
-    _interp_func = interp1d(_ref_norm, _ref_sa, kind='linear',
-                            bounds_error=False, fill_value='extrapolate')
-    try:
-        current_at_50 = float(_interp_func(50))
-    except Exception:
-        current_at_50 = float(_ref_sa[np.argmax(_ref_norm >= 50)])
+    # ── interactive recruitment curve output ──────────────────────────────
+    _rc_out = Output()
 
-    # normal polarity → solid lines, reversed → dashed lines
-    _rc_fmt = {0: 'o-', 1: 'o--'}
-    _rc_lbl = {0: 'Normal', 1: 'Reversed'}
-    _pol_note_rc = '  (solid = normal, dashed = reversed)' if _dual_pol else ''
-
-    # ── normalized recruitment curve ──────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(10, 6))
-    _H_max_ref = None
-    _cur_Hmax_ref = None
-
-    for _pk in _pol_keys:
-        _d   = _rc_data[_pk]
+    def _draw_rc_curves(pol_key):
+        _d   = _rc_data[pol_key]
         _sa  = np.array(_d['sorted_amps'])
-        _nc  = _sa / current_at_50
-        _mn  = (_d['m_means'] / M_max) * 100
-        _hn  = (_d['h_means'] / M_max) * 100
-        _mns = (_d['m_stds']  / M_max) * 100
-        _hns = (_d['h_stds']  / M_max) * 100
-        _fmt = _rc_fmt.get(_pk, 'o-')
-        _pfx = (_rc_lbl.get(_pk, str(_pk)) + ' ') if _dual_pol else ''
-        ax.errorbar(_nc, _mn, yerr=_mns, fmt=_fmt, color='blue',
-                    label=f'{_pfx}M-wave (% Mmax) ± STD', capsize=3)
-        ax.errorbar(_nc, _hn, yerr=_hns, fmt=_fmt, color='green',
-                    label=f'{_pfx}H-wave (% Mmax) ± STD', capsize=3)
-        if _pk == _ref_pk:
-            _H_max_ref     = float(np.max(_hn))
-            _idx_Hmax_ref  = int(np.argmax(_hn))
-            _cur_Hmax_ref  = float(_nc[_idx_Hmax_ref])
-            ax.axhline(_H_max_ref, color='green', linestyle='--', linewidth=1,
-                       label=f'H_max = {_H_max_ref:.1f}% Mmax')
-            ax.axvline(_cur_Hmax_ref, color='gray', linestyle='--', linewidth=1,
-                       label=f'Current at H_max = {_cur_Hmax_ref:.2f}x')
-            ax.text(_cur_Hmax_ref + 0.02, _H_max_ref + 2, 'b', fontsize=12, color='black')
-            ax.text(float(_nc[_idx_Hmax_ref]) - 0.08, _H_max_ref + 2, 'a',
-                    fontsize=12, color='black')
+        M_max_k = float(np.max(_d['m_means'])) if np.max(_d['m_means']) > 0 else 1.0
+        _norm_m     = (_d['m_means'] / M_max_k) * 100
+        _norm_h     = (_d['h_means'] / M_max_k) * 100
+        _norm_m_std = (_d['m_stds']  / M_max_k) * 100
+        _norm_h_std = (_d['h_stds']  / M_max_k) * 100
 
-    ax.set_xlabel('Current (normalized to current at 50% Mmax)', fontsize=18)
-    ax.set_ylabel('H and M wave amplitude (% of Mmax)', fontsize=18)
-    ax.set_title(f'HRS2 Normalized Recruitment Curve - {header.subject_id}{_pol_note_rc}',
-                 fontsize=15)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    _apply_tiered_ticks(ax)
-    plt.tight_layout()
-    plt.show()
+        _interp_func_k = interp1d(_norm_m, _sa, kind='linear',
+                                  bounds_error=False, fill_value='extrapolate')
+        try:
+            current_at_50_k = float(_interp_func_k(50))
+        except Exception:
+            current_at_50_k = float(_sa[np.argmax(_norm_m >= 50)])
+        _nc = _sa / current_at_50_k
 
-    # ── raw (mA) recruitment curve ────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(10, 6))
+        _pol_lbl = _pol_labels.get(pol_key, str(pol_key)) if _dual_pol else ''
+        _lbl_sfx = f'  [{_pol_lbl}]' if _dual_pol else ''
 
-    for _pk in _pol_keys:
-        _d   = _rc_data[_pk]
-        _fmt = _rc_fmt.get(_pk, 'o-')
-        _pfx = (_rc_lbl.get(_pk, str(_pk)) + ' ') if _dual_pol else ''
-        ax.errorbar(_d['sorted_amps'], _d['m_means'], yerr=_d['m_stds'],
-                    fmt=_fmt, color='blue',  label=f'{_pfx}M-wave mean ± STD', capsize=3)
-        ax.errorbar(_d['sorted_amps'], _d['h_means'], yerr=_d['h_stds'],
-                    fmt=_fmt, color='green', label=f'{_pfx}H-wave mean ± STD', capsize=3)
+        with _rc_out:
+            _rc_out.clear_output(wait=True)
 
-    _all_amps = sorted({a for _d in _rc_data.values() for a in _d['sorted_amps']})
-    ax.set_xticks(_all_amps)
-    ax.set_xticklabels([f'{a:.2f}' for a in _all_amps], rotation=45, ha='right', fontsize=9)
-    ax.set_xlabel('Stimulation Amplitude (mA)', fontsize=18)
-    ax.set_ylabel('MRA Amplitude (µV)', fontsize=18)
-    ax.set_title(f'HRS2 Recruitment Curve - {header.subject_id}{_pol_note_rc}', fontsize=15)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    _apply_tiered_ticks(ax)
-    plt.tight_layout()
-    plt.show()
+            # normalized recruitment curve
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.errorbar(_nc, _norm_m, yerr=_norm_m_std, fmt='o-', color='blue',
+                        label='M-wave (% Mmax) ± STD', capsize=3)
+            ax.errorbar(_nc, _norm_h, yerr=_norm_h_std, fmt='o-', color='green',
+                        label='H-wave (% Mmax) ± STD', capsize=3)
+            _H_max_k    = float(np.max(_norm_h))
+            _idx_Hmax_k = int(np.argmax(_norm_h))
+            _cur_Hmax_k = float(_nc[_idx_Hmax_k])
+            ax.axhline(_H_max_k, color='green', linestyle='--', linewidth=1,
+                       label=f'H_max = {_H_max_k:.1f}% Mmax')
+            ax.axvline(_cur_Hmax_k, color='gray', linestyle='--', linewidth=1,
+                       label=f'Current at H_max = {_cur_Hmax_k:.2f}x')
+            ax.text(_cur_Hmax_k + 0.02, _H_max_k + 2, 'b', fontsize=12, color='black')
+            ax.text(_cur_Hmax_k - 0.08, _H_max_k + 2, 'a', fontsize=12, color='black')
+            ax.set_xlabel('Current (normalized to current at 50% Mmax)', fontsize=18)
+            ax.set_ylabel('H and M wave amplitude (% of Mmax)', fontsize=18)
+            ax.set_title(f'HRS2 Normalized Recruitment Curve - {header.subject_id}{_lbl_sfx}',
+                         fontsize=15)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            _apply_tiered_ticks(ax)
+            plt.tight_layout()
+            plt.show()
 
-    _ref_h_means = _rc_data[_ref_pk]['h_means']
-    _ref_sa_arr  = np.array(_rc_data[_ref_pk]['sorted_amps'])
-    _ref_h_norm  = (_ref_h_means / M_max) * 100
-    _idx_Hmax    = int(np.argmax(_ref_h_norm))
-    print(f"M_max = {M_max:.2f} µV")
-    print(f"H_max = {float(np.max(_ref_h_means)):.2f} µV ({float(np.max(_ref_h_norm)):.1f}% of M_max)")
-    print(f"Current at 50% M_max = {current_at_50:.2f} mA")
-    print(f"Current at H_max = {float(_ref_sa_arr[_idx_Hmax]):.2f} mA "
-          f"({float(_ref_sa_arr[_idx_Hmax] / current_at_50):.2f}x normalized)")
+            # raw (mA) recruitment curve
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.errorbar(_sa, _d['m_means'], yerr=_d['m_stds'],
+                        fmt='o-', color='blue',  label='M-wave mean ± STD', capsize=3)
+            ax.errorbar(_sa, _d['h_means'], yerr=_d['h_stds'],
+                        fmt='o-', color='green', label='H-wave mean ± STD', capsize=3)
+            ax.set_xticks(_sa)
+            ax.set_xticklabels([f'{a:.2f}' for a in _sa], rotation=45, ha='right', fontsize=9)
+            ax.set_xlabel('Stimulation Amplitude (mA)', fontsize=18)
+            ax.set_ylabel('MRA Amplitude (µV)', fontsize=18)
+            ax.set_title(f'HRS2 Recruitment Curve - {header.subject_id}{_lbl_sfx}', fontsize=15)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            _apply_tiered_ticks(ax)
+            plt.tight_layout()
+            plt.show()
+
+            _h_norm_k    = (_d['h_means'] / M_max_k) * 100
+            _idx_Hmax_rw = int(np.argmax(_h_norm_k))
+            print(f"M_max = {M_max_k:.2f} µV")
+            print(f"H_max = {float(np.max(_d['h_means'])):.2f} µV "
+                  f"({float(np.max(_h_norm_k)):.1f}% of M_max)")
+            print(f"Current at 50% M_max = {current_at_50_k:.2f} mA")
+            print(f"Current at H_max = {float(_sa[_idx_Hmax_rw]):.2f} mA "
+                  f"({float(_sa[_idx_Hmax_rw] / current_at_50_k):.2f}x normalized)")
+
+    _pol_change_hooks.append(_draw_rc_curves)
+    display(_rc_out)
+    _draw_rc_curves(_active_pol['val'])
 
 
 def plot_hrs2_trials(trials, header,
@@ -2304,13 +2184,17 @@ def plot_hrs2_trials(trials, header,
     _show_sigs = {'val': set()}
     _ylim_auto = {'val': True}
     _ylim_man  = {'lo': -1000.0, 'hi': 1500.0}
+    _abs_emg   = {'val': False}
+    _view_mode = {'val': 'all'}   # 'all' | 'stim'
+    _upd_amp   = {'val': False}   # guard against observe re-entrancy
 
     def _get_ylim():
         if _ylim_auto['val']:
-            _all = np.concatenate([d['emg'] for d in _vst_t['trial_data']])
+            _raw = np.concatenate([d['emg'] for d in _vst_t['trial_data']])
+            _all = np.abs(_raw) if _abs_emg['val'] else _raw
             _all = _all[~np.isnan(_all)]
             if len(_all) == 0:
-                return (-1000.0, 1500.0)
+                return (0.0, 1500.0) if _abs_emg['val'] else (-1000.0, 1500.0)
             _lo, _hi = float(np.nanmin(_all)), float(np.nanmax(_all))
             _pad = max(0.08 * (_hi - _lo), 1.0)
             return (_lo - _pad, _hi + _pad)
@@ -2320,6 +2204,8 @@ def plot_hrs2_trials(trials, header,
         lw  = 0.8 if small else 1.5
         fsz = 8   if small else 11
         t, emg = d['t_ms'], d['emg']
+        if _abs_emg['val']:
+            emg = np.abs(emg)
         end_ms = d['stim_end_ms']
         sigs   = _show_sigs['val']
 
@@ -2471,6 +2357,31 @@ def plot_hrs2_trials(trials, header,
             _back_btn.on_click(_on_back)
             display(_back_btn)
 
+    _all_amps_t = sorted({round(tr.stimulation_amplitude_ma, 2) for tr in trials})
+
+    def _rebuild_trials():
+        pol_trs = list(_pol_split_t[_active_pol_t['val']])
+        if _view_mode['val'] == 'stim':
+            _pol_amps = sorted({round(t.stimulation_amplitude_ma, 2) for t in pol_trs})
+            _upd_amp['val'] = True
+            _stim_amp_drop.options = ([(f'{a:.2f} mA', a) for a in _pol_amps]
+                                      if _pol_amps else [('—', None)])
+            if _stim_amp_drop.value not in _pol_amps and _pol_amps:
+                _stim_amp_drop.value = _pol_amps[0]
+            _upd_amp['val'] = False
+            tgt = _stim_amp_drop.value
+            if tgt is not None:
+                pol_trs = [t for t in pol_trs
+                           if round(t.stimulation_amplitude_ma, 2) == tgt]
+        _vst_t['trial_data'] = _build_trial_data(pol_trs)
+        _vst_t['pages'] = [_vst_t['trial_data'][i:i + n_per_page]
+                           for i in range(0, max(len(_vst_t['trial_data']), 1), n_per_page)]
+        _cur_page['idx'] = 0
+        _zoom_state['active'] = False
+        _page_drop.options = [(f'Page {i+1}', i) for i in range(len(_vst_t['pages']))]
+        _page_drop.value = 0
+        _plot_page(0)
+
     def _on_prev(b):
         if _cur_page['idx'] > 0:
             _cur_page['idx'] -= 1
@@ -2534,6 +2445,33 @@ def plot_hrs2_trials(trials, header,
     _cb_stim_adc = Checkbox(value=False, description='Stim ADC (magenta)', indent=False,
                             layout={'width': '195px'}, disabled=not _has_stim_adc)
 
+    from ipywidgets import ToggleButtons as _TBs_t
+    _abs_emg_btn   = ToggleButton(value=False, description='Abs EMG',
+                                  button_style='', icon='',
+                                  tooltip='Show |EMG| absolute value trace',
+                                  layout={'width': '110px'})
+    _view_mode_tgl = _TBs_t(options=[('All trials', 'all'), ('By stim intensity', 'stim')],
+                             value='all', button_style='',
+                             layout={'width': '300px'})
+    _stim_amp_drop = Dropdown(
+        options=[(f'{a:.2f} mA', a) for a in _all_amps_t],
+        description='Amplitude:', layout={'width': '210px', 'visibility': 'hidden'}
+    )
+
+    def _on_abs_emg_t(change):
+        _abs_emg['val'] = bool(change['new'])
+        _abs_emg_btn.button_style = 'warning' if change['new'] else ''
+        _refresh()
+
+    def _on_view_mode_t(change):
+        _view_mode['val'] = change['new']
+        _stim_amp_drop.layout.visibility = '' if change['new'] == 'stim' else 'hidden'
+        _rebuild_trials()
+
+    def _on_stim_amp_t(change):
+        if _view_mode['val'] == 'stim' and not _upd_amp['val']:
+            _rebuild_trials()
+
     _auto_toggle = ToggleButton(
         value=True, description='Auto y-scale',
         button_style='success',
@@ -2550,16 +2488,21 @@ def plot_hrs2_trials(trials, header,
     _view_btn.on_click(_on_view)
     _cb_adc.observe(_make_sig_cb('adc'), names='value')
     _cb_stim_adc.observe(_make_sig_cb('stim_adc'), names='value')
+    _abs_emg_btn.observe(_on_abs_emg_t, names='value')
+    _view_mode_tgl.observe(_on_view_mode_t, names='value')
+    _stim_amp_drop.observe(_on_stim_amp_t, names='value')
     _auto_toggle.observe(_on_auto_toggle, names='value')
     _ymin_box.observe(_on_ymin_change, names='value')
     _ymax_box.observe(_on_ymax_change, names='value')
 
     _nav_row = HBox([_prev_btn, _next_btn, _page_drop,
                      Label('  '), _trial_drop, _view_btn])
+    _view_row = HBox([HTML('<b>View mode:</b>  '), _view_mode_tgl,
+                      Label('  '), _stim_amp_drop])
     _sig_row = HBox([
         VBox([
             HTML('<b>Signal overlays:</b>'),
-            HBox([_cb_adc, _cb_stim_adc]),
+            HBox([_cb_adc, _cb_stim_adc, Label('  '), _abs_emg_btn]),
         ]),
         Label('   '),
         VBox([_auto_toggle, _ymin_box, _ymax_box]),
@@ -2578,14 +2521,7 @@ def plot_hrs2_trials(trials, header,
         )
         def _on_pol_change_t(change):
             _active_pol_t['val'] = change['new']
-            _vst_t['trial_data'] = _build_trial_data(_pol_split_t[change['new']])
-            _vst_t['pages'] = [_vst_t['trial_data'][i:i+n_per_page]
-                               for i in range(0, len(_vst_t['trial_data']), n_per_page)]
-            _cur_page['idx'] = 0
-            _zoom_state['active'] = False
-            _page_drop.options = [(f'Page {i+1}', i) for i in range(len(_vst_t['pages']))]
-            _page_drop.value = 0
-            _plot_page(0)
+            _rebuild_trials()
         _pol_tog_t.observe(_on_pol_change_t, names='value')
         _top_rows_t.append(HBox([HTML('<b>Stim polarity:</b>  '), _pol_tog_t]))
 
@@ -2598,7 +2534,7 @@ def plot_hrs2_trials(trials, header,
     print(f"Stim waveform: {'available' if _has_stim_adc else 'not present in this file'}")
     print("Double-click a subplot to zoom in, or use the dropdown + 'View trial' button.")
 
-    display(VBox(_top_rows_t + [_nav_row, _sig_row, _out]))
+    display(VBox(_top_rows_t + [_view_row, _nav_row, _sig_row, _out]))
     _plot_page(0)
 
 
@@ -5226,7 +5162,8 @@ def detect_and_correct_failed_trials(hrs2_trials, hrs2_header, hrs2_emg_blocks,
                                      h_end_ms: float = 9.0,
                                      sample_rate: float = None,
                                      ctx_pre_s: float = 10.0,
-                                     ctx_post_s: float = 10.0):
+                                     ctx_post_s: float = 10.0,
+                                     silent: bool = False):
     """Classify HRS2 trials for ADC-sync failures, realign each failed trial to the
     true stim onset, and display an interactive per-trial context viewer plus a
     corrected-waveform grid.
@@ -5381,6 +5318,10 @@ def detect_and_correct_failed_trials(hrs2_trials, hrs2_header, hrs2_emg_blocks,
         ))
 
     n_found = sum(1 for d in realigned if d['delay_ms'] is not None)
+
+    if silent:
+        return trial_report, failed, passed, realigned
+
     print(f"\nRealignment summary:")
     print(f"  Resolved (pulse-count)  : {sum(1 for d in realigned if d['delay_ms_count'] is not None)}")
     print(f"  Resolved (ctx fallback) : {sum(1 for d in realigned if d['delay_ms_count'] is None and d['delay_ms_ctx'] is not None)}")
