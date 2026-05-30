@@ -63,8 +63,8 @@ BLOCK_MH_TRIAL             = 3
 BLOCK_EMG_TRIALS_PER_HOUR  = 4
 
 # Low-level type maps (mirrors FileIO_Helpers from hreflex_txbdc)
-_HRS_TYPE_FMT  = {'int8': 'b', 'int32': 'i', 'uint64': 'Q', 'uint8': 'B', 'float32': 'f', 'float64': 'd'}
-_HRS_TYPE_SIZE = {'int8': 1,  'int32': 4,   'uint64': 8,   'uint8': 1,   'float32': 4,   'float64': 8}
+_HRS_TYPE_FMT  = {'int8': 'b', 'int16': 'h', 'int32': 'i', 'int64': 'q', 'uint8': 'B', 'uint16': 'H', 'uint32': 'I', 'uint64': 'Q', 'float32': 'f', 'float64': 'd'}
+_HRS_TYPE_SIZE = {'int8': 1,  'int16': 2,   'int32': 4,   'int64': 8,   'uint8': 1,   'uint16': 2,   'uint32': 4,   'uint64': 8,   'float32': 4,   'float64': 8}
 
 
 # ====================================================================
@@ -184,7 +184,7 @@ class MhRecTrial:
     # --- file_version >= 2 fields ---
     trigger_wall_time_ms: int = 0
     onset_sample_index: int = -1       # -1 = not found (fallback used)
-    onset_detected: int = 0            # 1 = real crossing, 0 = fallback
+    onset_detected: int = 0            # 0 = fallback, 1 = ADC crossing, 2 = digital DIGITAL IN (v7+)
     stim_end_sample_index: int = -1    # -1 = not found within recording window
     stim_duration_samples: int = 0
     stim_duration_ms: float = 0.0
@@ -201,6 +201,9 @@ class MhRecTrial:
     background_bins: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     # --- file_version >= 6 fields ---
     stim_polarity_reversed: int = 0   # 0 = normal, 1 = reversed
+    # --- file_version >= 7 fields ---
+    digital_onset_sample_num: int = -1   # absolute OE sample of DIGITAL IN rising edge; -1 = none
+    digital_onset_channel: int = -1      # OE digital channel index (0-based); -1 = none
 
 
 # ====================================================================
@@ -265,6 +268,9 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0) -> MhRecTrial:
                     fid.seek(-4, 1)
     if file_version >= 6:
         t.stim_polarity_reversed = hrs_read_val(fid, 'int8')
+    if file_version >= 7:
+        t.digital_onset_sample_num = hrs_read_val(fid, 'int64')
+        t.digital_onset_channel    = hrs_read_val(fid, 'int32')
     return t
 
 
@@ -367,31 +373,67 @@ def read_hrs2(filepath: str):
             block_id = struct.unpack('i', chunk)[0]
 
             if block_id == BLOCK_MH_TRIAL:
-                trials.append(_read_mh_trial_block(fid, header.file_version))
+                try:
+                    trials.append(_read_mh_trial_block(fid, header.file_version))
+                except (struct.error, EOFError):
+                    break
             elif block_id == BLOCK_EMG_DATA:
-                # Could be a trial written with buggy block_id=1 -- peek to disambiguate.
-                # Old datetime format: MATLAB datenum (float64 ~730000-750000).
-                # New datetime format: Unix ms (uint64); as float64 interpretation ≈ 0.
-                #   EMG blocks: bytes 8-15 = ts_python_received (another Unix ms ~1.7e12).
-                #   Trial blocks: bytes 8-15 = two float32 thresholds (not a Unix ms value).
+                # App bug: MhRecruitmentCurveTrial.save_to_file writes block_id=1 (EMG_DATA)
+                # instead of block_id=3 (MH_TRIAL).  Disambiguate by peeking at the first
+                # 24 bytes after the block_id.
+                #
+                # EMG block layout  (bytes 0-23):
+                #   [0:8]   ts_open_ephys_sent  (uint64, wall-clock Unix ms from OE ZMQ)
+                #   [8:16]  ts_python_received  (uint64, wall-clock Unix ms from time.time()*1000)
+                #   [16:24] ts_background_emitted (uint64, wall-clock Unix ms)
+                #   → all three are Unix ms (~1.7e12 for 2026), ascending, within seconds of each other
+                #
+                # Trial block layout (bytes 0-23):
+                #   [0:8]   start_time          (uint64 Unix ms, OR float64 MATLAB datenum in old format)
+                #   [8:12]  min_init_threshold  (float32)
+                #   [12:16] max_init_threshold  (float32)
+                #   [16:20] stimulation_amplitude_ma (float32)
+                #   [20:24] first 4 bytes of trial_data length (uint32)
+                #   → only bytes[0:8] is a Unix ms timestamp; [8:24] are floats/counts
+                #
+                # Strategy: read 24 bytes.  If all three uint64 windows are in the Unix-ms
+                # range AND they are ascending AND within 1 hour of each other → EMG block.
+                # Otherwise → trial block (only one or zero windows will be in range).
+                # Old format check: if bytes[0:8] interpreted as float64 is > 1.0 → MATLAB
+                # datenum → trial (float64 MATLAB datums for 2026 are ~738xxx, well above 1).
+                _UNIX_MS_LO = 5e11   # ~1985-01-01
+                _UNIX_MS_HI = 3e12   # ~2065-01-01
                 pos = fid.tell()
-                peek = fid.read(16)
+                peek = fid.read(24)
                 fid.seek(pos)
-                if len(peek) < 8:
+                if len(peek) < 24:
                     break
                 peek_f64 = struct.unpack('<d', peek[:8])[0]
                 if peek_f64 > 1.0:
-                    # Old format: MATLAB datenum → trial
+                    # Old format: MATLAB datenum stored as float64 → trial block
                     trials.append(_read_mh_trial_block(fid, header.file_version))
-                elif len(peek) >= 16:
-                    # New format: bytes 8-15 in Unix ms range → EMG; otherwise → trial
-                    peek_u64 = struct.unpack('<Q', peek[8:16])[0]
-                    if 5e11 < peek_u64 < 3e12:
-                        emg_blocks.append(_read_emg_data_block(fid))
-                    else:
-                        trials.append(_read_mh_trial_block(fid, header.file_version))
                 else:
-                    emg_blocks.append(_read_emg_data_block(fid))
+                    ts0 = struct.unpack('<Q', peek[0:8])[0]
+                    ts1 = struct.unpack('<Q', peek[8:16])[0]
+                    ts2 = struct.unpack('<Q', peek[16:24])[0]
+                    _is_emg = (
+                        _UNIX_MS_LO < ts0 < _UNIX_MS_HI and
+                        _UNIX_MS_LO < ts1 < _UNIX_MS_HI and
+                        _UNIX_MS_LO < ts2 < _UNIX_MS_HI and
+                        ts1 >= ts0 and ts2 >= ts1 and
+                        (ts2 - ts0) < 3_600_000  # all three within 1 hour of each other
+                    )
+                    if _is_emg:
+                        try:
+                            emg_blocks.append(_read_emg_data_block(fid))
+                        except (struct.error, EOFError):
+                            # Truncated final EMG block (recording ended mid-frame); stop.
+                            break
+                    else:
+                        try:
+                            trials.append(_read_mh_trial_block(fid, header.file_version))
+                        except (struct.error, EOFError):
+                            break
             else:
                 print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
                 break
@@ -442,6 +484,22 @@ def detect_stim_onset(sync_data: np.ndarray,
     return bin_samples
 
 
+def _trial_onset_oe(trial, bin_samples: int) -> 'int | None':
+    """Return the absolute OE sample number of the stim onset.
+
+    Prefers digital_onset_sample_num (v7+) over the ADC-derived position.
+    Returns None when neither source is available.
+    """
+    dig = getattr(trial, 'digital_onset_sample_num', -1)
+    if dig is not None and dig >= 0:
+        return int(dig)
+    fid_val = getattr(trial, 'first_post_trigger_frame_sample_id', 0)
+    osi = getattr(trial, 'onset_sample_index', -1)
+    if fid_val > 0 and osi >= 0:
+        return int(fid_val) + (osi - bin_samples)
+    return None
+
+
 def get_trial_window(trial: MhRecTrial,
                      pre_plot_ms: float,
                      post_plot_ms: float,
@@ -470,9 +528,15 @@ def get_trial_window(trial: MhRecTrial,
     """
     has_sync = len(trial.sync_data) > 1
 
-    # Prefer the pre-computed onset stored in the trial (file_version >= 2)
-    if getattr(trial, 'onset_detected', 0) == 1 and getattr(trial, 'onset_sample_index', -1) >= 0:
-        onset_idx = trial.onset_sample_index
+    # For file_version >= 2 the app stores onset_sample_index for both ADC
+    # (onset_detected=1) and digital DIGITAL IN (onset_detected=2) sources.
+    # Trust it directly — recomputing from digital_onset_sample_num would
+    # require knowing the exact bin_sample_count used at record time (which
+    # depends on sample_rate and may differ from the offline BIN_SAMPLES constant).
+    _od  = getattr(trial, 'onset_detected', 0)
+    _osi = getattr(trial, 'onset_sample_index', -1)
+    if _od >= 1 and _osi >= 0:
+        onset_idx = _osi
     elif has_sync:
         onset_idx = detect_stim_onset(trial.sync_data, bin_samples, record_samples,
                                       onset_threshold)
@@ -555,14 +619,18 @@ def get_trial_context_window(trial: 'MhRecTrial',
     # ── Locate onset in OE sample space ──────────────────────────────────────
     onset_oe: int | None = None
 
-    first_id = getattr(trial, 'first_post_trigger_frame_sample_id', 0)
-    onset_idx_in_trial = getattr(trial, 'onset_sample_index', -1)
-
-    if first_id > 0 and onset_idx_in_trial >= 0:
-        # onset_sample_index is relative to the start of trial_data;
-        # the first BIN_SAMPLES of trial_data are pre-trigger, so:
-        onset_oe = int(first_id) + (onset_idx_in_trial - bin_samples)
+    _dig_oe = getattr(trial, 'digital_onset_sample_num', -1)
+    if _dig_oe is not None and _dig_oe >= 0:
+        onset_oe = int(_dig_oe)
     else:
+        first_id = getattr(trial, 'first_post_trigger_frame_sample_id', 0)
+        onset_idx_in_trial = getattr(trial, 'onset_sample_index', -1)
+        if first_id > 0 and onset_idx_in_trial >= 0:
+            # onset_sample_index is relative to the start of trial_data;
+            # the first BIN_SAMPLES of trial_data are pre-trigger, so:
+            onset_oe = int(first_id) + (onset_idx_in_trial - bin_samples)
+
+    if onset_oe is None:
         # Fallback: use trigger wall-clock time to find nearest block by
         # ts_background_emitted (background-thread wall-clock ms).
         tw = getattr(trial, 'trigger_wall_time_ms', 0)
@@ -769,6 +837,7 @@ def print_hrs2_summary(header, trials, emg_blocks, file_path: str = "") -> None:
         4: "v4: + stim_adc_data",
         5: "v5: + background_emg_mean + background_bins",
         6: "v6: + stim_polarity_reversed",
+        7: "v7: + digital_onset_sample_num/channel",
     }
     fv_desc = fv_descs.get(header.file_version, f"v{header.file_version}")
 
@@ -788,7 +857,14 @@ def print_hrs2_summary(header, trials, emg_blocks, file_path: str = "") -> None:
         n_normal   = sum(1 for t in trials if getattr(t, 'stim_polarity_reversed', 0) == 0)
         n_reversed = sum(1 for t in trials if getattr(t, 'stim_polarity_reversed', 0) == 1)
         print(f"  Stim polarity:      {n_normal} normal, {n_reversed} reversed"
-              + ("  ← dual-polarity session" if n_reversed > 0 else ""))
+              + ("  <-- dual-polarity session" if n_reversed > 0 else ""))
+
+    if header.file_version >= 7 and trials:
+        n_dig = sum(1 for t in trials if getattr(t, 'digital_onset_sample_num', -1) >= 0)
+        print(f"  Digital onsets:     {n_dig}/{len(trials)} trials have digital onset"
+              + ("  <-- all digital" if n_dig == len(trials) else
+                 "  <-- partial - some trials missing digital event" if n_dig > 0 else
+                 "  <-- none detected"))
 
     if len(emg_blocks) > 0:
         b0 = emg_blocks[0]
@@ -1562,7 +1638,8 @@ def plot_hrs2_analysis(trials, header,
                        n_per_page: int = 6,
                        m_start_ms: float = 2.0, m_end_ms: float = 4.0,
                        h_start_ms: float = 6.0, h_end_ms: float = 10.0,
-                       sample_rate: float = SAMPLE_RATE):
+                       sample_rate: float = SAMPLE_RATE,
+                       fig_width: float = 15.0, fig_height: float = 7.0):
     """Interactive averaged-waveform paged grid + zoom + recruitment curve.
 
     Each page shows ``n_per_page`` panels, one per stimulation amplitude, with raw
@@ -1668,6 +1745,7 @@ def plot_hrs2_analysis(trials, header,
     _show_sigs = {'val': set()}
     _ylim_auto = {'val': True}
     _ylim_man  = {'lo': -1000.0, 'hi': 1500.0}
+    _figsize   = {'w': fig_width, 'h': fig_height}
 
     def _get_ylim():
         if _ylim_auto['val']:
@@ -1689,7 +1767,6 @@ def plot_hrs2_analysis(trials, header,
         fsz = 8   if small else 11
         t   = d['t_ref']
         end_ms = d['mean_stim_end']
-        _text_off = 150 if small else 220
         sigs = _show_sigs['val']
 
         ax.axhline(0, color='black', linewidth=2.0, linestyle='-', alpha=1.0, zorder=3)
@@ -1747,25 +1824,24 @@ def plot_hrs2_analysis(trials, header,
         ax.axvline(h_start_ms, color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
         ax.axvline(h_end_ms,   color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
 
-        m_t, m_a = d['m_peak_time'], d['m_peak_amp']
-        h_t, h_a = d['h_peak_time'], d['h_peak_amp']
-        m_bip = d.get('m_peak_bip', m_a)
-        h_bip = d.get('h_peak_bip', h_a)
-        _msize = 8 if small else 14
-        ax.axvline(m_t, color='blue',  linestyle=':', linewidth=lw * 1.2,
-                   label=f'M-MRA: {m_a:.1f} uV')
-        ax.axvline(h_t, color='green', linestyle=':', linewidth=lw * 1.2,
-                   label=f'H-MRA: {h_a:.1f} uV')
-        ax.plot(m_t, m_bip, '*', color='blue',  markersize=_msize, zorder=6,
-                markeredgecolor='darkblue', markeredgewidth=0.5)
-        ax.plot(h_t, h_bip, '*', color='green', markersize=_msize, zorder=6,
-                markeredgecolor='darkgreen', markeredgewidth=0.5)
-        if not np.isnan(m_bip):
-            ax.text(m_t, m_bip + _text_off, f'{m_a:.1f} uV',
-                    color='blue', fontsize=fsz - 1, ha='center')
-        if not np.isnan(h_bip):
-            ax.text(h_t, h_bip + _text_off, f'{h_a:.1f} uV',
-                    color='green', fontsize=fsz - 1, ha='center')
+        m_a = abs(d['m_peak_amp'])
+        h_a = abs(d['h_peak_amp'])
+        if not np.isnan(m_a):
+            ax.hlines(m_a, m_start_ms, m_end_ms, colors='blue', linestyles='dotted',
+                      linewidth=lw * 2.5, zorder=5, label=f'M-MRA: {m_a:.1f} uV')
+            ax.text((m_start_ms + m_end_ms) / 2, 0.93, f'M: {m_a:.1f} uV',
+                    transform=ax.get_xaxis_transform(),
+                    color='blue', fontsize=fsz - 1, ha='center', va='top',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='blue', alpha=0.85),
+                    zorder=8)
+        if not np.isnan(h_a):
+            ax.hlines(h_a, h_start_ms, h_end_ms, colors='green', linestyles='dotted',
+                      linewidth=lw * 2.5, zorder=5, label=f'H-MRA: {h_a:.1f} uV')
+            ax.text((h_start_ms + h_end_ms) / 2, 0.93, f'H: {h_a:.1f} uV',
+                    transform=ax.get_xaxis_transform(),
+                    color='darkgreen', fontsize=fsz - 1, ha='center', va='top',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
+                    zorder=8)
 
         ax.set_xlim(-pre_avg_ms, post_avg_ms)
         ax.set_ylim(_get_ylim())
@@ -1813,7 +1889,7 @@ def plot_hrs2_analysis(trials, header,
             if _amp_drop.options:
                 _amp_drop.value = _amp_drop.options[0][1]
 
-            fig, axs  = plt.subplots(2, 3, figsize=(15, 7))
+            fig, axs  = plt.subplots(2, 3, figsize=(_figsize['w'], _figsize['h']))
             _axs_flat = axs.flatten()
 
             for j in range(n_per_page):
@@ -1859,7 +1935,7 @@ def plot_hrs2_analysis(trials, header,
         d = _vst['amp_data'][amp_idx]
         with _out:
             _out.clear_output(wait=True)
-            fig, ax = plt.subplots(figsize=(13, 5))
+            fig, ax = plt.subplots(figsize=(_figsize['w'] * 13/15, _figsize['h'] * 5/7))
             _draw_avg_panel(ax, d, small=False)
             ax.set_title(
                 f"Averaged Waveforms (n={d['n']}) | Stim Amp: {d['amp']:.2f} mA | "
@@ -1925,6 +2001,14 @@ def plot_hrs2_analysis(trials, header,
         if not _ylim_auto['val']:
             _refresh()
 
+    def _on_figw_change(change):
+        _figsize['w'] = float(change['new'])
+        _refresh()
+
+    def _on_figh_change(change):
+        _figsize['h'] = float(change['new'])
+        _refresh()
+
     _prev_btn  = Button(description='Prev',           button_style='')
     _next_btn  = Button(description='Next',           button_style='primary')
     _page_drop = Dropdown(
@@ -1953,6 +2037,10 @@ def plot_hrs2_analysis(trials, header,
                           disabled=True, layout={'width': '145px'})
     _ymax_box = FloatText(value=1500.0,  description='Y max:',
                           disabled=True, layout={'width': '145px'})
+    _figw_box = FloatText(value=fig_width,  description='Fig W:',
+                          layout={'width': '130px'})
+    _figh_box = FloatText(value=fig_height, description='Fig H:',
+                          layout={'width': '130px'})
 
     _prev_btn.on_click(_on_prev)
     _next_btn.on_click(_on_next)
@@ -1966,6 +2054,8 @@ def plot_hrs2_analysis(trials, header,
     _auto_toggle.observe(_on_auto_toggle, names='value')
     _ymin_box.observe(_on_ymin_change, names='value')
     _ymax_box.observe(_on_ymax_change, names='value')
+    _figw_box.observe(_on_figw_change, names='value')
+    _figh_box.observe(_on_figh_change, names='value')
 
     # ── polarity toggle (dual-polarity sessions only) ──────────────────────
     _top_rows = []
@@ -2002,6 +2092,8 @@ def plot_hrs2_analysis(trials, header,
         ]),
         Label('   '),
         VBox([_auto_toggle, _ymin_box, _ymax_box]),
+        Label('   '),
+        VBox([HTML('<b>Figure size:</b>'), _figw_box, _figh_box]),
     ])
 
     _pol_note = (f"  — dual-polarity session: {len(_pol_split[0])} normal, "
@@ -2072,7 +2164,7 @@ def plot_hrs2_analysis(trials, header,
             _rc_out.clear_output(wait=True)
 
             # normalized recruitment curve
-            fig, ax = plt.subplots(figsize=(10, 6))
+            fig, ax = plt.subplots(figsize=(_figsize['w'] * 10/15, _figsize['h']))
             ax.errorbar(_nc, _norm_m, yerr=_norm_m_std, fmt='o-', color='blue',
                         label='M-wave (% Mmax) ± STD', capsize=3)
             ax.errorbar(_nc, _norm_h, yerr=_norm_h_std, fmt='o-', color='green',
@@ -2097,7 +2189,7 @@ def plot_hrs2_analysis(trials, header,
             plt.show()
 
             # raw (mA) recruitment curve
-            fig, ax = plt.subplots(figsize=(10, 6))
+            fig, ax = plt.subplots(figsize=(_figsize['w'] * 10/15, _figsize['h']))
             ax.errorbar(_sa, _d['m_means'], yerr=_d['m_stds'],
                         fmt='o-', color='blue',  label='M-wave mean ± STD', capsize=3)
             ax.errorbar(_sa, _d['h_means'], yerr=_d['h_stds'],
@@ -2132,7 +2224,8 @@ def plot_hrs2_trials(trials, header,
                      n_per_page: int = 6,
                      m_start_ms: float = 2.0, m_end_ms: float = 4.0,
                      h_start_ms: float = 6.0, h_end_ms: float = 10.0,
-                     sample_rate: float = SAMPLE_RATE):
+                     sample_rate: float = SAMPLE_RATE,
+                     fig_width: float = 15.0, fig_height: float = 7.0):
     """Interactive per-trial paged grid + zoom viewer.
 
     Each page shows ``n_per_page`` panels, one per individual trial, with the
@@ -2184,6 +2277,7 @@ def plot_hrs2_trials(trials, header,
     _show_sigs = {'val': set()}
     _ylim_auto = {'val': True}
     _ylim_man  = {'lo': -1000.0, 'hi': 1500.0}
+    _figsize   = {'w': fig_width, 'h': fig_height}
     _abs_emg   = {'val': False}
     _view_mode = {'val': 'all'}   # 'all' | 'stim'
     _upd_amp   = {'val': False}   # guard against observe re-entrancy
@@ -2239,6 +2333,27 @@ def plot_hrs2_trials(trials, header,
         ax.axvline(h_start_ms, color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
         ax.axvline(h_end_ms,   color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
 
+        _mm = (t >= m_start_ms) & (t <= m_end_ms)
+        _hm = (t >= h_start_ms) & (t <= h_end_ms)
+        _m_mra = float(np.nanmean(np.abs(emg[_mm]))) if _mm.any() else float('nan')
+        _h_mra = float(np.nanmean(np.abs(emg[_hm]))) if _hm.any() else float('nan')
+        if not np.isnan(_m_mra):
+            ax.hlines(_m_mra, m_start_ms, m_end_ms, colors='blue', linestyles='dotted',
+                      linewidth=lw * 2.5, zorder=5)
+            ax.text((m_start_ms + m_end_ms) / 2, 0.93, f'M: {_m_mra:.1f} uV',
+                    transform=ax.get_xaxis_transform(),
+                    color='blue', fontsize=fsz - 1, ha='center', va='top',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='blue', alpha=0.85),
+                    zorder=8)
+        if not np.isnan(_h_mra):
+            ax.hlines(_h_mra, h_start_ms, h_end_ms, colors='green', linestyles='dotted',
+                      linewidth=lw * 2.5, zorder=5)
+            ax.text((h_start_ms + h_end_ms) / 2, 0.93, f'H: {_h_mra:.1f} uV',
+                    transform=ax.get_xaxis_transform(),
+                    color='darkgreen', fontsize=fsz - 1, ha='center', va='top',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
+                    zorder=8)
+
         ax.set_xlim(-pre_plot_ms, post_plot_ms)
         ax.set_ylim(_get_ylim())
         if _ax2 is not None:
@@ -2293,7 +2408,7 @@ def plot_hrs2_trials(trials, header,
             if _trial_drop.options:
                 _trial_drop.value = _trial_drop.options[0][1]
 
-            fig, axs  = plt.subplots(2, 3, figsize=(15, 7))
+            fig, axs  = plt.subplots(2, 3, figsize=(_figsize['w'], _figsize['h']))
             _axs_flat = axs.flatten()
 
             for j in range(n_per_page):
@@ -2339,7 +2454,7 @@ def plot_hrs2_trials(trials, header,
         d = _vst_t['trial_data'][trial_idx]
         with _out:
             _out.clear_output(wait=True)
-            fig, ax = plt.subplots(figsize=(13, 5))
+            fig, ax = plt.subplots(figsize=(_figsize['w'] * 13/15, _figsize['h'] * 5/7))
             _draw_trial_panel(ax, d, small=False)
             ax.set_title(
                 f"Trial {d['idx']+1}  |  Stim = {d['amp']:.2f} mA  |  "
@@ -2430,6 +2545,14 @@ def plot_hrs2_trials(trials, header,
         if not _ylim_auto['val']:
             _refresh()
 
+    def _on_figw_change(change):
+        _figsize['w'] = float(change['new'])
+        _refresh()
+
+    def _on_figh_change(change):
+        _figsize['h'] = float(change['new'])
+        _refresh()
+
     _has_stim_adc = any(d['stim_adc'] is not None for d in _vst_t['trial_data'])
 
     _prev_btn  = Button(description='Prev',       button_style='')
@@ -2481,6 +2604,10 @@ def plot_hrs2_trials(trials, header,
                           disabled=True, layout={'width': '145px'})
     _ymax_box = FloatText(value=1500.0,  description='Y max:',
                           disabled=True, layout={'width': '145px'})
+    _figw_box = FloatText(value=fig_width,  description='Fig W:',
+                          layout={'width': '130px'})
+    _figh_box = FloatText(value=fig_height, description='Fig H:',
+                          layout={'width': '130px'})
 
     _prev_btn.on_click(_on_prev)
     _next_btn.on_click(_on_next)
@@ -2494,6 +2621,8 @@ def plot_hrs2_trials(trials, header,
     _auto_toggle.observe(_on_auto_toggle, names='value')
     _ymin_box.observe(_on_ymin_change, names='value')
     _ymax_box.observe(_on_ymax_change, names='value')
+    _figw_box.observe(_on_figw_change, names='value')
+    _figh_box.observe(_on_figh_change, names='value')
 
     _nav_row = HBox([_prev_btn, _next_btn, _page_drop,
                      Label('  '), _trial_drop, _view_btn])
@@ -2506,6 +2635,8 @@ def plot_hrs2_trials(trials, header,
         ]),
         Label('   '),
         VBox([_auto_toggle, _ymin_box, _ymax_box]),
+        Label('   '),
+        VBox([HTML('<b>Figure size:</b>'), _figw_box, _figh_box]),
     ])
 
     # ── polarity toggle (dual-polarity sessions only) ──────────────────────
@@ -5040,19 +5171,30 @@ def classify_trials(trials, file_version=0,
         has_sync = len(tr.sync_data) > 1
         rec = {'idx': i, 'amp_ma': tr.stimulation_amplitude_ma, 'has_sync': has_sync}
 
+        dig_oe = getattr(tr, 'digital_onset_sample_num', -1)
+        if dig_oe is None:
+            dig_oe = -1
+        dig_ch = getattr(tr, 'digital_onset_channel', -1)
+        has_digital = dig_oe >= 0
+
         if not has_sync:
-            rec.update(onset_found=False, onset_idx=bin_samples,
+            rec.update(onset_found=has_digital, onset_idx=bin_samples,
                        adc_peak=float('nan'), adc_noise_std=float('nan'),
                        stim_end_ms=None, stim_duration_ms=0.0,
                        n_pre_trigger_frames_discarded=0,
                        first_post_trigger_frame_sample_id=0,
-                       failed=True)
+                       digital_onset=dig_oe, digital_ch=dig_ch,
+                       failed=not has_digital)
             results.append(rec)
             continue
 
         if file_version >= 2:
-            onset_found = bool(tr.onset_detected)
-            onset_idx   = tr.onset_sample_index if onset_found else bin_samples
+            # onset_detected: 0=none, 1=ADC, 2=digital DIGITAL IN.
+            # onset_sample_index is correctly set by the app for both 1 and 2.
+            onset_found = bool(tr.onset_detected) or has_digital
+            onset_idx   = (tr.onset_sample_index
+                           if (bool(tr.onset_detected) and tr.onset_sample_index >= 0)
+                           else bin_samples)
             adc_peak    = float(tr.sync_peak_voltage)
             stim_end_ms = (float(tr.stim_duration_ms)
                            if tr.stim_end_sample_index >= 0 else None)
@@ -5069,7 +5211,7 @@ def classify_trials(trials, file_version=0,
                 onset_found = True
             else:
                 onset_idx   = bin_samples
-                onset_found = False
+                onset_found = has_digital
             adc_peak    = float(window.max()) if len(window) > 0 else float('nan')
             stim_end_ms = None
             stim_dur_ms = 0.0
@@ -5090,6 +5232,7 @@ def classify_trials(trials, file_version=0,
                    stim_end_ms=stim_end_ms, stim_duration_ms=stim_dur_ms,
                    n_pre_trigger_frames_discarded=n_disc,
                    first_post_trigger_frame_sample_id=first_sid,
+                   digital_onset=dig_oe, digital_ch=dig_ch,
                    failed=not onset_found)
         results.append(rec)
     return results
@@ -5256,10 +5399,8 @@ def detect_and_correct_failed_trials(hrs2_trials, hrs2_header, hrs2_emg_blocks,
         # -- Primary: pulse-count approach (bidirectional, pre/post onset) --
         delay_ms_count = None
         if trial_n < len(all_pulse_oe):
-            first_id = getattr(tr, 'first_post_trigger_frame_sample_id', 0)
-            osi      = getattr(tr, 'onset_sample_index', -1)
-            if first_id > 0 and osi >= 0:
-                onset_oe = int(first_id) + (osi - _bin_s)
+            onset_oe = _trial_onset_oe(tr, _bin_s)
+            if onset_oe is not None:
                 pulse_oe = all_pulse_oe[trial_n]
                 delay_ms_count = (pulse_oe - onset_oe) / _sr * 1000.0
 
@@ -5288,8 +5429,10 @@ def detect_and_correct_failed_trials(hrs2_trials, hrs2_header, hrs2_emg_blocks,
             _delay_samp = int(round(delay_ms * _sr / 1000.0))
             _td = np.array(tr.trial_data)
 
-            if getattr(tr, 'onset_detected', 0) == 1 and getattr(tr, 'onset_sample_index', -1) >= 0:
-                _align_i = int(tr.onset_sample_index)
+            _od  = getattr(tr, 'onset_detected', 0)
+            _osi = getattr(tr, 'onset_sample_index', -1)
+            if _od >= 1 and _osi >= 0:
+                _align_i = int(_osi)
             elif len(tr.sync_data) > 1:
                 _align_i = detect_stim_onset(tr.sync_data, _bin_s)
             else:
