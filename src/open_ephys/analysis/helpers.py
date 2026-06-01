@@ -1853,7 +1853,7 @@ def plot_hrs2_analysis(trials, header,
                 _y2_span = _y2_hi - _y2_lo
                 _ax2.set_ylim(-_zero_frac * _y2_span,
                               (1.0 - _zero_frac) * _y2_span)
-        ax.set_xlabel('Time re: onset (ms)', fontsize=fsz)
+        ax.set_xlabel('Time (ms)', fontsize=fsz)
         ax.set_ylabel('EMG (uV)', fontsize=fsz)
         ax.tick_params(labelsize=fsz - 1)
         ax.tick_params(axis='x', width=2.0)
@@ -2365,7 +2365,7 @@ def plot_hrs2_trials(trials, header,
                 _ax2.set_ylim(-_zero_frac * _y2_span,
                               (1.0 - _zero_frac) * _y2_span)
 
-        ax.set_xlabel('Time re: onset (ms)', fontsize=fsz)
+        ax.set_xlabel('Time (ms)', fontsize=fsz)
         ax.set_ylabel('EMG (uV)', fontsize=fsz)
         ax.tick_params(labelsize=fsz - 1)
         ax.tick_params(axis='x', width=2.0)
@@ -2481,6 +2481,7 @@ def plot_hrs2_trials(trials, header,
             _upd_amp['val'] = True
             _stim_amp_drop.options = ([(f'{a:.2f} mA', a) for a in _pol_amps]
                                       if _pol_amps else [('—', None)])
+            _stim_amp_drop.disabled = not bool(_pol_amps)
             if _stim_amp_drop.value not in _pol_amps and _pol_amps:
                 _stim_amp_drop.value = _pol_amps[0]
             _upd_amp['val'] = False
@@ -2488,6 +2489,8 @@ def plot_hrs2_trials(trials, header,
             if tgt is not None:
                 pol_trs = [t for t in pol_trs
                            if round(t.stimulation_amplitude_ma, 2) == tgt]
+        else:
+            _stim_amp_drop.disabled = True
         _vst_t['trial_data'] = _build_trial_data(pol_trs)
         _vst_t['pages'] = [_vst_t['trial_data'][i:i + n_per_page]
                            for i in range(0, max(len(_vst_t['trial_data']), 1), n_per_page)]
@@ -2578,7 +2581,7 @@ def plot_hrs2_trials(trials, header,
                              layout={'width': '300px'})
     _stim_amp_drop = Dropdown(
         options=[(f'{a:.2f} mA', a) for a in _all_amps_t],
-        description='Amplitude:', layout={'width': '210px', 'visibility': 'hidden'}
+        description='Amplitude:', layout={'width': '210px', 'display': 'none'}
     )
 
     def _on_abs_emg_t(change):
@@ -2588,7 +2591,8 @@ def plot_hrs2_trials(trials, header,
 
     def _on_view_mode_t(change):
         _view_mode['val'] = change['new']
-        _stim_amp_drop.layout.visibility = '' if change['new'] == 'stim' else 'hidden'
+        _stim_amp_drop.layout.display = 'flex' if change['new'] == 'stim' else 'none'
+        _stim_amp_drop.disabled = change['new'] != 'stim'
         _rebuild_trials()
 
     def _on_stim_amp_t(change):
