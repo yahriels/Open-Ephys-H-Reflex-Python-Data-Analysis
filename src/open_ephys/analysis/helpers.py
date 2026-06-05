@@ -1633,13 +1633,139 @@ def _apply_tiered_ticks(ax, axis: str = 'both'):
                     line.set_markeredgewidth(1.2)
 
 
+def plot_hwave_regression(trials, emg_blocks=None,
+                          m_start_ms: float = 2.0, m_end_ms: float = 4.0,
+                          h_start_ms: float = 6.0, h_end_ms: float = 10.0,
+                          sample_rate: float = SAMPLE_RATE,
+                          pre_ms: float = 2.0, post_ms: float = 15.0,
+                          monitoring_window_ms: float = 2500.0,
+                          bin_duration_ms: float = BIN_DURATION_MS,
+                          title_suffix: str = ''):
+    """Two-panel H-wave regression plot for a trial subset.
+
+    Panel 1 — scatter + OLS regression: H-wave MRA (per trial) vs pre-stim
+              background EMG grand mean.
+    Panel 2 — scatter + OLS regression: H-wave MRA vs M-wave MRA (per trial).
+    """
+    from scipy import stats as _stats
+    import matplotlib.pyplot as plt
+
+    if not trials:
+        print("No trials for regression.")
+        return
+
+    _ms_ps = 1000.0 / sample_rate
+    _bin_s = int(BIN_DURATION_MS * sample_rate / 1000)
+    _rec_s = int(TRIAL_RECORD_MS  * sample_rate / 1000)
+
+    # ── per-trial H-wave MRA ──────────────────────────────────────────────
+    h_mra = []
+    for _tr in trials:
+        _t, _emg, _, _, _ = get_trial_window(
+            _tr, pre_ms, post_ms,
+            ms_per_sample=_ms_ps, bin_samples=_bin_s, record_samples=_rec_s)
+        _hm = (_t >= h_start_ms) & (_t <= h_end_ms)
+        h_mra.append(float(np.nanmean(np.abs(_emg[_hm]))) if _hm.any() else float('nan'))
+
+    # ── per-trial M-wave MRA ──────────────────────────────────────────────
+    m_mra = []
+    for _tr in trials:
+        _t, _emg, _, _, _ = get_trial_window(
+            _tr, pre_ms, post_ms,
+            ms_per_sample=_ms_ps, bin_samples=_bin_s, record_samples=_rec_s)
+        _mm = (_t >= m_start_ms) & (_t <= m_end_ms)
+        m_mra.append(float(np.nanmean(np.abs(_emg[_mm]))) if _mm.any() else float('nan'))
+
+    # ── per-trial background bins and grand mean ──────────────────────────
+    bins_list = []
+    bg_means  = []
+    for _tr in trials:
+        _sb = getattr(_tr, 'background_bins', None)
+        _gm = getattr(_tr, 'background_emg_mean', None)
+        if _sb is not None and len(_sb) > 0:
+            _b  = np.asarray(_sb, dtype=float)
+            _gm = float(_gm) if _gm is not None else float(np.mean(_b))
+        elif emg_blocks is not None:
+            _b, _gm = compute_background_bins(
+                _tr, emg_blocks,
+                monitoring_window_ms=monitoring_window_ms,
+                sample_rate=sample_rate)
+        else:
+            _b, _gm = None, float('nan')
+        bins_list.append(_b)
+        bg_means.append(_gm if _gm is not None else float('nan'))
+
+    # ── filter to valid trials ────────────────────────────────────────────
+    _valid = [(i, h_mra[i], bg_means[i])
+              for i in range(len(trials))
+              if not np.isnan(h_mra[i]) and not np.isnan(bg_means[i])]
+    if len(_valid) < 3:
+        print(f"Not enough valid trials for regression (need ≥ 3, got {len(_valid)}).")
+        return
+
+    h_arr  = np.array([v[1] for v in _valid])
+    bg_arr = np.array([v[2] for v in _valid])
+
+    # ── Panel 1: scatter + linear regression ─────────────────────────────
+    _sl, _ic, _r, _p, _ = _stats.linregress(bg_arr, h_arr)
+    _r2    = _r ** 2
+    _xfit  = np.linspace(float(bg_arr.min()), float(bg_arr.max()), 200)
+    _yfit  = _sl * _xfit + _ic
+
+    # ── Panel 2: H-wave MRA vs M-wave MRA linear regression ──────────────
+    _valid_mh = [(m_mra[i], h_mra[i])
+                 for i in range(len(trials))
+                 if not np.isnan(h_mra[i]) and not np.isnan(m_mra[i])]
+
+    # ── figure ────────────────────────────────────────────────────────────
+    _sfx = f'  —  {title_suffix}' if title_suffix else ''
+    _fig, (_ax1, _ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    _ax1.scatter(bg_arr, h_arr, color='steelblue', alpha=0.75, s=55, zorder=3,
+                 label=f'n = {len(_valid)} trials')
+    _ax1.plot(_xfit, _yfit, color='crimson', linewidth=2.0,
+              label=f'y = {_sl:.2f}x + {_ic:.2f}\nR² = {_r2:.3f},  p = {_p:.3g}')
+    _ax1.set_xlabel('Pre-stim background EMG (µV)', fontsize=12)
+    _ax1.set_ylabel('H-wave MRA (µV)', fontsize=12)
+    _ax1.set_title(f'H-wave vs Background EMG{_sfx}', fontsize=13)
+    _ax1.legend(fontsize=10)
+    _ax1.grid(True, alpha=0.3)
+
+    if len(_valid_mh) >= 3:
+        _m_arr  = np.array([v[0] for v in _valid_mh])
+        _h_arr2 = np.array([v[1] for v in _valid_mh])
+        _sl2, _ic2, _r2v, _p2, _ = _stats.linregress(_m_arr, _h_arr2)
+        _r2_mh  = _r2v ** 2
+        _xfit2  = np.linspace(float(_m_arr.min()), float(_m_arr.max()), 200)
+        _yfit2  = _sl2 * _xfit2 + _ic2
+        _ax2.scatter(_m_arr, _h_arr2, color='steelblue', alpha=0.75, s=55, zorder=3,
+                     label=f'n = {len(_valid_mh)} trials')
+        _ax2.plot(_xfit2, _yfit2, color='crimson', linewidth=2.0,
+                  label=f'y = {_sl2:.2f}x + {_ic2:.2f}\nR² = {_r2_mh:.3f},  p = {_p2:.3g}')
+        _ax2.set_xlabel('M-wave MRA (µV)', fontsize=12)
+        _ax2.set_ylabel('H-wave MRA (µV)', fontsize=12)
+        _ax2.set_title(f'H-wave vs M-wave MRA{_sfx}', fontsize=13)
+        _ax2.legend(fontsize=10)
+        _ax2.grid(True, alpha=0.3)
+    else:
+        _ax2.text(0.5, 0.5, 'Not enough valid trials for\nH vs M regression',
+                  ha='center', va='center', transform=_ax2.transAxes, fontsize=11)
+        _ax2.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+    print(f"  Regression (n={len(_valid)}):  "
+          f"slope={_sl:.4f}  intercept={_ic:.2f}  R²={_r2:.4f}  p={_p:.4g}")
+
+
 def plot_hrs2_analysis(trials, header,
                        pre_avg_ms: float = 2.0, post_avg_ms: float = 15.0,
                        n_per_page: int = 6,
                        m_start_ms: float = 2.0, m_end_ms: float = 4.0,
                        h_start_ms: float = 6.0, h_end_ms: float = 10.0,
                        sample_rate: float = SAMPLE_RATE,
-                       fig_width: float = 15.0, fig_height: float = 7.0):
+                       fig_width: float = 15.0, fig_height: float = 7.0,
+                       emg_blocks=None, monitoring_window_ms: float = 2500.0):
     """Interactive averaged-waveform paged grid + zoom + recruitment curve.
 
     Each page shows ``n_per_page`` panels, one per stimulation amplitude, with raw
@@ -1684,8 +1810,10 @@ def plot_hrs2_analysis(trials, header,
 
     def _build_amp_data(trial_list):
         _groups = defaultdict(list)
+        _trial_groups = defaultdict(list)
         for _trial in trial_list:
             _key = round(_trial.stimulation_amplitude_ma, 2)
+            _trial_groups[_key].append(_trial)
             _t_win, _bip_win, _adc_win, _stim_end, _stim_adc_win = get_trial_window(
                 _trial, pre_avg_ms, post_avg_ms, ms_per_sample=_ms_ps,
                 bin_samples=_bin_s, record_samples=_rec_s)
@@ -1734,6 +1862,7 @@ def plot_hrs2_analysis(trials, header,
                 'padded_abs_uni': _pau, 'avg_abs_uni': _avg_au,
                 'm_peak_time': _m_t, 'm_peak_amp': _m_a, 'm_peak_bip': _m_bip,
                 'h_peak_time': _h_t, 'h_peak_amp': _h_a, 'h_peak_bip': _h_bip,
+                'trials': _trial_groups[_amp],
             })
         return _adata
 
@@ -1842,6 +1971,35 @@ def plot_hrs2_analysis(trials, header,
                     color='darkgreen', fontsize=fsz - 1, ha='center', va='top',
                     bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
                     zorder=8)
+
+        # ── stim pulse peak-to-peak annotation ───────────────────────────
+        _sa_avg = d.get('avg_stim_adc')
+        if _sa_avg is not None and len(_sa_avg) > 0:
+            _stm = (t >= 0) & (t <= end_ms)
+            if _stm.sum() >= 2:
+                _seg = _sa_avg[_stm]
+                _seg = _seg[~np.isnan(_seg)]
+                if len(_seg) >= 2:
+                    _ptp = float(np.max(_seg) - np.min(_seg))
+                    ax.text(0.01, 0.01, f'Stim P2P: {_ptp:.3f} V',
+                            transform=ax.transAxes, color='magenta',
+                            fontsize=fsz - 1, ha='left', va='bottom',
+                            bbox=dict(boxstyle='round,pad=0.2', fc='white',
+                                      ec='magenta', alpha=0.85),
+                            zorder=8)
+
+        # ── pre-stim EMG activity annotation ─────────────────────────────
+        _pre_mask = t < 0
+        if _pre_mask.sum() >= 2:
+            _pre_abs = d['padded_abs_bip'][:, _pre_mask]
+            _pre_emg = float(np.nanmean(_pre_abs))
+            if not np.isnan(_pre_emg):
+                ax.text(0.99, 0.01, f'Pre-stim EMG: {_pre_emg:.1f} µV',
+                        transform=ax.transAxes, color='dimgray',
+                        fontsize=fsz - 1, ha='right', va='bottom',
+                        bbox=dict(boxstyle='round,pad=0.2', fc='white',
+                                  ec='dimgray', alpha=0.85),
+                        zorder=8)
 
         ax.set_xlim(-pre_avg_ms, post_avg_ms)
         ax.set_ylim(_get_ylim())
@@ -2218,6 +2376,63 @@ def plot_hrs2_analysis(trials, header,
     display(_rc_out)
     _draw_rc_curves(_active_pol['val'])
 
+    # ── linked background EMG: updates on amplitude selection or polarity change ──
+    if emg_blocks is not None:
+        _bg_out_a = Output()
+
+        def _render_bg_a(trial_subset):
+            with _bg_out_a:
+                _bg_out_a.clear_output(wait=True)
+                if trial_subset:
+                    plot_background_emg_views(
+                        trial_subset, emg_blocks,
+                        monitoring_window_ms=monitoring_window_ms,
+                        sample_rate=sample_rate)
+
+        def _on_amp_bg(change):
+            if change['new'] is not None:
+                _idx = change['new']
+                if 0 <= _idx < len(_vst['amp_data']):
+                    _render_bg_a(_vst['amp_data'][_idx]['trials'])
+
+        _amp_drop.observe(_on_amp_bg, names='value')
+        _pol_change_hooks.append(lambda _pk: _render_bg_a(_pol_split[_pk]))
+
+        display(HTML('<hr><b>Background EMG — selected amplitude / polarity group</b>'))
+        display(_bg_out_a)
+        if _vst['amp_data']:
+            _render_bg_a(_vst['amp_data'][0]['trials'])
+
+    # ── linked H-wave regression ──────────────────────────────────────────
+    if emg_blocks is not None:
+        _reg_out_a = Output()
+
+        def _render_reg_a(trial_subset):
+            with _reg_out_a:
+                _reg_out_a.clear_output(wait=True)
+                if trial_subset:
+                    plot_hwave_regression(
+                        trial_subset, emg_blocks,
+                        m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+                        h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+                        sample_rate=sample_rate,
+                        pre_ms=pre_avg_ms, post_ms=post_avg_ms,
+                        monitoring_window_ms=monitoring_window_ms)
+
+        def _on_amp_reg(change):
+            if change['new'] is not None:
+                _idx = change['new']
+                if 0 <= _idx < len(_vst['amp_data']):
+                    _render_reg_a(_vst['amp_data'][_idx]['trials'])
+
+        _amp_drop.observe(_on_amp_reg, names='value')
+        _pol_change_hooks.append(lambda _pk: _render_reg_a(_pol_split[_pk]))
+
+        display(HTML('<hr><b>H-wave Regression — selected amplitude / polarity group</b>'))
+        display(_reg_out_a)
+        if _vst['amp_data']:
+            _render_reg_a(_vst['amp_data'][0]['trials'])
+
 
 def plot_hrs2_trials(trials, header,
                      pre_plot_ms: float = 2.0, post_plot_ms: float = 15.0,
@@ -2225,7 +2440,8 @@ def plot_hrs2_trials(trials, header,
                      m_start_ms: float = 2.0, m_end_ms: float = 4.0,
                      h_start_ms: float = 6.0, h_end_ms: float = 10.0,
                      sample_rate: float = SAMPLE_RATE,
-                     fig_width: float = 15.0, fig_height: float = 7.0):
+                     fig_width: float = 15.0, fig_height: float = 7.0,
+                     emg_blocks=None, monitoring_window_ms: float = 2500.0):
     """Interactive per-trial paged grid + zoom viewer.
 
     Each page shows ``n_per_page`` panels, one per individual trial, with the
@@ -2354,6 +2570,35 @@ def plot_hrs2_trials(trials, header,
                     bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
                     zorder=8)
 
+        # ── stim pulse peak-to-peak annotation ───────────────────────────
+        _sa = d.get('stim_adc')
+        if _sa is not None and len(_sa) > 0:
+            _end = end_ms if end_ms is not None else 1.0
+            _stm = (t >= 0) & (t <= _end)
+            if _stm.sum() >= 2:
+                _seg = _sa[_stm]
+                _seg = _seg[~np.isnan(_seg)]
+                if len(_seg) >= 2:
+                    _ptp = float(np.max(_seg) - np.min(_seg))
+                    ax.text(0.01, 0.01, f'Stim P2P: {_ptp:.3f} V',
+                            transform=ax.transAxes, color='magenta',
+                            fontsize=fsz - 1, ha='left', va='bottom',
+                            bbox=dict(boxstyle='round,pad=0.2', fc='white',
+                                      ec='magenta', alpha=0.85),
+                            zorder=8)
+
+        # ── pre-stim EMG activity annotation ─────────────────────────────
+        _pre_mask = t < 0
+        if _pre_mask.sum() >= 2:
+            _pre_emg = float(np.nanmean(np.abs(d['emg'][_pre_mask])))
+            if not np.isnan(_pre_emg):
+                ax.text(0.99, 0.01, f'Pre-stim EMG: {_pre_emg:.1f} µV',
+                        transform=ax.transAxes, color='dimgray',
+                        fontsize=fsz - 1, ha='right', va='bottom',
+                        bbox=dict(boxstyle='round,pad=0.2', fc='white',
+                                  ec='dimgray', alpha=0.85),
+                        zorder=8)
+
         ax.set_xlim(-pre_plot_ms, post_plot_ms)
         ax.set_ylim(_get_ylim())
         if _ax2 is not None:
@@ -2473,6 +2718,7 @@ def plot_hrs2_trials(trials, header,
             display(_back_btn)
 
     _all_amps_t = sorted({round(tr.stimulation_amplitude_ma, 2) for tr in trials})
+    _rebuild_hooks_t = []
 
     def _rebuild_trials():
         pol_trs = list(_pol_split_t[_active_pol_t['val']])
@@ -2499,6 +2745,8 @@ def plot_hrs2_trials(trials, header,
         _page_drop.options = [(f'Page {i+1}', i) for i in range(len(_vst_t['pages']))]
         _page_drop.value = 0
         _plot_page(0)
+        for _hook in _rebuild_hooks_t:
+            _hook(pol_trs)
 
     def _on_prev(b):
         if _cur_page['idx'] > 0:
@@ -2671,6 +2919,64 @@ def plot_hrs2_trials(trials, header,
 
     display(VBox(_top_rows_t + [_view_row, _nav_row, _sig_row, _out]))
     _plot_page(0)
+
+    # ── linked background EMG: updates when group selection changes ────────
+    if emg_blocks is not None:
+        _bg_out_t = Output()
+
+        def _render_bg_t(trial_subset):
+            with _bg_out_t:
+                _bg_out_t.clear_output(wait=True)
+                if trial_subset:
+                    plot_background_emg_views(
+                        trial_subset, emg_blocks,
+                        monitoring_window_ms=monitoring_window_ms,
+                        sample_rate=sample_rate)
+
+        _rebuild_hooks_t.append(_render_bg_t)
+        display(HTML('<hr><b>Background EMG — selected group</b>'))
+        display(_bg_out_t)
+        _render_bg_t(list(_pol_split_t[_active_pol_t['val']]))
+
+    # ── linked H:M ratio summary: updates when group selection changes ─────
+    _hm_out_t = Output()
+
+    def _render_hm_t(trial_subset):
+        with _hm_out_t:
+            _hm_out_t.clear_output(wait=True)
+            if trial_subset:
+                _tbp = split_trials_by_polarity(trial_subset)
+                plot_hm_ratio_summary(
+                    _tbp, header,
+                    m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+                    h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+                    sample_rate=sample_rate,
+                    pre_ms=pre_plot_ms, post_ms=post_plot_ms)
+
+    _rebuild_hooks_t.append(_render_hm_t)
+    display(HTML('<hr><b>H:M Ratio Summary — selected group</b>'))
+    display(_hm_out_t)
+    _render_hm_t(list(_pol_split_t[_active_pol_t['val']]))
+
+    # ── linked H-wave regression ──────────────────────────────────────────
+    _reg_out_t = Output()
+
+    def _render_reg_t(trial_subset):
+        with _reg_out_t:
+            _reg_out_t.clear_output(wait=True)
+            if trial_subset:
+                plot_hwave_regression(
+                    trial_subset, emg_blocks,
+                    m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+                    h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+                    sample_rate=sample_rate,
+                    pre_ms=pre_plot_ms, post_ms=post_plot_ms,
+                    monitoring_window_ms=monitoring_window_ms)
+
+    _rebuild_hooks_t.append(_render_reg_t)
+    display(HTML('<hr><b>H-wave Regression — selected group</b>'))
+    display(_reg_out_t)
+    _render_reg_t(list(_pol_split_t[_active_pol_t['val']]))
 
 
 def analyze_global_background(trials, emg_blocks, header,
