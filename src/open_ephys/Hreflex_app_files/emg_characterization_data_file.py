@@ -47,7 +47,7 @@ class EmgCharacterizationHeader:
     def save_to_file (self, fid: BinaryIO) -> None:
 
         #Save the file version
-        FileIO_Helpers.write(fid, "int32", int(0))
+        FileIO_Helpers.write(fid, "int32", self.file_version)
 
         #Save the subject id
         FileIO_Helpers.write_string(fid, self.subject_id)
@@ -108,7 +108,12 @@ class EmgCharacterizationTrial:
     #So essentially: monitored signal = abs(EMG2 - EMG1)
     monitored_signal: list[float] = field(default_factory=list)
 
-    def read_from_file (self, fid: BinaryIO) -> None:
+    #The actual runtime initiation thresholds active when this trial was counted.
+    #Defaults match the class-level constants for files written before version 1.
+    actual_init_min_threshold: float = 0.0
+    actual_init_max_threshold: float = 0.0
+
+    def read_from_file (self, fid: BinaryIO, file_version: int = 0) -> None:
         self.trial_end_datetime = FileIO_Helpers.read_datetime(fid)
         self.trial_start_index = FileIO_Helpers.read(fid, "uint64")
         self.trial_start_open_ephys_millis = FileIO_Helpers.read(fid, "uint64")
@@ -116,6 +121,11 @@ class EmgCharacterizationTrial:
         self.grand_mean = FileIO_Helpers.read(fid, "float32")
         self.bins = FileIO_Helpers.read_array(fid, "float32")
         self.monitored_signal = FileIO_Helpers.read_array(fid, "float32")
+
+        #Per-trial runtime thresholds (added in file version 1)
+        if file_version >= 1:
+            self.actual_init_min_threshold = FileIO_Helpers.read(fid, "float32")
+            self.actual_init_max_threshold = FileIO_Helpers.read(fid, "float32")
 
     def save_to_file (self, fid: BinaryIO) -> None:
 
@@ -142,6 +152,10 @@ class EmgCharacterizationTrial:
 
         #Save the monitored signal
         FileIO_Helpers.write_array(fid, "float32", self.monitored_signal)
+
+        #Save the runtime initiation thresholds (file version 1+)
+        FileIO_Helpers.write(fid, "float32", self.actual_init_min_threshold)
+        FileIO_Helpers.write(fid, "float32", self.actual_init_max_threshold)
 
 ## This class holds the computed "trials per hour vs window size" curve and IS saved to the
 ## data file as a single block written at session end (block ID = EMG_TRIALS_PER_HOUR_BLOCK).
@@ -219,7 +233,7 @@ class EmgCharacterizationDataFile:
             block_id: int = struct.unpack(FileIO_Helpers.type_dictionary["int32"], chunk)[0]
             if (block_id == HReflexDataFileBlockIds.EMG_CHARACTERIZATION_TRIAL_BLOCK):
                 trial: EmgCharacterizationTrial = EmgCharacterizationTrial()
-                trial.read_from_file(fid)
+                trial.read_from_file(fid, self.header.file_version)
 
                 self.trials.append(trial)
             elif (block_id == HReflexDataFileBlockIds.EMG_DATA_BLOCK):

@@ -210,10 +210,10 @@ class EmgCharacterizationStage (Stage):
             #Get the mean of all the bins
             bin_grand_mean: float = np.mean(self._bins)
 
-            #If the bin grand mean is within a pre-specified min or max range, then
-            #we consider this a trial initiation.
+            #A trial is initiated only when every bin is above the lower bound
+            #AND the grand mean is below the upper bound.
             if ((self._current_trial_sample_count >= self._monitored_signal_sample_count) and
-                (bin_grand_mean >= self._init_min_threshold) and
+                (np.all(self._bins >= self._init_min_threshold)) and
                 (bin_grand_mean <= self._init_max_threshold)):
 
                 #A trial has been initiatied...
@@ -477,7 +477,7 @@ class EmgCharacterizationStage (Stage):
         if (self._fid is not None):
             #Create a header object
             header: EmgCharacterizationHeader = EmgCharacterizationHeader(
-                0,
+                1,
                 self._subject_id,
                 datetime.now(),
                 self.stage_name,
@@ -519,6 +519,8 @@ class EmgCharacterizationStage (Stage):
                 self._bins,
                 self._monitored_signal
             )
+            trial.actual_init_min_threshold = self._init_min_threshold
+            trial.actual_init_max_threshold = self._init_max_threshold
 
             #Save the trial object to the data file
             trial.save_to_file(self._fid)

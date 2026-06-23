@@ -8,6 +8,7 @@ import bisect
 from .open_ephys_streamer import OpenEphysStreamer
 from .open_ephys_streamer import OpenEphysDataBlock
 from .open_ephys_streamer import OpenEphysDataFrame
+from .open_ephys_streamer import OpenEphysDigitalEvent
 from .open_ephys_streamer import OPEN_EPHYS_EXPECTED_CHANNEL_COUNT
 
 class BackgroundWorkerSignals (QObject):
@@ -54,28 +55,41 @@ class BackgroundWorker (QRunnable):
         #Create a variable to hold a "frame" of data
         df: OpenEphysDataFrame = None
 
+        #Digital events received between frame emits are buffered here and
+        #attached to the next completed frame so the stage can use them for
+        #precise stim-onset alignment via the DIGITAL IN sample_num.
+        pending_digital_events: list = []
+
         #Iterate until the "should cancel" is set to True
         while (not self._should_cancel):
 
             #Process any messages to/from OpenEphys
-            result: OpenEphysDataBlock = self._open_ephys_streamer.callback()
+            result = self._open_ephys_streamer.callback()
 
-            #Check to see if any data was received
-            if (result is not None) and (result.data is not None):
+            #Digital event — buffer it; will be attached to the next frame
+            if isinstance(result, OpenEphysDigitalEvent):
+                pending_digital_events.append(result)
+
+            #Analog data block
+            elif (result is not None) and (result.data is not None):
 
                 #Check if a new dataframe should be created
                 if (df is None):# or ((df is not None) and (result.timestamp != df.timestamp)):
                     df = OpenEphysDataFrame(result.timestamp, result.sample_id, [], 0)
-                
+
                 #Insert this data block into the dataframe's list of blocks
                 #We maintain the list of blocks IN ORDER of index, so we INSERT IN ORDER
                 #For this reason, we use bisect.insort rather than list.append
-                #(The data blocks SHOULD come into our app already "in order", but it's not guaranteed, so 
+                #(The data blocks SHOULD come into our app already "in order", but it's not guaranteed, so
                 #it's useful to do this just to make sure)
                 bisect.insort(df.channel_data_blocks, result, key=lambda x: x.channel_index)
 
                 #Check if it is time to emit
                 if (len(df.channel_data_blocks) >= OPEN_EPHYS_EXPECTED_CHANNEL_COUNT):
+                    #Attach buffered digital events to this frame and reset the buffer
+                    df.digital_events = pending_digital_events
+                    pending_digital_events = []
+
                     #Emit the data
                     df.timestamp_emitted = int(math.floor(time.time() * 1000))
                     self.signals.data_received_signal.emit(df)

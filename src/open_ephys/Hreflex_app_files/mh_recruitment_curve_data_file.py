@@ -86,6 +86,11 @@ class MhRecruitmentCurveTrial:
         #Populated at runtime for display only — not persisted to the data file.
         self.unipolar_trial_data: np.ndarray = np.zeros(1, dtype=np.float32)
 
+        #Define a numpy array to hold the raw stimulation ADC waveform for this trial.
+        #Signed (not abs'd) so the full biphasic pulse shape is preserved.
+        #Populated in file format version 4+.
+        self.stim_adc_data: np.ndarray = np.zeros(1, dtype=np.float32)
+
         #Define a numpy array to hold the ADC sync line data for this trial
         #(used for precise stim-onset alignment; populated when file_version >= 1)
         self.sync_data: np.ndarray = np.zeros(1, dtype=np.float32)
@@ -124,6 +129,37 @@ class MhRecruitmentCurveTrial:
         #Use this to tune STIM_ONSET_THRESHOLD: if this value is consistently below
         #the threshold the pulse is not being captured.
         self.sync_peak_voltage: float = 0.0
+
+        #Background EMG grand mean (mean rectified abs-filtered EMG) from the monitoring
+        #window captured at the moment this trial's initiation criteria were met.
+        #Used to compute normalised H-reflex / M-wave size: (window_mra - bg) / bg.
+        self.background_emg_mean: float = 0.0
+
+        #Per-bin means from the background monitoring window (one value per 50 ms bin).
+        #Preserves the full bin-by-bin background profile for each trial.
+        self.background_bins: np.ndarray = np.zeros(0, dtype=np.float32)
+
+        #Software polarity toggle state at the moment the trigger was sent.
+        #0 = normal (toggle off, default state).
+        #1 = reversed (toggle on, +/- button was active).
+        #Physical cathodal/anodal direction depends on cable orientation and is not
+        #encoded here — document your electrode wiring separately.
+        #Added in file format version 6.
+        self.stim_polarity_reversed: int = 0
+
+        #Absolute Open Ephys sample counter (sample_num) from the DIGITAL IN rising-edge
+        #event that was used as the primary stim-onset reference for this trial.
+        #-1 means no digital event was captured and onset was determined by ADC fallback.
+        #Cross-reference with first_post_trigger_frame_sample_id to recompute onset_sample_index
+        #offline: onset_sample_index = digital_onset_sample_num - first_post_trigger_frame_sample_id + pre_stim_samples.
+        #Added in file format version 7.
+        self.digital_onset_sample_num: int = -1
+
+        #Digital input channel number (0-indexed, matching Open Ephys event_channel) from
+        #which the digital_onset_sample_num event was received.
+        #-1 when no digital event was used.
+        #Added in file format version 7.
+        self.digital_onset_channel: int = -1
 
         #Number of data frames that were received by the RECORD state but discarded
         #because their timestamp_emitted pre-dated the trigger call.  A non-zero value
@@ -188,6 +224,24 @@ class MhRecruitmentCurveTrial:
         if (file_version >= 3):
             self.unipolar_trial_data = np.array(FileIO_Helpers.read_array(fid, "float32"), dtype=np.float32)
 
+        #Read the stimulation ADC waveform (added in file format version 4)
+        if (file_version >= 4):
+            self.stim_adc_data = np.array(FileIO_Helpers.read_array(fid, "float32"), dtype=np.float32)
+
+        #Read per-trial background EMG mean and bins (added in file format version 5)
+        if (file_version >= 5):
+            self.background_emg_mean = FileIO_Helpers.read(fid, "float32")
+            self.background_bins = np.array(FileIO_Helpers.read_array(fid, "float32"), dtype=np.float32)
+
+        #Read stim polarity (added in file format version 6)
+        if (file_version >= 6):
+            self.stim_polarity_reversed = FileIO_Helpers.read(fid, "int8")
+
+        #Read digital onset fields (added in file format version 7)
+        if (file_version >= 7):
+            self.digital_onset_sample_num = FileIO_Helpers.read(fid, "int64")
+            self.digital_onset_channel = FileIO_Helpers.read(fid, "int32")
+
     def save_to_file (self, fid: BinaryIO) -> None:
         #Save a trial block indicator
         FileIO_Helpers.write(fid, "int32", int(1))
@@ -222,6 +276,20 @@ class MhRecruitmentCurveTrial:
 
         #Save the unipolar (non-differential) filtered trial data (file format version 3+)
         FileIO_Helpers.write_array(fid, "float32", self.unipolar_trial_data)
+
+        #Save the stimulation ADC waveform (file format version 4+)
+        FileIO_Helpers.write_array(fid, "float32", self.stim_adc_data)
+
+        #Save per-trial background EMG mean and bins (file format version 5+)
+        FileIO_Helpers.write(fid, "float32", self.background_emg_mean)
+        FileIO_Helpers.write_array(fid, "float32", self.background_bins)
+
+        #Save stim polarity (file format version 6+)
+        FileIO_Helpers.write(fid, "int8", self.stim_polarity_reversed)
+
+        #Save digital onset fields (file format version 7+)
+        FileIO_Helpers.write(fid, "int64", self.digital_onset_sample_num)
+        FileIO_Helpers.write(fid, "int32", self.digital_onset_channel)
 
     #endregion
 

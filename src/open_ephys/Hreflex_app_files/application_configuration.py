@@ -6,6 +6,7 @@ from am_systems_4100.am_systems_4100 import AmSystems4100
 from am_systems_4100.am_systems_4100 import AmSystems4100_TcpConnectionInfo
 
 from .booth import Booth
+from .network_events_client import OpenEphysNetworkEventsClient
 
 class ApplicationConfiguration:
 
@@ -37,7 +38,40 @@ class ApplicationConfiguration:
     #The filtering protocol to use.
     #"OFFLINE": differential subtraction + bandpass filter performed in-app (ch0=raw, ch1=raw, ch2=sync).
     #"ONLINE":  channels arrive pre-processed from Open Ephys (ch0=unipolar filtered, ch1=bipolar+filt+abs, ch2=sync).
-    filtering_protocol: str = "OFFLINE"
+    filtering_protocol: str = "ONLINE"
+
+    #Network Events plugin client for sending TTL commands to Open Ephys.
+    #NOTE: The Network Events plugin uses its own independent REP socket.
+    #      If you are also running the ZMQ Interface plugin (ports 5556/5557
+    #      for data streaming), you MUST configure the Network Events plugin
+    #      in Open Ephys to use a different port (e.g. 5558) to avoid a conflict.
+    network_events_client: OpenEphysNetworkEventsClient = None
+    network_events_hostname: str = "localhost"
+    network_events_port: int = 59117
+
+    #TTL output line numbers used by the two TTL pulse buttons.
+    #These correspond to the digital output lines configured in Open Ephys.
+    ttl_line_1: int = 1
+    ttl_line_2: int = 2
+
+    #TTL line, pulse duration, and repeat interval for the Feed button.
+    ttl_line_feed: int = 3
+    feed_pulse_duration_ms: int = 100
+    feed_interval_ms: int = 90000  # 1.5 minutes
+
+    #Digital input channel number (1-indexed, matching the Open Ephys UI "Digital Input N")
+    #used as the primary stim-onset reference instead of the ADC analog threshold.
+    #OE ZMQ events report 0-indexed event_channel; subtract 1 when comparing.
+    sync_digital_channel: int = 1
+
+    #Open Ephys HTTP REST API server address (port 37497 is the OE default).
+    #Used to send ACQBOARD TRIGGER commands that generate real 5V hardware TTL pulses.
+    oe_http_hostname: str = "localhost"
+    oe_http_port: int = 37497
+
+    #Persistent HTTP session — keeps the TCP connection to the OE REST API alive
+    #between pulses so each TTL button press incurs no TCP handshake overhead.
+    _http_session = None
 
     #region Configuration file methods
 
@@ -178,24 +212,28 @@ class ApplicationConfiguration:
         ApplicationConfiguration.stimulator = None
 
     @staticmethod
-    def set_stimulation_amplitude (amplitude_ma: float) -> None:
+    def set_stimulation_amplitude (amplitude_ma: float, reversed_polarity: bool = False) -> None:
 
         stim: AmSystems4100 = ApplicationConfiguration.stimulator
         if (stim is None):
             return
-        
-        #Tell the stimulator unit that each phase of the biphasic pulse will be 0.8 mA
-        #in amplitude.
-        stim.set_event_amplitude1(int(round(amplitude_ma * 1000.0)))
+
+        amp_ua: int = int(round(amplitude_ma * 1000.0))
+        if reversed_polarity:
+            amp_ua = -amp_ua
+        stim.set_event_amplitude1(amp_ua)
 
     @staticmethod
-    def set_biphasic_stimulus_pulse_parameters (amplitude_ma: float) -> None:
+    def set_biphasic_stimulus_pulse_parameters (amplitude_ma: float, reversed_polarity: bool = False) -> None:
         #   Current = decided by the caller of the function
         #   Frequency = N/A
         #   Pulse phase width = 500 us
         #   Biphasic pulse
         #   Train duration = 1000 us
         #   Total pulses = 1
+        #
+        #   reversed_polarity=False → positive-first biphasic (normal)
+        #   reversed_polarity=True  → negative-first biphasic (inverted; amplitude1 sent as negative)
 
         stim: AmSystems4100 = ApplicationConfiguration.stimulator
         if (stim is None):
@@ -230,12 +268,15 @@ class ApplicationConfiguration:
 
         #Tell the stimulator unit that each phase of the biphasic pulse will be 500 uS
         #in duration.
-        stim.set_event_duration1(250)
-        stim.set_event_period(500)
+        stim.set_event_duration1(100)
+        stim.set_event_period(200)
 
-        #Tell the stimulator unit that each phase of the biphasic pulse will be 0.8 mA
-        #in amplitude.
-        stim.set_event_amplitude1(amplitude_ma * 1000.0)
+        #Set the amplitude in microamps.  For reversed polarity, negate the value so that
+        #the first phase is cathodal (negative-first) instead of anodal (positive-first).
+        amp_ua: int = int(round(amplitude_ma * 1000.0))
+        if reversed_polarity:
+            amp_ua = -amp_ua
+        stim.set_event_amplitude1(amp_ua)
 
         #Biphasic pulses do not use "duration2" and "amplitude2", so we will set them
         #to a value of 0.
@@ -247,6 +288,75 @@ class ApplicationConfiguration:
         stim.set_event_duration3(0)
 
         pass
+
+    @staticmethod
+    def get_http_session():
+        '''
+        Returns the shared persistent requests.Session, creating it on first call.
+        The session keeps the underlying TCP connection to the OE HTTP server alive
+        so that repeated ACQBOARD TRIGGER calls incur no TCP handshake penalty.
+        Retries once immediately on connection errors (stale socket) with no backoff.
+        '''
+        if ApplicationConfiguration._http_session is None:
+            import requests
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            s = requests.Session()
+            retry = Retry(
+                total=1,
+                connect=1,
+                read=False,
+                backoff_factor=0,
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry, pool_connections=1, pool_maxsize=2)
+            s.mount('http://', adapter)
+            ApplicationConfiguration._http_session = s
+        return ApplicationConfiguration._http_session
+
+    @staticmethod
+    def connect_to_network_events() -> tuple[bool, str]:
+        '''Create (if necessary) and connect the Network Events client.'''
+        if ApplicationConfiguration.network_events_client is None:
+            ApplicationConfiguration.network_events_client = OpenEphysNetworkEventsClient()
+        return ApplicationConfiguration.network_events_client.connect(
+            ApplicationConfiguration.network_events_hostname,
+            ApplicationConfiguration.network_events_port
+        )
+
+    @staticmethod
+    def disconnect_from_network_events() -> None:
+        '''Disconnect and destroy the Network Events client.'''
+        if ApplicationConfiguration.network_events_client is not None:
+            ApplicationConfiguration.network_events_client.disconnect()
+            ApplicationConfiguration.network_events_client = None
+
+    @staticmethod
+    def send_acqboard_trigger(line: int, duration_ms: int) -> tuple[bool, str]:
+        '''
+        Send an ACQBOARD TRIGGER command via the Open Ephys HTTP REST API.
+
+        This broadcasts a message to all processors in the OE signal chain.
+        The Open Ephys Acquisition Board plugin handles the message by driving
+        the specified digital output line HIGH for duration_ms milliseconds,
+        producing a real 5V hardware TTL pulse visible on an oscilloscope.
+
+        PUT http://<hostname>:<port>/api/message
+        Body: {"text": "ACQBOARD TRIGGER <line> <duration_ms>"}
+        '''
+        import requests
+        try:
+            url = (f"http://{ApplicationConfiguration.oe_http_hostname}"
+                   f":{ApplicationConfiguration.oe_http_port}/api/message")
+            r = requests.put(
+                url,
+                json={"text": f"ACQBOARD TRIGGER {line} {duration_ms}"},
+                timeout=2.0
+            )
+            r.raise_for_status()
+            return (True, r.text)
+        except Exception as exc:
+            return (False, str(exc))
 
     @staticmethod
     def set_standard_vns_stimulation_parameters () -> None:

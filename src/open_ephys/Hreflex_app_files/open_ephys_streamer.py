@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from .emg_data_filter import EmgDataFilter
 from .application_configuration import ApplicationConfiguration
 
-OPEN_EPHYS_EXPECTED_CHANNEL_COUNT: int = 3
+OPEN_EPHYS_EXPECTED_CHANNEL_COUNT: int = 7
 
 @dataclass
 class OpenEphysDataBlock:
@@ -28,11 +28,19 @@ class OpenEphysDataBlock:
     data: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
 
 @dataclass
+class OpenEphysDigitalEvent:
+    sample_num: int = 0              # Absolute OE sample counter of the event edge
+    event_id: int = 0                # 1 = rising edge (ON), 0 = falling edge (OFF)
+    event_channel: int = 0           # Digital channel index (0-indexed from OE)
+    timestamp_received_ms: int = 0   # Wall-clock ms when this app received the event
+
+@dataclass
 class OpenEphysDataFrame:
     timestamp: int = 0
     sample_id: int = 0
     channel_data_blocks: list[OpenEphysDataBlock] = field(default_factory=lambda: [])
     timestamp_emitted: int = 0
+    digital_events: list = field(default_factory=list)
 
     #The following data members are CALCULATED, and thus are NOT initialized with data upon
     #construction of the object
@@ -42,6 +50,10 @@ class OpenEphysDataFrame:
     sync_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     unipolar_filtered_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     unipolar_abs_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    feeder_adc_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    vns_adc_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    vns_waveform_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    stim_adc_data_block: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
 
     #region Public methods
 
@@ -64,6 +76,19 @@ class OpenEphysDataFrame:
 
             if (len(self.channel_data_blocks) >= 3):
                 self.sync_data_block = np.abs(self.channel_data_blocks[2].data)
+
+            if (len(self.channel_data_blocks) >= 4):
+                #ch3: Tibial Stim ADC waveform (signed, no abs — preserves biphasic pulse shape)
+                self.stim_adc_data_block = self.channel_data_blocks[3].data
+
+            if (len(self.channel_data_blocks) >= 5):
+                self.vns_adc_data_block = self.channel_data_blocks[4].data
+
+            if (len(self.channel_data_blocks) >= 6):
+                self.vns_waveform_data_block = self.channel_data_blocks[5].data
+
+            if (len(self.channel_data_blocks) >= 7):
+                self.feeder_adc_data_block = self.channel_data_blocks[6].data
         else:
             #OFFLINE FILTERING: perform differential subtraction and bandpass filter in-app.
             #ch0 & ch1 = raw EMG electrodes  →  diff → filter → abs
@@ -86,6 +111,19 @@ class OpenEphysDataFrame:
                 #Extract the ADC sync line (channel index 2) used for precise stim-onset alignment.
                 #Absolute value is applied to handle any polarity ambiguity in the ADC signal.
                 self.sync_data_block = np.abs(self.channel_data_blocks[2].data)
+
+            if (len(self.channel_data_blocks) >= 4):
+                #ch3: Tibial Stim ADC waveform (signed, no abs — preserves biphasic pulse shape)
+                self.stim_adc_data_block = self.channel_data_blocks[3].data
+
+            if (len(self.channel_data_blocks) >= 5):
+                self.vns_adc_data_block = self.channel_data_blocks[4].data
+
+            if (len(self.channel_data_blocks) >= 6):
+                self.vns_waveform_data_block = self.channel_data_blocks[5].data
+
+            if (len(self.channel_data_blocks) >= 7):
+                self.feeder_adc_data_block = self.channel_data_blocks[6].data
 
     #endregion
     
@@ -287,9 +325,14 @@ class OpenEphysStreamer (object):
                         pass
 
                 elif header['type'] == 'event':
-
-                    #We will not handle this message type
-                    pass
+                    c = header.get('content', {})
+                    ts_received: int = int(math.floor(time.time() * 1000))
+                    return OpenEphysDigitalEvent(
+                        sample_num=int(c.get('sample_num', 0)),
+                        event_id=int(c.get('event_id', 0)),
+                        event_channel=int(c.get('event_channel', 0)),
+                        timestamp_received_ms=ts_received
+                    )
 
                 elif header['type'] == 'spike':
 

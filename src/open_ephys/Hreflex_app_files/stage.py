@@ -129,6 +129,10 @@ class Stage (object):
         self._session_widget = session_widget
         self._trial_widget = trial_widget
 
+        bold_axis_pen = pg.mkPen(color='k', width=2)
+        for widget in [session_widget, trial_widget]:
+            widget.getPlotItem().getAxis('bottom').setPen(bold_axis_pen)
+
     def finalize (self) -> None:
 
         #This should be implemented by each stage

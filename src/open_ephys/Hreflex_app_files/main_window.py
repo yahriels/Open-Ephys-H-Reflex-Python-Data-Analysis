@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from PySide6.QtGui import QFont, QAction
-from PySide6.QtCore import QThreadPool
+from PySide6.QtCore import QThreadPool, QTimer
 from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 import numpy as np
@@ -29,6 +29,7 @@ from datetime import timedelta
 from typing import Tuple
 
 from ..model.background_worker import BackgroundWorker
+from ..model.ttl_pulse_worker import TtlPulseWorker
 from ..model.stages.stage import Stage
 from ..model.stages.emg_characterization_stage import EmgCharacterizationStage
 from ..model.stages.mh_recruitment_curve_stage import MhRecruitmentCurveStage
@@ -49,6 +50,7 @@ class MainWindow(QMainWindow):
 
     EMG_PLOTTING_SAMPLE_COUNT: int = 25000
     LIVE_EMG_WINDOW_SECONDS: float = 5.0
+    EMG_PLOT_INTERVAL_MS: int = 20   # cap live EMG redraws at 50 Hz
 
     #endregion
 
@@ -79,7 +81,7 @@ class MainWindow(QMainWindow):
         # and the list of ScatterPlotItems (star markers) currently drawn on the live EMG plot.
         self._stim_event_times_ms: list = []
         self._live_emg_stim_markers: list = []
-      
+
         # Initialize a list of stages
         self._stages: list[Stage] = []
 
@@ -131,6 +133,11 @@ class MainWindow(QMainWindow):
         self._max_sample_count: int = -1
         self._frame_start = datetime.now()
 
+        # Timestamp (ms) of the last live-EMG buffer accumulation + plot refresh.
+        # Used to cap the live display redraw rate at EMG_PLOT_INTERVAL_MS regardless
+        # of how fast Open Ephys sends frames (prevents UI freezing at high sample rates).
+        self._last_emg_plot_ms: int = 0
+
         # Set the session and plot widgets on each stage
         for s in self._stages:
             s.set_session_and_trial_widgets(self._session_history_plot_widget, self._previous_trial_plot_widget)
@@ -140,6 +147,21 @@ class MainWindow(QMainWindow):
         self.background_worker = BackgroundWorker()
         self.background_worker.signals.data_received_signal.connect(self._on_data_received)
         self.threadpool.start(self.background_worker)
+
+        # Periodic HTTP keepalive — fires every 4 seconds to keep the OE HTTP
+        # connection warm so TTL pulse buttons never experience the ~2 s delay
+        # that occurs on the first request of a freshly established connection.
+        self._oe_keepalive_timer = QTimer(self)
+        self._oe_keepalive_timer.setInterval(4000)
+        self._oe_keepalive_timer.timeout.connect(self._send_oe_http_keepalive)
+        self._oe_keepalive_timer.start()
+
+        # Auto-feed state: toggles when the user clicks the Feed button.
+        # When True, _feed_timer fires a 100 ms TTL pulse on line 3 every 1.5 min.
+        self._is_feeding: bool = False
+        self._feed_timer = QTimer(self)
+        self._feed_timer.setInterval(ApplicationConfiguration.feed_interval_ms)
+        self._feed_timer.timeout.connect(self._on_feed_timer_fired)
 
     #endregion
 
@@ -208,6 +230,11 @@ class MainWindow(QMainWindow):
         self._protocol_combo.setFont(self._regular_font)
         self._protocol_combo.setStyleSheet("QComboBox {color: #000000; background-color: #FFFFFF;}")
         self._protocol_combo.addItems(["PROTOCOL: OFFLINE FILTERING", "PROTOCOL: ONLINE FILTERING"])
+        #Default to ONLINE (index 1) — set before connecting the signal so the handler
+        #does not fire during construction when dependent widgets aren't ready yet.
+        self._protocol_combo.setCurrentIndex(
+            1 if ApplicationConfiguration.filtering_protocol == "ONLINE" else 0
+        )
         self._protocol_combo.currentIndexChanged.connect(self._on_protocol_changed)
         left_grid.addWidget(self._protocol_combo, 2, 1)
 
@@ -294,6 +321,14 @@ class MainWindow(QMainWindow):
         self._stim_sequential_checkbox.setFont(self._regular_font)
         self._stim_sequential_checkbox.setChecked(False)
         sp_layout.addWidget(self._stim_sequential_checkbox, 2, 1, 1, 2)
+
+        #Polarity toggle: "+/-" = positive-first (default), "-/+" red = negative-first
+        self._stim_polarity_button = QPushButton("+/-")
+        self._stim_polarity_button.setFont(self._regular_font)
+        self._stim_polarity_button.setFixedWidth(45)
+        self._stim_polarity_button.setToolTip("Toggle biphasic pulse polarity (positive-first / negative-first)")
+        self._stim_polarity_button.clicked.connect(self._on_stim_polarity_button_clicked)
+        sp_layout.addWidget(self._stim_polarity_button, 2, 3)
 
         self._stim_params_set_button = QPushButton("Set")
         self._stim_params_set_button.setFont(self._regular_font)
@@ -432,6 +467,26 @@ class MainWindow(QMainWindow):
             items: list[str] = self._selected_stage.get_session_plot_options()
             for i in items:
                 self._session_history_plot_selection_box.addItem(i)
+
+        self._session_polarity_filter_box = QComboBox()
+        self._session_polarity_filter_box.setFont(self._regular_font)
+        self._session_polarity_filter_box.setStyleSheet("QComboBox {color: #808080; background-color: #F0F0F0;}")
+        self._session_polarity_filter_box.setEnabled(False)
+        self._session_polarity_filter_box.addItem("All Pol")
+        self._session_polarity_filter_box.addItem("Pol 0: Normal")
+        self._session_polarity_filter_box.addItem("Pol 1: Reversed")
+        self._session_polarity_filter_box.setToolTip("Filter session plots by stimulation polarity")
+        self._session_polarity_filter_box.currentIndexChanged.connect(self._on_session_polarity_filter_changed)
+
+        self._timeline_scale_box = QComboBox()
+        self._timeline_scale_box.setFont(self._regular_font)
+        self._timeline_scale_box.setStyleSheet("QComboBox {color: #808080; background-color: #F0F0F0;}")
+        self._timeline_scale_box.setEnabled(False)
+        self._timeline_scale_box.addItem("min")
+        self._timeline_scale_box.addItem("hr")
+        self._timeline_scale_box.setFixedWidth(55)
+        self._timeline_scale_box.setToolTip("Trial Timeline x-axis time scale")
+        self._timeline_scale_box.currentIndexChanged.connect(self._on_timeline_scale_changed)
         
         self._most_recent_trial_plot_selection_box = QComboBox()
         self._most_recent_trial_plot_selection_box.setFont(self._regular_font)
@@ -504,6 +559,10 @@ class MainWindow(QMainWindow):
             self._previous_trial_plot_widget.getPlotItem().setLabel('bottom', 'Time (ms)')
         except Exception:
             pass
+        # Y-axis lock state — read by the stage draw methods to persist the user's range
+        self._previous_trial_plot_widget._trial_y_locked = False
+        self._previous_trial_plot_widget._trial_y_min   = -250.0
+        self._previous_trial_plot_widget._trial_y_max   = 250.0
 
         #This plot will show the live EMG data
         self._live_emg_graph_widget = pg.PlotWidget()
@@ -517,12 +576,29 @@ class MainWindow(QMainWindow):
         
         # Add both plots to the middle layout
         #middle_grid.addWidget(history_plot_label, 0, 0)
-        #Stack the trial plot combo box and the signal chooser button horizontally in col 1
+        #Stack the trial plot combo box, signal chooser, and Y-limit controls in col 1
         trial_controls_layout = QHBoxLayout()
         trial_controls_layout.setContentsMargins(0, 0, 0, 0)
         trial_controls_layout.setSpacing(4)
         trial_controls_layout.addWidget(self._most_recent_trial_plot_selection_box)
         trial_controls_layout.addWidget(self._trial_signal_tool_button)
+
+        self._trial_ymin_entry = QLineEdit("-250")
+        self._trial_ymin_entry.setFixedWidth(55)
+        self._trial_ymin_entry.setFont(self._regular_font)
+        self._trial_ymax_entry = QLineEdit("250")
+        self._trial_ymax_entry.setFixedWidth(55)
+        self._trial_ymax_entry.setFont(self._regular_font)
+        self._trial_ylim_set_button = QPushButton("Set Y")
+        self._trial_ylim_set_button.setFixedWidth(50)
+        self._trial_ylim_set_button.setFont(self._regular_font)
+        self._trial_ylim_set_button.clicked.connect(self._on_trial_ylim_set_clicked)
+
+        trial_controls_layout.addWidget(QLabel("Y min:"))
+        trial_controls_layout.addWidget(self._trial_ymin_entry)
+        trial_controls_layout.addWidget(QLabel("Y max:"))
+        trial_controls_layout.addWidget(self._trial_ymax_entry)
+        trial_controls_layout.addWidget(self._trial_ylim_set_button)
 
         #Pack the live EMG button and Y-limit controls together in one row
         live_emg_controls_layout = QHBoxLayout()
@@ -535,7 +611,13 @@ class MainWindow(QMainWindow):
         live_emg_controls_layout.addWidget(self._live_emg_ymax_entry)
         live_emg_controls_layout.addWidget(self._live_emg_ylim_set_button)
 
-        middle_grid.addWidget(self._session_history_plot_selection_box, 0, 0)
+        session_plot_controls_layout = QHBoxLayout()
+        session_plot_controls_layout.setContentsMargins(0, 0, 0, 0)
+        session_plot_controls_layout.setSpacing(4)
+        session_plot_controls_layout.addWidget(self._session_history_plot_selection_box)
+        session_plot_controls_layout.addWidget(self._session_polarity_filter_box)
+        session_plot_controls_layout.addWidget(self._timeline_scale_box)
+        middle_grid.addLayout(session_plot_controls_layout, 0, 0)
         middle_grid.addLayout(trial_controls_layout, 0, 1)
         middle_grid.addLayout(live_emg_controls_layout, 0, 2)
 
@@ -603,6 +685,7 @@ class MainWindow(QMainWindow):
         self._feed_button.setFixedWidth(200)
         self._feed_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Expanding)
         self._feed_button.setEnabled(False)
+        self._feed_button.clicked.connect(self._on_feed_button_clicked)
 
         #Stim button (UI-only stub for now)
         self._stim_button = QPushButton("Stim")
@@ -624,6 +707,72 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self._pause_button, 1, 0)
         button_layout.addWidget(self._feed_button, 2, 0)
         button_layout.addWidget(self._stim_button, 3, 0)
+
+        # ── TTL Output (OE HTTP) section ──────────────────────────────────
+
+        ttl_separator = QFrame()
+        ttl_separator.setFrameShape(QFrame.Shape.HLine)
+        ttl_separator.setFrameShadow(QFrame.Shadow.Sunken)
+        button_layout.addWidget(ttl_separator, 4, 0)
+
+        ttl_section_label = QLabel("TTL Output (OE HTTP)")
+        ttl_section_label.setFont(self._bold_font)
+        button_layout.addWidget(ttl_section_label, 5, 0)
+
+        # Host + Port + Test row
+        oe_addr_row = QHBoxLayout()
+        oe_addr_row.setSpacing(4)
+        oe_addr_row.addWidget(QLabel("Host:"))
+        self._oe_hostname_entry = QLineEdit(ApplicationConfiguration.oe_http_hostname)
+        self._oe_hostname_entry.setFixedWidth(90)
+        self._oe_hostname_entry.setFont(self._regular_font)
+        oe_addr_row.addWidget(self._oe_hostname_entry)
+        oe_addr_row.addWidget(QLabel("Port:"))
+        self._oe_port_entry = QLineEdit(str(ApplicationConfiguration.oe_http_port))
+        self._oe_port_entry.setFixedWidth(50)
+        self._oe_port_entry.setFont(self._regular_font)
+        oe_addr_row.addWidget(self._oe_port_entry)
+        self._oe_test_button = QPushButton("Test")
+        self._oe_test_button.setFont(self._regular_font)
+        self._oe_test_button.setFixedWidth(45)
+        self._oe_test_button.setToolTip("Ping the Open Ephys HTTP server to verify it is reachable")
+        self._oe_test_button.clicked.connect(self._on_oe_test_button_clicked)
+        oe_addr_row.addWidget(self._oe_test_button)
+        self._oe_status_label = QLabel("●")
+        self._oe_status_label.setStyleSheet("color: gray; font-size: 18px;")
+        oe_addr_row.addWidget(self._oe_status_label)
+        oe_addr_row.addStretch()
+        button_layout.addLayout(oe_addr_row, 6, 0)
+
+        # TTL pulse row
+        ttl1_row = QHBoxLayout()
+        ttl1_row.setSpacing(4)
+        ttl1_row.addWidget(QLabel("Line:"))
+        self._ne_line1_entry = QLineEdit(str(ApplicationConfiguration.ttl_line_1))
+        self._ne_line1_entry.setFixedWidth(35)
+        self._ne_line1_entry.setFont(self._regular_font)
+        ttl1_row.addWidget(self._ne_line1_entry)
+        self._ttl1_pulse_button = QPushButton("Pulse")
+        self._ttl1_pulse_button.setFont(self._regular_font)
+        self._ttl1_pulse_button.setToolTip("Send a hardware 5V TTL pulse via Open Ephys HTTP API")
+        self._ttl1_pulse_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._ttl1_pulse_button.clicked.connect(self._on_ttl_pulse_button_clicked)
+        ttl1_row.addWidget(self._ttl1_pulse_button, 1)
+        button_layout.addLayout(ttl1_row, 7, 0)
+
+        # Pulse duration row
+        pulse_dur_row = QHBoxLayout()
+        pulse_dur_row.setSpacing(4)
+        pulse_dur_row.addWidget(QLabel("Pulse dur (ms):"))
+        self._ne_pulse_duration_entry = QLineEdit("100")
+        self._ne_pulse_duration_entry.setFixedWidth(55)
+        self._ne_pulse_duration_entry.setFont(self._regular_font)
+        self._ne_pulse_duration_entry.setToolTip(
+            "Duration (ms) of the 5V hardware TTL pulse sent via ACQBOARD TRIGGER"
+        )
+        pulse_dur_row.addWidget(self._ne_pulse_duration_entry)
+        pulse_dur_row.addStretch()
+        button_layout.addLayout(pulse_dur_row, 8, 0)
 
         #Add the message box and command box to the message command layout
         message_command_layout.addWidget(self._session_message_box, 0, 0)
@@ -659,6 +808,9 @@ class MainWindow(QMainWindow):
 
         #Close the connection to the AM Systems Model 4100 if it exists
         ApplicationConfiguration.disconnect_from_am_systems_4100()
+
+        #Disconnect from the Network Events plugin if connected
+        ApplicationConfiguration.disconnect_from_network_events()
 
         #Accept the event
         event.accept()
@@ -801,15 +953,23 @@ class MainWindow(QMainWindow):
         data = received.diff_data_block
         sample_rate = received.channel_data_blocks[0].sample_rate
 
-        #Append the new data to the live EMG signal array, and remove old data
-        self._emg_signal_data_raw = np.concatenate([self._emg_signal_data_raw, received.diff_data_block])
-        self._emg_signal_data_filtered = np.concatenate([self._emg_signal_data_filtered, received.filtered_data_block])
-        self._emg_signal_data_abs = np.concatenate([self._emg_signal_data_abs, received.abs_data_block])
-        if (len(self._emg_signal_data_raw) > MainWindow.EMG_PLOTTING_SAMPLE_COUNT):
-            elements_to_remove = len(self._emg_signal_data_raw) - MainWindow.EMG_PLOTTING_SAMPLE_COUNT
-            self._emg_signal_data_raw = self._emg_signal_data_raw[elements_to_remove:]
-            self._emg_signal_data_filtered = self._emg_signal_data_filtered[elements_to_remove:]
-            self._emg_signal_data_abs = self._emg_signal_data_abs[elements_to_remove:]
+        #Accumulate live EMG display buffers in-place (zero allocations).
+        #Always runs every frame so the scrolling trace is continuous.
+        _n: int = MainWindow.EMG_PLOTTING_SAMPLE_COUNT
+        _n_new: int = min(len(received.diff_data_block), _n)
+        _keep: int = _n - _n_new
+        self._emg_signal_data_raw[:_keep]      = self._emg_signal_data_raw[_n_new:_n]
+        self._emg_signal_data_raw[_keep:]       = received.diff_data_block[-_n_new:]
+        self._emg_signal_data_filtered[:_keep] = self._emg_signal_data_filtered[_n_new:_n]
+        self._emg_signal_data_filtered[_keep:]  = received.filtered_data_block[-_n_new:]
+        self._emg_signal_data_abs[:_keep]      = self._emg_signal_data_abs[_n_new:_n]
+        self._emg_signal_data_abs[_keep:]       = received.abs_data_block[-_n_new:]
+
+        #Gate the actual plot redraw at EMG_PLOT_INTERVAL_MS (50 Hz cap).
+        now_ms: int = int(datetime.now().timestamp() * 1000)
+        do_plot_emg: bool = (now_ms - self._last_emg_plot_ms >= MainWindow.EMG_PLOT_INTERVAL_MS)
+        if do_plot_emg:
+            self._last_emg_plot_ms = now_ms
         
         #For debugging purposes, keep a count of how many frames per second we are achieving
         self._frame_count += 1
@@ -836,8 +996,9 @@ class MainWindow(QMainWindow):
             #If so, process the data through the selected stage
             self._selected_stage.process(received)
 
-        #Plot the live emg data
-        self._plot_live_emg()
+        #Plot the live emg data (rate-limited to EMG_PLOT_INTERVAL_MS)
+        if do_plot_emg:
+            self._plot_live_emg()
 
         #Return from this function
         return
@@ -899,6 +1060,10 @@ class MainWindow(QMainWindow):
             #Enable the plot selection combo boxes
             self._session_history_plot_selection_box.setEnabled(True)
             self._session_history_plot_selection_box.setStyleSheet("QComboBox {color: #000000; background-color: #FFFFFF;}")
+            self._session_polarity_filter_box.setEnabled(True)
+            self._session_polarity_filter_box.setStyleSheet("QComboBox {color: #000000; background-color: #FFFFFF;}")
+            self._timeline_scale_box.setEnabled(True)
+            self._timeline_scale_box.setStyleSheet("QComboBox {color: #000000; background-color: #FFFFFF;}")
             self._most_recent_trial_plot_selection_box.setEnabled(True)
             self._most_recent_trial_plot_selection_box.setStyleSheet("QComboBox {color: #000000; background-color: #FFFFFF;}")
 
@@ -956,6 +1121,13 @@ class MainWindow(QMainWindow):
             self._start_stop_button.setEnabled(False)
             self._start_stop_button.setStyleSheet('QPushButton {color: #9D9D9D;}')
 
+            #Stop auto-feeding if it was active when the session was stopped
+            if self._is_feeding:
+                self._is_feeding = False
+                self._feed_timer.stop()
+                self._feed_button.setText("Feed")
+                self._feed_button.setStyleSheet("")
+
             #Disable the pause and feed buttons
             self._pause_button.setEnabled(False)
             self._feed_button.setEnabled(False)
@@ -979,6 +1151,12 @@ class MainWindow(QMainWindow):
             #Disable the plot selection combo boxes
             self._session_history_plot_selection_box.setEnabled(False)
             self._session_history_plot_selection_box.setStyleSheet("QComboBox {color: #808080; background-color: #F0F0F0;}")
+            self._session_polarity_filter_box.setCurrentIndex(0)
+            self._session_polarity_filter_box.setEnabled(False)
+            self._session_polarity_filter_box.setStyleSheet("QComboBox {color: #808080; background-color: #F0F0F0;}")
+            self._timeline_scale_box.setCurrentIndex(0)
+            self._timeline_scale_box.setEnabled(False)
+            self._timeline_scale_box.setStyleSheet("QComboBox {color: #808080; background-color: #F0F0F0;}")
             self._most_recent_trial_plot_selection_box.setEnabled(False)
             self._most_recent_trial_plot_selection_box.setStyleSheet("QComboBox {color: #808080; background-color: #F0F0F0;}")
             self._trial_signal_tool_button.setEnabled(False)
@@ -1048,6 +1226,30 @@ class MainWindow(QMainWindow):
         self._session_messages.append(msg)
         self._update_session_messages()
 
+    def _on_stim_polarity_button_clicked (self) -> None:
+        '''
+        Toggles the biphasic pulse polarity on the MH Recruitment Curve stage and
+        updates the button label/style to reflect the new state.
+        '''
+        mh_stage: MhRecruitmentCurveStage = None
+        for s in self._stages:
+            if s.stage_type == Stage.STAGE_TYPE_RECRUITMENT_CURVE:
+                mh_stage = s
+                break
+
+        if mh_stage is None:
+            return
+
+        reversed_polarity: bool = mh_stage.toggle_polarity()
+
+        #Reversed = red "-/+" label; normal = default "+/-"
+        if reversed_polarity:
+            self._stim_polarity_button.setText("-/+")
+            self._stim_polarity_button.setStyleSheet("QPushButton {color: red;}")
+        else:
+            self._stim_polarity_button.setText("+/-")
+            self._stim_polarity_button.setStyleSheet("")
+
     def _on_emg_char_threshold_set_button_clicked (self) -> None:
         if (self._selected_stage is None or
                 self._selected_stage.stage_type != Stage.STAGE_TYPE_EMG_CHARACTERIZATION):
@@ -1065,9 +1267,174 @@ class MainWindow(QMainWindow):
         self._session_messages.append(msg)
         self._update_session_messages()
 
+    def _on_feed_button_clicked(self) -> None:
+        self._is_feeding = not self._is_feeding
+        if self._is_feeding:
+            self._feed_button.setText("Feed (ON)")
+            self._feed_button.setStyleSheet("QPushButton {color: #007700;}")
+            self._on_feed_timer_fired()   # deliver first pulse immediately
+            self._feed_timer.start()
+            msg = SessionMessage(
+                f"Feed: auto-feed ON — {ApplicationConfiguration.feed_pulse_duration_ms} ms TTL "
+                f"on line {ApplicationConfiguration.ttl_line_feed} every 1.5 min"
+            )
+        else:
+            self._feed_button.setText("Feed")
+            self._feed_button.setStyleSheet("")
+            self._feed_timer.stop()
+            msg = SessionMessage("Feed: auto-feed OFF")
+        self._session_messages.append(msg)
+        self._update_session_messages()
+
+    def _on_feed_timer_fired(self) -> None:
+        hostname = self._oe_hostname_entry.text().strip() or "localhost"
+        try:
+            port = int(self._oe_port_entry.text())
+        except ValueError:
+            port = ApplicationConfiguration.oe_http_port
+
+        worker = TtlPulseWorker(
+            ne_hostname  = ApplicationConfiguration.network_events_hostname,
+            ne_port      = ApplicationConfiguration.network_events_port,
+            oe_hostname  = hostname,
+            oe_port      = port,
+            line         = ApplicationConfiguration.ttl_line_feed,
+            duration_ms  = ApplicationConfiguration.feed_pulse_duration_ms,
+            http_session = ApplicationConfiguration.get_http_session(),
+            button_index = 0,
+        )
+        worker.signals.finished.connect(self._on_feed_pulse_finished)
+        self.threadpool.start(worker)
+
+    def _on_feed_pulse_finished(self, _button_index: int, success: bool, message: str) -> None:
+        prefix = "" if success else "[FAILED] "
+        msg = SessionMessage(f"{prefix}Feed pulse: {message}")
+        self._session_messages.append(msg)
+        self._update_session_messages()
+
     def _on_stim_button_clicked (self) -> None:
         if (self._is_session_running) and (not self._is_session_paused):
             self._selected_stage.manual_stim()
+
+    def _send_oe_http_keepalive(self) -> None:
+        '''
+        Sends a lightweight GET /api/status to the OE HTTP server in a background
+        daemon thread.  Called by the periodic keepalive timer every 4 seconds so the
+        shared HTTP connection stays warm and the first TTL button press after any idle
+        period is never delayed.  Failures are silently ignored.
+        '''
+        import threading
+        hostname = ApplicationConfiguration.oe_http_hostname
+        port     = ApplicationConfiguration.oe_http_port
+
+        def _ping():
+            try:
+                sess = ApplicationConfiguration.get_http_session()
+                sess.get(f"http://{hostname}:{port}/api/status", timeout=(0.3, 2.0))
+            except Exception:
+                pass
+
+        threading.Thread(target=_ping, daemon=True).start()
+
+    def _on_oe_test_button_clicked(self) -> None:
+        '''Ping the Open Ephys HTTP server at /api/status to verify it is reachable.'''
+        hostname = self._oe_hostname_entry.text().strip() or "localhost"
+        try:
+            port = int(self._oe_port_entry.text())
+        except ValueError:
+            msg = SessionMessage("OE HTTP: invalid port number")
+            self._session_messages.append(msg)
+            self._update_session_messages()
+            return
+
+        ApplicationConfiguration.oe_http_hostname = hostname
+        ApplicationConfiguration.oe_http_port = port
+
+        try:
+            # Use the shared persistent session so the TCP connection is
+            # pre-warmed and ready before the first TTL pulse button press.
+            sess = ApplicationConfiguration.get_http_session()
+            r = sess.get(
+                f"http://{hostname}:{port}/api/status",
+                timeout=2.0
+            )
+            r.raise_for_status()
+            self._oe_status_label.setStyleSheet("color: green; font-size: 18px;")
+            msg = SessionMessage(f"OE HTTP: reachable at {hostname}:{port}")
+        except Exception as exc:
+            self._oe_status_label.setStyleSheet("color: red; font-size: 18px;")
+            msg = SessionMessage(f"OE HTTP: unreachable — {exc}")
+
+        self._session_messages.append(msg)
+        self._update_session_messages()
+
+    def _on_ttl_pulse_button_clicked(self) -> None:
+        '''
+        Send a hardware 5V TTL pulse via the Open Ephys HTTP REST API.
+
+        Sends PUT /api/message with body {"text": "ACQBOARD TRIGGER <line> <duration_ms>"}.
+        The Open Ephys Acquisition Board plugin handles this by driving the specified
+        digital output line HIGH for duration_ms milliseconds, producing a real hardware
+        TTL pulse visible on an oscilloscope and usable to trigger external devices.
+        '''
+        try:
+            duration_ms = int(self._ne_pulse_duration_entry.text())
+            if duration_ms <= 0:
+                raise ValueError("duration must be positive")
+        except ValueError:
+            msg = SessionMessage("TTL Pulse: enter a positive integer duration (ms)")
+            self._session_messages.append(msg)
+            self._update_session_messages()
+            return
+
+        try:
+            line = int(self._ne_line1_entry.text())
+        except ValueError:
+            line = ApplicationConfiguration.ttl_line_1
+
+        hostname = self._oe_hostname_entry.text().strip() or "localhost"
+        try:
+            port = int(self._oe_port_entry.text())
+        except ValueError:
+            port = ApplicationConfiguration.oe_http_port
+
+        ApplicationConfiguration.oe_http_hostname = hostname
+        ApplicationConfiguration.oe_http_port = port
+
+        self._ttl1_pulse_button.setEnabled(False)
+        self._ttl1_pulse_button.setText("Pulsing…")
+
+        worker = TtlPulseWorker(
+            ne_hostname  = ApplicationConfiguration.network_events_hostname,
+            ne_port      = ApplicationConfiguration.network_events_port,
+            oe_hostname  = hostname,
+            oe_port      = port,
+            line         = line,
+            duration_ms  = duration_ms,
+            http_session = ApplicationConfiguration.get_http_session(),
+            button_index = 1,
+        )
+        worker.signals.finished.connect(self._on_ttl_pulse_finished)
+        self.threadpool.start(worker)
+
+    def _on_ttl_pulse_finished(self, button_index: int, success: bool, message: str) -> None:
+        '''Re-enables the TTL button and logs the outcome after the background worker completes.'''
+        self._ttl1_pulse_button.setText("Pulse")
+        self._ttl1_pulse_button.setEnabled(True)
+
+        self._oe_status_label.setStyleSheet(
+            "color: green; font-size: 18px;" if success else "color: red; font-size: 18px;"
+        )
+
+        prefix = "" if success else "[FAILED] "
+        msg = SessionMessage(f"{prefix}TTL {button_index}: {message}")
+        self._session_messages.append(msg)
+        self._update_session_messages()
+
+        # Pre-warm the connection for the next press immediately after each pulse.
+        # This absorbs any OE per-connection initialization in the background so the
+        # user never waits for it on the next button press.
+        self._send_oe_http_keepalive()
 
     def _on_message_received_from_stage (self, message: SessionMessage) -> None:
         self._session_messages.append(message)
@@ -1097,6 +1464,20 @@ class MainWindow(QMainWindow):
             current_index = self._session_history_plot_selection_box.currentIndex()
             self._selected_stage.session_plot_index = current_index
 
+    def _on_session_polarity_filter_changed (self) -> None:
+        if (self._is_session_running) and (self._selected_stage is not None):
+            idx = self._session_polarity_filter_box.currentIndex()
+            # index 0 = All (-1), index 1 = Pol 0, index 2 = Pol 1
+            polarity_value = idx - 1
+            if hasattr(self._selected_stage, 'set_session_polarity_filter'):
+                self._selected_stage.set_session_polarity_filter(polarity_value)
+
+    def _on_timeline_scale_changed (self) -> None:
+        if (self._is_session_running) and (self._selected_stage is not None):
+            use_hours = self._timeline_scale_box.currentIndex() == 1
+            if hasattr(self._selected_stage, 'set_timeline_use_hours'):
+                self._selected_stage.set_timeline_use_hours(use_hours)
+
     def _on_most_recent_trial_plot_selection_index_changed (self) -> None:
         if (self._is_session_running):
             current_index = self._most_recent_trial_plot_selection_box.currentIndex()
@@ -1124,6 +1505,25 @@ class MainWindow(QMainWindow):
         self._live_emg_y_min = y_min
         self._live_emg_y_max = y_max
         self._live_emg_graph_widget.setYRange(y_min, y_max, padding=0)
+
+    def _on_trial_ylim_set_clicked(self) -> None:
+        '''Reads the Y-min/Y-max entries and locks the trial/group-avg plot Y-axis.'''
+        w = self._previous_trial_plot_widget
+        try:
+            y_min = float(self._trial_ymin_entry.text())
+            y_max = float(self._trial_ymax_entry.text())
+        except ValueError:
+            self._trial_ymin_entry.setText(str(int(w._trial_y_min)))
+            self._trial_ymax_entry.setText(str(int(w._trial_y_max)))
+            return
+        if y_min >= y_max:
+            self._trial_ymin_entry.setText(str(int(w._trial_y_min)))
+            self._trial_ymax_entry.setText(str(int(w._trial_y_max)))
+            return
+        w._trial_y_min    = y_min
+        w._trial_y_max    = y_max
+        w._trial_y_locked = True
+        w.setYRange(y_min, y_max, padding=0)
 
     def _handle_live_emg_data_plot_selection_changed (self, checked) -> None:
 
@@ -1296,6 +1696,7 @@ class MainWindow(QMainWindow):
         self._live_emg_graph_widget.setYRange(self._live_emg_y_min, self._live_emg_y_max, padding=0)
         self._live_emg_graph_widget.setXRange(-MainWindow.LIVE_EMG_WINDOW_SECONDS, 0, padding=0)
         self._live_emg_graph_widget.getPlotItem().setLabel('bottom', 'Time (s)')
+        self._live_emg_graph_widget.getPlotItem().getAxis('bottom').setPen(pg.mkPen(color='k', width=2))
         self._live_emg_graph_widget.addLegend(offset=(0, 0))
 
         #Create the line object that will be used for updating the data
