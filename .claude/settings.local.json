@@ -3,7 +3,18 @@
     "allow": [
       "Bash(python -c:*)",
       "Bash(python _patch_notebook.py:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(ls -lh \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\src\\\\open_ephys\\\\analysis\"/*.ipynb)",
+      "Bash(python3:*)",
+      "Bash(where python:*)",
+      "Bash(python -c \":*)",
+      "Bash(pip show:*)",
+      "Bash(pip install *)",
+      "Bash(.venv/Scripts/pip install *)",
+      "Bash(.venv/Scripts/python -c \"import nbformat; print\\('nbformat', nbformat.__version__\\); import plotly; print\\('plotly', plotly.__version__\\)\")",
+      "Bash(.venv/Scripts/jupyter nbconvert *)",
+      "Bash(\"../../../../../../.venv/Scripts/jupyter.exe\" nbconvert *)"
     ]
   }
 }

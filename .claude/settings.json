@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(c:/Users/dal866445/Documents/Github/open-ephys-python-tools/.venv/Scripts/python.exe -c ' *)",
+      "Bash(\"c:/Users/dal866445/Documents/Github/open-ephys-python-tools/.venv/Scripts/python.exe\")",
+      "Bash(.venv/Scripts/python -c ' *)",
+      "Bash(.venv/Scripts/python)",
+      "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('src/open_ephys/analysis/helpers.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('src/open_ephys/analysis/helpers.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(.venv/Scripts/python -u -c ' *)",
+      "PowerShell(cd \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\src\\\\open_ephys\\\\analysis\"; $nb = Get-Content \"Post_Hoc_Global_Windowing copy.ipynb\" | ConvertFrom-Json; $cells = $nb.cells; for \\($i=0; $i -lt $cells.Count; $i++\\) { Write-Output \"$i`: $\\($cells[$i].id\\)\" })",
+      "PowerShell(cd \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\src\\\\open_ephys\\\\analysis\"; $nb = Get-Content \"Post_Hoc_Global_Windowing copy.ipynb\" | ConvertFrom-Json; $cells = $nb.cells; $target_ids = @\\('204d96e1','f0058f17','5e5c5cad','f75b780f','a916eea6'\\); foreach \\($id in $target_ids\\) { $cell = $cells | Where-Object { $_.id -eq $id }; $src = \\($cell.source -join ''\\) -replace '\\\\n',' '; Write-Output \"=== $id ===\"; Write-Output \\($src.Substring\\(0, [Math]::Min\\(200, $src.Length\\)\\)\\); Write-Output \"\" })",
+      "PowerShell(cd \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\src\\\\open_ephys\\\\analysis\"; $nb = Get-Content \"Post_Hoc_Global_Windowing copy.ipynb\" | ConvertFrom-Json; for \\($i=0; $i -lt $nb.cells.Count; $i++\\) { Write-Output \"$i`: $\\($nb.cells[$i].id\\)\" })",
+      "PowerShell(cd \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\src\\\\open_ephys\\\\analysis\"; $nb = Get-Content \"Post_Hoc_Global_Windowing.ipynb\" | ConvertFrom-Json; for \\($i=0; $i -lt $nb.cells.Count; $i++\\) { $src = \\($nb.cells[$i].source -join ''\\).Substring\\(0, [Math]::Min\\(60, \\($nb.cells[$i].source -join ''\\).Length\\)\\); Write-Output \"$i`: $\\($nb.cells[$i].id\\)  [$src]\" })",
+      "Bash(.venv/Scripts/python -)",
+      "Bash(del \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\tmp_cell25.txt\")",
+      "PowerShell(cd \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\src\\\\open_ephys\\\\analysis\"; $nb = Get-Content \"Post_Hoc_Global_Windowing copy.ipynb\" | ConvertFrom-Json; $cells = $nb.cells; for \\($i=0; $i -lt $cells.Count; $i++\\) { $src = \\($cells[$i].source -join \"\"\\); Write-Host \"Cell $i [$\\($cells[$i].cell_type\\)]: $\\($src.Substring\\(0, [Math]::Min\\(100, $src.Length\\)\\)\\)\" })",
+      "PowerShell(cd \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\src\\\\open_ephys\\\\analysis\"; $nb = Get-Content \"Post_Hoc_Global_Windowing copy.ipynb\" | ConvertFrom-Json; $cells = $nb.cells; for \\($i=22; $i -le 28; $i++\\) { Write-Host \"===== Cell $i [$\\($cells[$i].cell_type\\)] =====\"; Write-Host \\($cells[$i].source -join \"\"\\); Write-Host \"\" })",
+      "PowerShell(& \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\.venv\\\\Scripts\\\\python.exe\" \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\_patch_nb.py\")",
+      "PowerShell(cd \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\src\\\\open_ephys\\\\analysis\"; $nb = Get-Content \"Post_Hoc_Global_Windowing copy.ipynb\" | ConvertFrom-Json; $cells = $nb.cells; $c22 = $cells | Where-Object { $_.id -eq '0fba7312' }; $c23 = $cells | Where-Object { $_.id -eq 'ec0f2d4d' }; Write-Host \"=== Cell 22 \\(markdown\\) ===\"; Write-Host \\($c22.source -join \"\"\\); Write-Host \"\"; Write-Host \"=== Cell 23 \\(code\\) ===\"; Write-Host \\($c23.source -join \"\"\\))",
+      "PowerShell(python -c \"import json; nb=json.load\\(open\\(r'c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\src\\\\open_ephys\\\\analysis\\\\Post_Hoc_Global_Windowing copy.ipynb'\\)\\); cells=[c for c in nb['cells'] if 'plot_hm_ratio_summary' in ''.join\\(c['source']\\)]; [print\\('=== cell id='+c['id']+' ==='\\); print\\(''.join\\(c['source']\\)\\) for c in cells]\")",
+      "PowerShell(python \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\_patch_notebook.py\")",
+      "PowerShell(python \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\_patch_bin_overview.py\")",
+      "PowerShell(python \"c:\\\\Users\\\\dal866445\\\\Documents\\\\Github\\\\open-ephys-python-tools\\\\_patch_bin_overview2.py\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\dal866445\\.claude\\projects\\c--Users-dal866445-Documents-Github-open-ephys-python-tools\\memory"
+    ]
+  }
+}
