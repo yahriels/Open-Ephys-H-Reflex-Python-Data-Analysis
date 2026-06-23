@@ -1559,16 +1559,39 @@ def plot_background_emg_views(trials, emg_blocks,
                 ax_lvl.plot([], [], color='goldenrod', linewidth=2,
                             label=f'Selected (Trial {idx})')
 
+            # Per-trial threshold markers: short horizontal segments at each trial's x-pos.
+            # Thresholds vary per trial (stored in trial.min/max_initiation_threshold),
+            # so we draw one segment per trial rather than full-width axhlines.
+            _vi_arr   = np.array(valid_idx, dtype=float)
+            _min_ths  = np.array([trials[i].min_initiation_threshold for i in valid_idx])
+            _max_ths  = np.array([trials[i].max_initiation_threshold for i in valid_idx])
+            _hw       = box_w * 0.65   # half-width of each threshold segment
+
+            # Non-selected trials: thin, faded segments
+            _others = _vi_arr != idx
+            if np.any(_others):
+                _xo = _vi_arr[_others]
+                ax_lvl.hlines(_min_ths[_others], _xo - _hw, _xo + _hw,
+                              colors=(0, 160/255, 0), linewidth=0.9,
+                              linestyle='--', alpha=0.95)
+                ax_lvl.hlines(_max_ths[_others], _xo - _hw, _xo + _hw,
+                              colors=(200/255, 0, 0), linewidth=0.9,
+                              linestyle='--', alpha=0.95)
+
+            # Selected trial: wider, fully opaque, with legend labels
             tr = trials[idx]
-            ax_lvl.axhline(tr.min_initiation_threshold, color=(0, 160/255, 0),
-                           linestyle='--', linewidth=1.5,
-                           label=f'Min thresh: {tr.min_initiation_threshold:.1f}')
-            ax_lvl.axhline(tr.max_initiation_threshold, color=(200/255, 0, 0),
-                           linestyle='--', linewidth=1.5,
-                           label=f'Max thresh: {tr.max_initiation_threshold:.1f}')
+            _sel_hw = _hw * 1.35
+            ax_lvl.hlines(tr.min_initiation_threshold, idx - _sel_hw, idx + _sel_hw,
+                          colors=(0, 160/255, 0), linewidth=2.0, linestyle='--',
+                          label=f'Min thresh: {tr.min_initiation_threshold:.1f} µV')
+            ax_lvl.hlines(tr.max_initiation_threshold, idx - _sel_hw, idx + _sel_hw,
+                          colors=(200/255, 0, 0), linewidth=2.0, linestyle='--',
+                          label=f'Max thresh: {tr.max_initiation_threshold:.1f} µV')
             ax_lvl.set_xlabel('Trial #')
             ax_lvl.set_ylabel('EMG (µV)')
-            ax_lvl.set_title('Background EMG Level  (box=Q1–Q3, whiskers=min/max)')
+            ax_lvl.set_title('Background EMG Level  '
+                             '(box=Q1–Q3, whiskers=min/max, '
+                             '── per-trial init. thresholds)')
             ax_lvl.legend(loc='upper right', fontsize=9)
             ax_lvl.grid(True, alpha=0.3)
 
@@ -2135,7 +2158,7 @@ def plot_hrs2_analysis(trials, header,
             _blo = d.get('bg_lo', float('nan'))
             _bhi = d.get('bg_hi', float('nan'))
             if np.isfinite(_blo) and np.isfinite(_bhi):
-                lbl += f"  BG: {_blo:.3f}–{_bhi:.3f} µV"
+                lbl += f"  BG: {_blo:.0f}–{_bhi:.0f} µV"
         return lbl
 
     def _refresh():
@@ -2761,7 +2784,7 @@ def plot_hrs2_trials(trials, header,
         if with_bg:
             _bg = d.get('bg', float('nan'))
             if np.isfinite(_bg):
-                lbl += f"  |  BG: {_bg:.3f} µV"
+                lbl += f"  |  BG: {_bg:.0f} µV"
         return lbl
 
     def _refresh():
@@ -2835,7 +2858,7 @@ def plot_hrs2_trials(trials, header,
             _draw_trial_panel(ax, d, small=False)
             ax.set_title(
                 f"Trial {d['idx']+1}  |  Stim = {d['amp']:.3f} mA"
-                + (f"  |  BG: {d['bg']:.3f} µV"
+                + (f"  |  BG: {d['bg']:.0f} µV"
                    if _show_bg_t['val'] and np.isfinite(d.get('bg', float('nan'))) else "")
                 + f"  |  {header.subject_id}  "
                   f"({header.session_start_time:%Y-%m-%d %H:%M})",
