@@ -59,8 +59,10 @@ STIM_END_THRESHOLD   = 1.9  # V -- ADC level below which stim pulse has ended
 # Block IDs (mirrors HReflexDataFileBlockIds)
 BLOCK_EMG_DATA             = 1
 BLOCK_EMG_CHAR_TRIAL       = 2
-BLOCK_MH_TRIAL             = 3
+BLOCK_MH_TRIAL             = 3   # V1 .hrs2 / V2 .hrs1  MH Recruitment Curve trials
 BLOCK_EMG_TRIALS_PER_HOUR  = 4
+BLOCK_DCP_TRIAL            = 5   # V2 .hrs3  Down Condition Pellet trials
+BLOCK_CONTROL_MODE_TRIAL   = 6   # V2 .hrs2  Control Mode trials
 
 # Low-level type maps (mirrors FileIO_Helpers from hreflex_txbdc)
 _HRS_TYPE_FMT  = {'int8': 'b', 'int16': 'h', 'int32': 'i', 'int64': 'q', 'uint8': 'B', 'uint16': 'H', 'uint32': 'I', 'uint64': 'Q', 'float32': 'f', 'float64': 'd'}
@@ -171,6 +173,10 @@ class MhRecHeader:
     stage_name: str = ""
     stage_description: str = ""
     stage_type: int = 0
+    app_version: str = ""   # file_version >= 8 (.hrs1/.hrs2) or >= 9 (.hrs3)
+    # Derived after reading trials: len(trial_data) / (TRIAL_RECORD_MS / 1000).
+    # Defaults to 5000.0 for files with no trials.
+    sample_rate: float = 5000.0
 
 
 @dataclass
@@ -204,6 +210,21 @@ class MhRecTrial:
     # --- file_version >= 7 fields ---
     digital_onset_sample_num: int = -1   # absolute OE sample of DIGITAL IN rising edge; -1 = none
     digital_onset_channel: int = -1      # OE digital channel index (0-based); -1 = none
+
+
+@dataclass
+class DcpTrial(MhRecTrial):
+    """Down Condition Pellet trial (hreflex_txbdc V2 .hrs3, file_version=8).
+
+    Extends MhRecTrial with six outcome fields appended after all standard fields.
+    """
+    # --- file_version >= 8 fields (.hrs3 only) ---
+    h_wave_response:   float = float('nan')  # H-wave peak-to-peak amplitude (µV)
+    m_wave_response:   float = float('nan')  # M-wave peak-to-peak amplitude (µV)
+    hm_ratio:          float = float('nan')  # H/M ratio (0–1)
+    success_threshold: float = float('nan')  # H/M ratio threshold for pellet delivery
+    is_success:        int   = 0             # 1 if trial met the success threshold
+    pellet_delivered:  int   = 0             # 1 if a food pellet was actually dispensed
 
 
 # ====================================================================
@@ -271,6 +292,31 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0) -> MhRecTrial:
     if file_version >= 7:
         t.digital_onset_sample_num = hrs_read_val(fid, 'int64')
         t.digital_onset_channel    = hrs_read_val(fid, 'int32')
+    return t
+
+
+def _read_dcp_trial_block(fid: BinaryIO, file_version: int = 8) -> DcpTrial:
+    """Read one Down Condition Pellet trial block.
+
+    Reads all standard MhRecTrial fields via _read_mh_trial_block, then
+    appends the six DcpTrial-specific outcome fields (file_version >= 8).
+    """
+    base = _read_mh_trial_block(fid, file_version)
+    t = DcpTrial.__new__(DcpTrial)
+    t.__dict__.update(base.__dict__)
+    t.h_wave_response   = float('nan')
+    t.m_wave_response   = float('nan')
+    t.hm_ratio          = float('nan')
+    t.success_threshold = float('nan')
+    t.is_success        = 0
+    t.pellet_delivered  = 0
+    if file_version >= 8:
+        t.h_wave_response   = hrs_read_val(fid, 'float32')
+        t.m_wave_response   = hrs_read_val(fid, 'float32')
+        t.hm_ratio          = hrs_read_val(fid, 'float32')
+        t.success_threshold = hrs_read_val(fid, 'float32')
+        t.is_success        = hrs_read_val(fid, 'int8')
+        t.pellet_delivered  = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -344,7 +390,17 @@ def read_hrs1(filepath: str):
 
 
 def read_hrs2(filepath: str):
-    """Read an .hrs2 (MH Recruitment Curve) data file.
+    """Read a peri-stimulus trial file (.hrs1 or .hrs2).
+
+    Used for:
+    - V1 .hrs1: EMG Characterization stage  (stage_type=0, EmgCharHeader — use read_hrs1)
+    - V1 .hrs2: MH Recruitment Curve stage  (sweeps across intensities)
+    - V2 .hrs1: MH Recruitment Curve stage  (same binary format as V1 .hrs2)
+    - V2 .hrs2: Control Mode stage          (fixed intensity, user-adjustable)
+
+    All of the above share the MhRecHeader + MhRecTrial binary format.
+    Block IDs handled: BLOCK_MH_TRIAL (3), BLOCK_CONTROL_MODE_TRIAL (6),
+    BLOCK_DCP_TRIAL (5, used by V2 file_version ≥ 8 Control Mode).
 
     Notes:
     - file_version 0: trial blocks contain trial_data only (no sync_data).
@@ -365,6 +421,8 @@ def read_hrs2(filepath: str):
         header.stage_name        = hrs_read_string(fid)
         header.stage_description = hrs_read_string(fid)
         header.stage_type        = hrs_read_val(fid, 'int32')
+        if header.file_version >= 8:
+            header.app_version = hrs_read_string(fid)
 
         while True:
             chunk = fid.read(4)
@@ -372,7 +430,7 @@ def read_hrs2(filepath: str):
                 break
             block_id = struct.unpack('i', chunk)[0]
 
-            if block_id == BLOCK_MH_TRIAL:
+            if block_id in (BLOCK_MH_TRIAL, BLOCK_CONTROL_MODE_TRIAL):
                 try:
                     trials.append(_read_mh_trial_block(fid, header.file_version))
                 except (struct.error, EOFError):
@@ -441,24 +499,166 @@ def read_hrs2(filepath: str):
     return header, trials, emg_blocks
 
 
-def find_hrs_files(directory: str):
-    """Auto-detect the .hrs1 and .hrs2 files in a recording directory.
+def read_hrs3(filepath: str):
+    """Read an .hrs3 (Down Condition Pellet) data file (hreflex_txbdc V2).
 
-    Returns (hrs1_path, hrs2_path). hrs2_path is None if no .hrs2 file is found.
-    Raises FileNotFoundError only if the .hrs1 file is missing.
+    file_version=8 appends six outcome fields per trial after all standard
+    MhRecTrial fields (h_wave_response, m_wave_response, hm_ratio,
+    success_threshold, is_success, pellet_delivered).
+
+    Returns (header, trials, emg_blocks).
+    """
+    header = MhRecHeader()
+    trials, emg_blocks = [], []
+
+    with open(filepath, 'rb') as fid:
+        header.file_version       = hrs_read_val(fid, 'int32')
+        header.subject_id         = hrs_read_string(fid)
+        header.session_start_time = hrs_read_datetime(fid)
+        header.stage_name         = hrs_read_string(fid)
+        header.stage_description  = hrs_read_string(fid)
+        header.stage_type         = hrs_read_val(fid, 'int32')
+        if header.file_version >= 9:
+            header.app_version = hrs_read_string(fid)
+
+        while True:
+            chunk = fid.read(4)
+            if len(chunk) < 4:
+                break
+            block_id = struct.unpack('i', chunk)[0]
+
+            if block_id in (BLOCK_MH_TRIAL, BLOCK_DCP_TRIAL):
+                try:
+                    trials.append(_read_dcp_trial_block(fid, header.file_version))
+                except (struct.error, EOFError):
+                    break
+            elif block_id == BLOCK_EMG_DATA:
+                # Same block_id=1 disambiguation as read_hrs2.
+                _UNIX_MS_LO = 5e11
+                _UNIX_MS_HI = 3e12
+                pos = fid.tell()
+                peek = fid.read(24)
+                fid.seek(pos)
+                if len(peek) < 24:
+                    break
+                peek_f64 = struct.unpack('<d', peek[:8])[0]
+                if peek_f64 > 1.0:
+                    try:
+                        trials.append(_read_dcp_trial_block(fid, header.file_version))
+                    except (struct.error, EOFError):
+                        break
+                else:
+                    ts0 = struct.unpack('<Q', peek[0:8])[0]
+                    ts1 = struct.unpack('<Q', peek[8:16])[0]
+                    ts2 = struct.unpack('<Q', peek[16:24])[0]
+                    _is_emg = (
+                        _UNIX_MS_LO < ts0 < _UNIX_MS_HI and
+                        _UNIX_MS_LO < ts1 < _UNIX_MS_HI and
+                        _UNIX_MS_LO < ts2 < _UNIX_MS_HI and
+                        ts1 >= ts0 and ts2 >= ts1 and
+                        (ts2 - ts0) < 3_600_000
+                    )
+                    if _is_emg:
+                        try:
+                            emg_blocks.append(_read_emg_data_block(fid))
+                        except (struct.error, EOFError):
+                            break
+                    else:
+                        try:
+                            trials.append(_read_dcp_trial_block(fid, header.file_version))
+                        except (struct.error, EOFError):
+                            break
+            else:
+                print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
+                break
+
+    return header, trials, emg_blocks
+
+
+def find_hrs_files(directory: str):
+    """Auto-detect .hrs1, .hrs2, and .hrs3 files in a recording directory.
+
+    Returns (hrs1_path, hrs2_path, hrs3_path). Any path is None if the
+    corresponding file is absent. Raises FileNotFoundError only when no
+    .hrs* files of any kind are found in the directory.
     """
     hrs1_files = globmod.glob(os.path.join(directory, "*.hrs1"))
     hrs2_files = globmod.glob(os.path.join(directory, "*.hrs2"))
+    hrs3_files = globmod.glob(os.path.join(directory, "*.hrs3"))
 
-    if not hrs1_files:
-        raise FileNotFoundError(f"No .hrs1 file found in '{directory}'")
+    if not hrs1_files and not hrs2_files and not hrs3_files:
+        raise FileNotFoundError(f"No .hrs1 / .hrs2 / .hrs3 files found in '{directory}'")
     if len(hrs1_files) > 1:
         print(f"Warning: multiple .hrs1 files found, using: {hrs1_files[0]}")
     if len(hrs2_files) > 1:
         print(f"Warning: multiple .hrs2 files found, using: {hrs2_files[0]}")
+    if len(hrs3_files) > 1:
+        print(f"Warning: multiple .hrs3 files found, using: {hrs3_files[0]}")
 
+    hrs1_path = hrs1_files[0] if hrs1_files else None
     hrs2_path = hrs2_files[0] if hrs2_files else None
-    return hrs1_files[0], hrs2_path
+    hrs3_path = hrs3_files[0] if hrs3_files else None
+    return hrs1_path, hrs2_path, hrs3_path
+
+
+def detect_app_version(directory: str) -> int:
+    """Detect which H-Reflex app version produced files in a recording directory.
+
+    Returns 1 (hreflex_txbdc 0.0.1) or 2 (hreflex_txbdc 0.0.2).
+
+    V1 file convention:
+      .hrs1 = EMG Characterization stage  (stage_type=0)
+      .hrs2 = MH Recruitment Curve stage  (stage_type=1)
+
+    V2 file convention:
+      .hrs1 = MH Recruitment Curve stage  (sweeps intensities,  stage_type=1)
+      .hrs2 = Control Mode stage           (fixed intensity,      stage_type=1)
+      .hrs3 = Down Condition Pellet stage  (V2-exclusive)
+
+    Detection priority:
+    1. .hrs3 present → always V2
+    2. .hrs1 present → read stage_type (0=EMG char → V1, else → V2)
+    3. Only .hrs2 present → read stage_description ("Control Mode" → V2, else → V1)
+    4. No files → defaults to V1 (treated as single-stage .hrs2 session)
+    """
+    hrs3_files = globmod.glob(os.path.join(directory, "*.hrs3"))
+    if hrs3_files:
+        return 2
+
+    hrs1_files = globmod.glob(os.path.join(directory, "*.hrs1"))
+    if hrs1_files:
+        try:
+            with open(hrs1_files[0], 'rb') as fid:
+                hrs_read_val(fid, 'int32')   # file_version
+                hrs_read_string(fid)          # subject_id
+                hrs_read_datetime(fid)        # session_start_time
+                hrs_read_string(fid)          # stage_name
+                hrs_read_string(fid)          # stage_description
+                stage_type = hrs_read_val(fid, 'int32')
+            # stage_type 0 = EMG Characterization → V1;
+            # stage_type 1 = MH Recruitment (V2 uses 1 for its .hrs1 stage) → V2
+            return 1 if stage_type == 0 else 2
+        except Exception:
+            pass
+
+    hrs2_files = globmod.glob(os.path.join(directory, "*.hrs2"))
+    if hrs2_files:
+        try:
+            with open(hrs2_files[0], 'rb') as fid:
+                hrs_read_val(fid, 'int32')   # file_version
+                hrs_read_string(fid)          # subject_id
+                hrs_read_datetime(fid)        # session_start_time
+                hrs_read_string(fid)          # stage_name
+                stage_description = hrs_read_string(fid)
+            # V2 Control Mode writes stage_description="Control Mode";
+            # V1 MH Recruitment writes a different description (e.g. "S2").
+            # The loading cell aliases hrs2_trials ← cm_trials when .hrs2-only V2,
+            # so all downstream analysis cells work unchanged.
+            return 2 if 'control mode' in stage_description.lower() else 1
+        except Exception:
+            pass
+
+    return 1  # default
 
 
 # ====================================================================
@@ -2150,15 +2350,15 @@ def plot_hrs2_analysis(trials, header,
     def _amp_label(d, with_bg=False):
         """Build display label for one amplitude group dict."""
         if d.get('is_merged'):
-            lbl = (f"{d['amp']:.3f} mA "
-                   f"({d['amp_lo']:.3f}–{d['amp_hi']:.3f}, n={d['n']})")
+            lbl = (f"{d['amp']:.5f} mA "
+                   f"({d['amp_lo']:.5f}–{d['amp_hi']:.5f}, n={d['n']})")
         else:
-            lbl = f"{d['amp']:.3f} mA (n={d['n']})"
+            lbl = f"{d['amp']:.5f} mA (n={d['n']})"
         if with_bg:
             _blo = d.get('bg_lo', float('nan'))
             _bhi = d.get('bg_hi', float('nan'))
             if np.isfinite(_blo) and np.isfinite(_bhi):
-                lbl += f"  BG: {_blo:.0f}–{_bhi:.0f} µV"
+                lbl += f"\nBG: {_blo:.0f}–{_bhi:.0f} µV"
         return lbl
 
     def _refresh():
@@ -2189,7 +2389,8 @@ def plot_hrs2_analysis(trials, header,
                 if j < n:
                     d = page[j]
                     _draw_avg_panel(ax, d, small=True)
-                    ax.set_title(_amp_label(d, _show_bg['val']), fontsize=24)
+                    _grid_lbl = _amp_label(d, _show_bg['val'])
+                    ax.set_title(_grid_lbl, fontsize=18 if '\n' in _grid_lbl else 24)
                 else:
                     ax.axis('off')
 
@@ -2229,13 +2430,17 @@ def plot_hrs2_analysis(trials, header,
             _out.clear_output(wait=True)
             fig, ax = plt.subplots(figsize=(_figsize['w'] * 13/15, _figsize['h'] * 5/7))
             _draw_avg_panel(ax, d, small=False)
-            ax.set_title(
+            _zoom_lbl = (
                 f"Averaged Waveforms (n={d['n']}) | "
-                f"Stim Amp: {_amp_label(d, _show_bg['val'])} | "
+                f"Stim Amp: {_amp_label(d, False)} | "
                 f"{header.subject_id}  "
-                f"({header.session_start_time:%Y-%m-%d %H:%M})",
-                fontsize=12
+                f"({header.session_start_time:%Y-%m-%d %H:%M})"
             )
+            _blo = d.get('bg_lo', float('nan'))
+            _bhi = d.get('bg_hi', float('nan'))
+            if _show_bg['val'] and np.isfinite(_blo) and np.isfinite(_bhi):
+                _zoom_lbl += f"\nBG: {_blo:.0f}–{_bhi:.0f} µV"
+            ax.set_title(_zoom_lbl, fontsize=12)
             plt.tight_layout()
             plt.show()
 
@@ -2780,11 +2985,11 @@ def plot_hrs2_trials(trials, header,
 
     def _trial_label(d, with_bg=False):
         """Build display label for one trial dict."""
-        lbl = f"Trial {d['idx']+1}  |  {d['amp']:.3f} mA"
+        lbl = f"Trial {d['idx']+1}  |  {d['amp']:.5f} mA"
         if with_bg:
             _bg = d.get('bg', float('nan'))
             if np.isfinite(_bg):
-                lbl += f"  |  BG: {_bg:.0f} µV"
+                lbl += f"\nBG: {_bg:.0f} µV"
         return lbl
 
     def _refresh():
@@ -2816,7 +3021,8 @@ def plot_hrs2_trials(trials, header,
                 if j < n:
                     d = page[j]
                     _draw_trial_panel(ax, d, small=True)
-                    ax.set_title(_trial_label(d, _show_bg_t['val']), fontsize=9)
+                    _grid_lbl_t = _trial_label(d, _show_bg_t['val'])
+                    ax.set_title(_grid_lbl_t, fontsize=7.5 if '\n' in _grid_lbl_t else 9)
                 else:
                     ax.axis('off')
 
@@ -2856,14 +3062,14 @@ def plot_hrs2_trials(trials, header,
             _out.clear_output(wait=True)
             fig, ax = plt.subplots(figsize=(_figsize['w'] * 13/15, _figsize['h'] * 5/7))
             _draw_trial_panel(ax, d, small=False)
-            ax.set_title(
-                f"Trial {d['idx']+1}  |  Stim = {d['amp']:.3f} mA"
-                + (f"  |  BG: {d['bg']:.0f} µV"
-                   if _show_bg_t['val'] and np.isfinite(d.get('bg', float('nan'))) else "")
-                + f"  |  {header.subject_id}  "
-                  f"({header.session_start_time:%Y-%m-%d %H:%M})",
-                fontsize=12
+            _zt_lbl = (
+                f"Trial {d['idx']+1}  |  Stim = {d['amp']:.5f} mA"
+                f"  |  {header.subject_id}  "
+                f"({header.session_start_time:%Y-%m-%d %H:%M})"
             )
+            if _show_bg_t['val'] and np.isfinite(d.get('bg', float('nan'))):
+                _zt_lbl += f"\nBG: {d['bg']:.0f} µV"
+            ax.set_title(_zt_lbl, fontsize=12)
             plt.tight_layout()
             plt.show()
 
@@ -2882,7 +3088,7 @@ def plot_hrs2_trials(trials, header,
         if _view_mode['val'] == 'stim':
             _pol_amps = sorted({round(t.stimulation_amplitude_ma, 3) for t in pol_trs})
             _upd_amp['val'] = True
-            _stim_amp_drop.options = ([(f'{a:.3f} mA', a) for a in _pol_amps]
+            _stim_amp_drop.options = ([(f'{a:.5f} mA', a) for a in _pol_amps]
                                       if _pol_amps else [('—', None)])
             _stim_amp_drop.disabled = not bool(_pol_amps)
             if _stim_amp_drop.value not in _pol_amps and _pol_amps:
@@ -2987,7 +3193,7 @@ def plot_hrs2_trials(trials, header,
                              value='all', button_style='',
                              layout={'width': '300px'})
     _stim_amp_drop = Dropdown(
-        options=[(f'{a:.3f} mA', a) for a in _all_amps_t],
+        options=[(f'{a:.5f} mA', a) for a in _all_amps_t],
         description='Amplitude:', layout={'width': '210px', 'display': 'none'}
     )
 
