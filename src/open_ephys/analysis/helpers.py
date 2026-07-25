@@ -63,6 +63,10 @@ BLOCK_MH_TRIAL             = 3   # V1 .hrs2 / V2 .hrs1  MH Recruitment Curve tri
 BLOCK_EMG_TRIALS_PER_HOUR  = 4
 BLOCK_DCP_TRIAL            = 5   # V2 .hrs3  Down Condition Pellet trials
 BLOCK_CONTROL_MODE_TRIAL   = 6   # V2 .hrs2  Control Mode trials
+BLOCK_FREQUENCY_TEST_TRIAL = 8   # V3 .hrsft Frequency Test trials
+BLOCK_UP_COND_PELLET_TRIAL = 9   # V3 .hrs4  Up Condition Pellet trials
+BLOCK_DOWN_COND_VNS_TRIAL  = 10  # V3 .hrs5  Down Condition VNS trials
+BLOCK_UP_COND_VNS_TRIAL    = 11  # V3 .hrs6  Up Condition VNS trials
 
 # Low-level type maps (mirrors FileIO_Helpers from hreflex_txbdc)
 _HRS_TYPE_FMT  = {'int8': 'b', 'int16': 'h', 'int32': 'i', 'int64': 'q', 'uint8': 'B', 'uint16': 'H', 'uint32': 'I', 'uint64': 'Q', 'float32': 'f', 'float64': 'd'}
@@ -177,6 +181,7 @@ class MhRecHeader:
     # Derived after reading trials: len(trial_data) / (TRIAL_RECORD_MS / 1000).
     # Defaults to 5000.0 for files with no trials.
     sample_rate: float = 5000.0
+    bin_duration_ms: int = BIN_DURATION_MS
 
 
 @dataclass
@@ -210,21 +215,62 @@ class MhRecTrial:
     # --- file_version >= 7 fields ---
     digital_onset_sample_num: int = -1   # absolute OE sample of DIGITAL IN rising edge; -1 = none
     digital_onset_channel: int = -1      # OE digital channel index (0-based); -1 = none
+    # --- file_version >= 9 fields (S2 Control Mode; inherited by V3 stages) ---
+    h_wave_response:          float = float('nan')
+    m_wave_response:          float = float('nan')
+    hm_ratio:                 float = float('nan')
+    m_wave_window_median:     float = float('nan')
+    m_wave_set_value_uv:      float = float('nan')
+    m_wave_error:             float = float('nan')
+    m_wave_adjust_step_ma:    float = float('nan')
+    m_wave_min_intensity_ma:  float = float('nan')
+    m_wave_max_intensity_ma:  float = float('nan')
 
 
 @dataclass
 class DcpTrial(MhRecTrial):
-    """Down Condition Pellet trial (hreflex_txbdc V2 .hrs3, file_version=8).
+    """Down Condition Pellet trial (hreflex_txbdc V2/V3 .hrs3).
 
-    Extends MhRecTrial with six outcome fields appended after all standard fields.
+    h_wave_response, m_wave_response, hm_ratio inherited from MhRecTrial.
+    m_wave_window_median … m_wave_max_intensity_ma inherited from MhRecTrial (V10 gate).
     """
     # --- file_version >= 8 fields (.hrs3 only) ---
-    h_wave_response:   float = float('nan')  # H-wave peak-to-peak amplitude (µV)
-    m_wave_response:   float = float('nan')  # M-wave peak-to-peak amplitude (µV)
-    hm_ratio:          float = float('nan')  # H/M ratio (0–1)
     success_threshold: float = float('nan')  # H/M ratio threshold for pellet delivery
     is_success:        int   = 0             # 1 if trial met the success threshold
     pellet_delivered:  int   = 0             # 1 if a food pellet was actually dispensed
+
+
+@dataclass
+class FrequencyTestHeader(MhRecHeader):
+    """Header for Frequency Test stage (.hrsft, V3)."""
+    n_pulses_per_train: int = 0
+    event_period_us:    int = 0
+    pulse_width_us:     int = 0
+
+
+@dataclass
+class FrequencyTestTrial(MhRecTrial):
+    """Frequency Test trial (V3 .hrsft, block_id=8)."""
+    pulse_h_wave_mra: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    pulse_m_wave_mra: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+
+
+@dataclass
+class UpCondPelletTrial(MhRecTrial):
+    """Up Condition Pellet trial (V3 .hrs4, block_id=9)."""
+    pellet_delivered: int = 0
+
+
+@dataclass
+class DownCondVnsTrial(MhRecTrial):
+    """Down Condition VNS trial (V3 .hrs5, block_id=10)."""
+    vns_delivered: int = 0
+
+
+@dataclass
+class UpCondVnsTrial(MhRecTrial):
+    """Up Condition VNS trial (V3 .hrs6, block_id=11)."""
+    vns_delivered: int = 0
 
 
 # ====================================================================
@@ -246,7 +292,8 @@ def _read_emg_data_block(fid: BinaryIO) -> EmgDataBlock:
     return block
 
 
-def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0) -> MhRecTrial:
+def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0,
+                          block_id: int = BLOCK_MH_TRIAL) -> MhRecTrial:
     t = MhRecTrial()
     t.start_time                = hrs_read_datetime(fid)
     t.min_initiation_threshold  = hrs_read_val(fid, 'float32')
@@ -292,6 +339,103 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0) -> MhRecTrial:
     if file_version >= 7:
         t.digital_onset_sample_num = hrs_read_val(fid, 'int64')
         t.digital_onset_channel    = hrs_read_val(fid, 'int32')
+    if block_id == BLOCK_CONTROL_MODE_TRIAL and file_version >= 9:
+        t.h_wave_response         = hrs_read_val(fid, 'float32')
+        t.m_wave_response         = hrs_read_val(fid, 'float32')
+        t.hm_ratio                = hrs_read_val(fid, 'float32')
+        t.m_wave_window_median    = hrs_read_val(fid, 'float32')
+        t.m_wave_set_value_uv     = hrs_read_val(fid, 'float32')
+        t.m_wave_error            = hrs_read_val(fid, 'float32')
+        t.m_wave_adjust_step_ma   = hrs_read_val(fid, 'float32')
+        t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
+        t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
+    return t
+
+
+def _read_mh_trial_block_full(fid: BinaryIO) -> MhRecTrial:
+    """Read all MhRecTrial base fields unconditionally (V3 new stages)."""
+    t = MhRecTrial()
+    t.start_time                         = hrs_read_datetime(fid)
+    t.min_initiation_threshold           = hrs_read_val(fid, 'float32')
+    t.max_initiation_threshold           = hrs_read_val(fid, 'float32')
+    t.stimulation_amplitude_ma           = hrs_read_val(fid, 'float32')
+    t.trial_data                         = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    t.sync_data                          = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    t.trigger_wall_time_ms               = hrs_read_val(fid, 'uint64')
+    t.onset_sample_index                 = hrs_read_val(fid, 'int32')
+    t.onset_detected                     = hrs_read_val(fid, 'int8')
+    t.stim_end_sample_index              = hrs_read_val(fid, 'int32')
+    t.stim_duration_samples              = hrs_read_val(fid, 'int32')
+    t.stim_duration_ms                   = hrs_read_val(fid, 'float32')
+    t.sync_peak_voltage                  = hrs_read_val(fid, 'float32')
+    t.n_pre_trigger_frames_discarded     = hrs_read_val(fid, 'int32')
+    t.frame_received_timestamps_ms       = np.array(hrs_read_array(fid, 'uint64'), dtype=np.uint64)
+    t.first_post_trigger_frame_sample_id = hrs_read_val(fid, 'uint64')
+    t.unipolar_trial_data                = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    t.stim_adc_data                      = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    t.background_emg_mean                = hrs_read_val(fid, 'float32')
+    t.background_bins                    = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    t.stim_polarity_reversed             = hrs_read_val(fid, 'int8')
+    t.digital_onset_sample_num           = hrs_read_val(fid, 'int64')
+    t.digital_onset_channel              = hrs_read_val(fid, 'int32')
+    return t
+
+
+def _read_up_cond_pellet_trial_block(fid: BinaryIO, file_version: int) -> UpCondPelletTrial:
+    """Read one Up Condition Pellet trial block (V3 .hrs4, block_id=9)."""
+    base = _read_mh_trial_block_full(fid)
+    t = UpCondPelletTrial.__new__(UpCondPelletTrial)
+    t.__dict__.update(base.__dict__)
+    t.pellet_delivered = hrs_read_val(fid, 'int8')
+    if file_version >= 2:
+        t.m_wave_window_median    = hrs_read_val(fid, 'float32')
+        t.m_wave_set_value_uv     = hrs_read_val(fid, 'float32')
+        t.m_wave_error            = hrs_read_val(fid, 'float32')
+        t.m_wave_adjust_step_ma   = hrs_read_val(fid, 'float32')
+        t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
+        t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
+    return t
+
+
+def _read_down_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> DownCondVnsTrial:
+    """Read one Down Condition VNS trial block (V3 .hrs5, block_id=10)."""
+    base = _read_mh_trial_block_full(fid)
+    t = DownCondVnsTrial.__new__(DownCondVnsTrial)
+    t.__dict__.update(base.__dict__)
+    t.vns_delivered = hrs_read_val(fid, 'int8')
+    if file_version >= 2:
+        t.m_wave_window_median    = hrs_read_val(fid, 'float32')
+        t.m_wave_set_value_uv     = hrs_read_val(fid, 'float32')
+        t.m_wave_error            = hrs_read_val(fid, 'float32')
+        t.m_wave_adjust_step_ma   = hrs_read_val(fid, 'float32')
+        t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
+        t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
+    return t
+
+
+def _read_up_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> UpCondVnsTrial:
+    """Read one Up Condition VNS trial block (V3 .hrs6, block_id=11)."""
+    base = _read_mh_trial_block_full(fid)
+    t = UpCondVnsTrial.__new__(UpCondVnsTrial)
+    t.__dict__.update(base.__dict__)
+    t.vns_delivered = hrs_read_val(fid, 'int8')
+    if file_version >= 2:
+        t.m_wave_window_median    = hrs_read_val(fid, 'float32')
+        t.m_wave_set_value_uv     = hrs_read_val(fid, 'float32')
+        t.m_wave_error            = hrs_read_val(fid, 'float32')
+        t.m_wave_adjust_step_ma   = hrs_read_val(fid, 'float32')
+        t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
+        t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
+    return t
+
+
+def _read_frequency_test_trial_block(fid: BinaryIO, file_version: int) -> FrequencyTestTrial:
+    """Read one Frequency Test trial block (V3 .hrsft, block_id=8)."""
+    base = _read_mh_trial_block_full(fid)
+    t = FrequencyTestTrial.__new__(FrequencyTestTrial)
+    t.__dict__.update(base.__dict__)
+    t.pulse_h_wave_mra = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    t.pulse_m_wave_mra = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
     return t
 
 
@@ -304,9 +448,6 @@ def _read_dcp_trial_block(fid: BinaryIO, file_version: int = 8) -> DcpTrial:
     base = _read_mh_trial_block(fid, file_version)
     t = DcpTrial.__new__(DcpTrial)
     t.__dict__.update(base.__dict__)
-    t.h_wave_response   = float('nan')
-    t.m_wave_response   = float('nan')
-    t.hm_ratio          = float('nan')
     t.success_threshold = float('nan')
     t.is_success        = 0
     t.pellet_delivered  = 0
@@ -317,6 +458,13 @@ def _read_dcp_trial_block(fid: BinaryIO, file_version: int = 8) -> DcpTrial:
         t.success_threshold = hrs_read_val(fid, 'float32')
         t.is_success        = hrs_read_val(fid, 'int8')
         t.pellet_delivered  = hrs_read_val(fid, 'int8')
+    if file_version >= 10:
+        t.m_wave_window_median    = hrs_read_val(fid, 'float32')
+        t.m_wave_set_value_uv     = hrs_read_val(fid, 'float32')
+        t.m_wave_error            = hrs_read_val(fid, 'float32')
+        t.m_wave_adjust_step_ma   = hrs_read_val(fid, 'float32')
+        t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
+        t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
     return t
 
 
@@ -432,7 +580,7 @@ def read_hrs2(filepath: str):
 
             if block_id in (BLOCK_MH_TRIAL, BLOCK_CONTROL_MODE_TRIAL):
                 try:
-                    trials.append(_read_mh_trial_block(fid, header.file_version))
+                    trials.append(_read_mh_trial_block(fid, header.file_version, block_id))
                 except (struct.error, EOFError):
                     break
             elif block_id == BLOCK_EMG_DATA:
@@ -496,6 +644,8 @@ def read_hrs2(filepath: str):
                 print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
                 break
 
+    if trials:
+        header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
     return header, trials, emg_blocks
 
 
@@ -572,55 +722,241 @@ def read_hrs3(filepath: str):
                 print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
                 break
 
+    if trials:
+        header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
+    return header, trials, emg_blocks
+
+
+def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn):
+    """Shared block-loop body for V3 stage readers (hrs4/hrs5/hrs6)."""
+    trials, emg_blocks = [], []
+    with open(filepath, 'rb') as fid:
+        header.file_version       = hrs_read_val(fid, 'int32')
+        header.subject_id         = hrs_read_string(fid)
+        header.session_start_time = hrs_read_datetime(fid)
+        header.stage_name         = hrs_read_string(fid)
+        header.stage_description  = hrs_read_string(fid)
+        header.stage_type         = hrs_read_val(fid, 'int32')
+        header.app_version        = hrs_read_string(fid)
+
+        _UNIX_MS_LO = 5e11
+        _UNIX_MS_HI = 3e12
+        while True:
+            chunk = fid.read(4)
+            if len(chunk) < 4:
+                break
+            block_id = struct.unpack('i', chunk)[0]
+            if block_id == block_id_expected:
+                try:
+                    trials.append(reader_fn(fid, header.file_version))
+                except (struct.error, EOFError):
+                    break
+            elif block_id == BLOCK_EMG_DATA:
+                pos = fid.tell()
+                peek = fid.read(24)
+                fid.seek(pos)
+                if len(peek) < 24:
+                    break
+                ts0 = struct.unpack('<Q', peek[0:8])[0]
+                ts1 = struct.unpack('<Q', peek[8:16])[0]
+                ts2 = struct.unpack('<Q', peek[16:24])[0]
+                _is_emg = (
+                    _UNIX_MS_LO < ts0 < _UNIX_MS_HI and
+                    _UNIX_MS_LO < ts1 < _UNIX_MS_HI and
+                    _UNIX_MS_LO < ts2 < _UNIX_MS_HI and
+                    ts1 >= ts0 and ts2 >= ts1 and
+                    (ts2 - ts0) < 3_600_000
+                )
+                if _is_emg:
+                    try:
+                        emg_blocks.append(_read_emg_data_block(fid))
+                    except (struct.error, EOFError):
+                        break
+                else:
+                    try:
+                        trials.append(reader_fn(fid, header.file_version))
+                    except (struct.error, EOFError):
+                        break
+            else:
+                print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
+                break
+    return trials, emg_blocks
+
+
+def read_hrs4(filepath: str):
+    """Read a .hrs4 (Up Condition Pellet) data file (hreflex_txbdc V3).
+
+    Returns (header, trials, emg_blocks).
+    """
+    header = MhRecHeader()
+    trials, emg_blocks = _make_v3_block_loop(
+        filepath, header, BLOCK_UP_COND_PELLET_TRIAL, _read_up_cond_pellet_trial_block)
+    if trials:
+        header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
+    return header, trials, emg_blocks
+
+
+def read_hrs5(filepath: str):
+    """Read a .hrs5 (Down Condition VNS) data file (hreflex_txbdc V3).
+
+    Returns (header, trials, emg_blocks).
+    """
+    header = MhRecHeader()
+    trials, emg_blocks = _make_v3_block_loop(
+        filepath, header, BLOCK_DOWN_COND_VNS_TRIAL, _read_down_cond_vns_trial_block)
+    if trials:
+        header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
+    return header, trials, emg_blocks
+
+
+def read_hrs6(filepath: str):
+    """Read a .hrs6 (Up Condition VNS) data file (hreflex_txbdc V3).
+
+    Returns (header, trials, emg_blocks).
+    """
+    header = MhRecHeader()
+    trials, emg_blocks = _make_v3_block_loop(
+        filepath, header, BLOCK_UP_COND_VNS_TRIAL, _read_up_cond_vns_trial_block)
+    if trials:
+        header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
+    return header, trials, emg_blocks
+
+
+def read_hrs_ft(filepath: str):
+    """Read a .hrsft (Frequency Test) data file (hreflex_txbdc V3).
+
+    Returns (header, trials, emg_blocks).
+    """
+    header = FrequencyTestHeader()
+    trials, emg_blocks = [], []
+
+    with open(filepath, 'rb') as fid:
+        header.file_version       = hrs_read_val(fid, 'int32')
+        header.subject_id         = hrs_read_string(fid)
+        header.session_start_time = hrs_read_datetime(fid)
+        header.stage_name         = hrs_read_string(fid)
+        header.stage_description  = hrs_read_string(fid)
+        header.stage_type         = hrs_read_val(fid, 'int32')
+        header.app_version        = hrs_read_string(fid)
+        if header.file_version >= 1:
+            header.n_pulses_per_train = hrs_read_val(fid, 'int32')
+            header.event_period_us    = hrs_read_val(fid, 'int32')
+            header.pulse_width_us     = hrs_read_val(fid, 'int32')
+
+        _UNIX_MS_LO = 5e11
+        _UNIX_MS_HI = 3e12
+        while True:
+            chunk = fid.read(4)
+            if len(chunk) < 4:
+                break
+            block_id = struct.unpack('i', chunk)[0]
+            if block_id == BLOCK_FREQUENCY_TEST_TRIAL:
+                try:
+                    trials.append(_read_frequency_test_trial_block(fid, header.file_version))
+                except (struct.error, EOFError):
+                    break
+            elif block_id == BLOCK_EMG_DATA:
+                pos = fid.tell()
+                peek = fid.read(24)
+                fid.seek(pos)
+                if len(peek) < 24:
+                    break
+                ts0 = struct.unpack('<Q', peek[0:8])[0]
+                ts1 = struct.unpack('<Q', peek[8:16])[0]
+                ts2 = struct.unpack('<Q', peek[16:24])[0]
+                _is_emg = (
+                    _UNIX_MS_LO < ts0 < _UNIX_MS_HI and
+                    _UNIX_MS_LO < ts1 < _UNIX_MS_HI and
+                    _UNIX_MS_LO < ts2 < _UNIX_MS_HI and
+                    ts1 >= ts0 and ts2 >= ts1 and
+                    (ts2 - ts0) < 3_600_000
+                )
+                if _is_emg:
+                    try:
+                        emg_blocks.append(_read_emg_data_block(fid))
+                    except (struct.error, EOFError):
+                        break
+                else:
+                    try:
+                        trials.append(_read_frequency_test_trial_block(fid, header.file_version))
+                    except (struct.error, EOFError):
+                        break
+            else:
+                print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
+                break
+
+    if trials:
+        header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
     return header, trials, emg_blocks
 
 
 def find_hrs_files(directory: str):
-    """Auto-detect .hrs1, .hrs2, and .hrs3 files in a recording directory.
+    """Auto-detect .hrs* files in a recording directory.
 
-    Returns (hrs1_path, hrs2_path, hrs3_path). Any path is None if the
-    corresponding file is absent. Raises FileNotFoundError only when no
-    .hrs* files of any kind are found in the directory.
+    Returns (hrs1_path, hrs2_path, hrs3_path, hrs4_path, hrs5_path, hrs6_path, hrsft_path).
+    Any path is None if the corresponding file is absent.  Raises FileNotFoundError
+    only when no .hrs* files of any kind are found in the directory.
     """
-    hrs1_files = globmod.glob(os.path.join(directory, "*.hrs1"))
-    hrs2_files = globmod.glob(os.path.join(directory, "*.hrs2"))
-    hrs3_files = globmod.glob(os.path.join(directory, "*.hrs3"))
+    hrs1_files  = globmod.glob(os.path.join(directory, "*.hrs1"))
+    hrs2_files  = globmod.glob(os.path.join(directory, "*.hrs2"))
+    hrs3_files  = globmod.glob(os.path.join(directory, "*.hrs3"))
+    hrs4_files  = globmod.glob(os.path.join(directory, "*.hrs4"))
+    hrs5_files  = globmod.glob(os.path.join(directory, "*.hrs5"))
+    hrs6_files  = globmod.glob(os.path.join(directory, "*.hrs6"))
+    hrsft_files = globmod.glob(os.path.join(directory, "*.hrsft"))
 
-    if not hrs1_files and not hrs2_files and not hrs3_files:
-        raise FileNotFoundError(f"No .hrs1 / .hrs2 / .hrs3 files found in '{directory}'")
-    if len(hrs1_files) > 1:
-        print(f"Warning: multiple .hrs1 files found, using: {hrs1_files[0]}")
-    if len(hrs2_files) > 1:
-        print(f"Warning: multiple .hrs2 files found, using: {hrs2_files[0]}")
-    if len(hrs3_files) > 1:
-        print(f"Warning: multiple .hrs3 files found, using: {hrs3_files[0]}")
+    if not any([hrs1_files, hrs2_files, hrs3_files, hrs4_files,
+                hrs5_files, hrs6_files, hrsft_files]):
+        raise FileNotFoundError(f"No .hrs* files found in '{directory}'")
+    for ext, files in [('.hrs1', hrs1_files), ('.hrs2', hrs2_files), ('.hrs3', hrs3_files),
+                       ('.hrs4', hrs4_files), ('.hrs5', hrs5_files), ('.hrs6', hrs6_files),
+                       ('.hrsft', hrsft_files)]:
+        if len(files) > 1:
+            print(f"Warning: multiple {ext} files found, using: {files[0]}")
 
-    hrs1_path = hrs1_files[0] if hrs1_files else None
-    hrs2_path = hrs2_files[0] if hrs2_files else None
-    hrs3_path = hrs3_files[0] if hrs3_files else None
-    return hrs1_path, hrs2_path, hrs3_path
+    return (
+        hrs1_files[0]  if hrs1_files  else None,
+        hrs2_files[0]  if hrs2_files  else None,
+        hrs3_files[0]  if hrs3_files  else None,
+        hrs4_files[0]  if hrs4_files  else None,
+        hrs5_files[0]  if hrs5_files  else None,
+        hrs6_files[0]  if hrs6_files  else None,
+        hrsft_files[0] if hrsft_files else None,
+    )
 
 
 def detect_app_version(directory: str) -> int:
     """Detect which H-Reflex app version produced files in a recording directory.
 
-    Returns 1 (hreflex_txbdc 0.0.1) or 2 (hreflex_txbdc 0.0.2).
+    Returns 1 (hreflex_txbdc 0.0.1), 2 (0.0.2), or 3 (0.0.3).
 
-    V1 file convention:
-      .hrs1 = EMG Characterization stage  (stage_type=0)
-      .hrs2 = MH Recruitment Curve stage  (stage_type=1)
-
-    V2 file convention:
-      .hrs1 = MH Recruitment Curve stage  (sweeps intensities,  stage_type=1)
-      .hrs2 = Control Mode stage           (fixed intensity,      stage_type=1)
-      .hrs3 = Down Condition Pellet stage  (V2-exclusive)
+    V1 convention: .hrs1 = EMG Char; .hrs2 = MH Recruitment.
+    V2 convention: .hrs1 = MH Recruitment; .hrs2 = Control Mode; .hrs3 = DCP.
+    V3 convention: adds .hrs4 (S4), .hrs5 (S5), .hrs6 (S6), .hrsft (FT);
+                   .hrs2 file_version bumped to 9; .hrs3 file_version bumped to 10.
 
     Detection priority:
-    1. .hrs3 present → always V2
-    2. .hrs1 present → read stage_type (0=EMG char → V1, else → V2)
-    3. Only .hrs2 present → read stage_description ("Control Mode" → V2, else → V1)
-    4. No files → defaults to V1 (treated as single-stage .hrs2 session)
+    1. .hrs4/.hrs5/.hrs6/.hrsft present → V3
+    2. .hrs2 with file_version >= 9 → V3
+    3. .hrs3 present → V2
+    4. .hrs1 present → stage_type 0 = V1, else V2
+    5. .hrs2 only → "Control Mode" in description → V2, else V1
+    6. No files → V1 (default)
     """
+    for ext in ('*.hrs4', '*.hrs5', '*.hrs6', '*.hrsft'):
+        if globmod.glob(os.path.join(directory, ext)):
+            return 3
+
+    hrs2_files = globmod.glob(os.path.join(directory, "*.hrs2"))
+    if hrs2_files:
+        try:
+            with open(hrs2_files[0], 'rb') as fid:
+                fv = hrs_read_val(fid, 'int32')
+            if fv >= 9:
+                return 3
+        except Exception:
+            pass
+
     hrs3_files = globmod.glob(os.path.join(directory, "*.hrs3"))
     if hrs3_files:
         return 2
@@ -635,13 +971,10 @@ def detect_app_version(directory: str) -> int:
                 hrs_read_string(fid)          # stage_name
                 hrs_read_string(fid)          # stage_description
                 stage_type = hrs_read_val(fid, 'int32')
-            # stage_type 0 = EMG Characterization → V1;
-            # stage_type 1 = MH Recruitment (V2 uses 1 for its .hrs1 stage) → V2
             return 1 if stage_type == 0 else 2
         except Exception:
             pass
 
-    hrs2_files = globmod.glob(os.path.join(directory, "*.hrs2"))
     if hrs2_files:
         try:
             with open(hrs2_files[0], 'rb') as fid:
@@ -650,10 +983,6 @@ def detect_app_version(directory: str) -> int:
                 hrs_read_datetime(fid)        # session_start_time
                 hrs_read_string(fid)          # stage_name
                 stage_description = hrs_read_string(fid)
-            # V2 Control Mode writes stage_description="Control Mode";
-            # V1 MH Recruitment writes a different description (e.g. "S2").
-            # The loading cell aliases hrs2_trials ← cm_trials when .hrs2-only V2,
-            # so all downstream analysis cells work unchanged.
             return 2 if 'control mode' in stage_description.lower() else 1
         except Exception:
             pass
@@ -1345,6 +1674,99 @@ def plot_hm_ratio_summary(trials_by_polarity, header,
     )
     plt.tight_layout()
     plt.show()
+
+
+def plot_mwave_control_error(trials, header, title_suffix: str = ''):
+    """Plot M-wave stabilization control error and stim amplitude over trials (V3 S2+).
+
+    Left Y axis : m_wave_error (µV); falls back to m_wave_window_median when all NaN.
+    Right Y axis: stimulation_amplitude_ma (mA, orange).
+
+    Requires trials with file_version >= 9 fields populated (V3 Control Mode / S4/S5/S6).
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    if not trials:
+        print("No trials to plot.")
+        return
+
+    trial_nums   = list(range(1, len(trials) + 1))
+    errors       = [getattr(t, 'm_wave_error',        float('nan')) for t in trials]
+    medians      = [getattr(t, 'm_wave_window_median', float('nan')) for t in trials]
+    stim_amps    = [t.stimulation_amplitude_ma for t in trials]
+
+    has_error = any(not (e != e) for e in errors)  # nan check: e != e iff nan
+    y_left       = errors  if has_error else medians
+    y_left_label = 'M-wave Error (µV)' if has_error else 'M-wave Window Median (µV)'
+
+    fig = make_subplots(specs=[[{'secondary_y': True}]])
+    fig.add_trace(
+        go.Scatter(x=trial_nums, y=y_left, name=y_left_label,
+                   mode='lines+markers', marker=dict(size=3), line=dict(color='steelblue')),
+        secondary_y=False)
+    fig.add_trace(
+        go.Scatter(x=trial_nums, y=stim_amps, name='Stim Amplitude (mA)',
+                   mode='lines+markers', marker=dict(size=3), line=dict(color='orange')),
+        secondary_y=True)
+
+    title = f'M-Wave Control Error — {header.subject_id}'
+    if title_suffix:
+        title += f'  {title_suffix}'
+    fig.update_layout(title=title, xaxis_title='Trial #', height=400,
+                      legend=dict(orientation='h', yanchor='bottom', y=1.02))
+    fig.update_yaxes(title_text=y_left_label, secondary_y=False)
+    fig.update_yaxes(title_text='Stim Amplitude (mA)', secondary_y=True)
+    fig.show()
+
+
+def plot_frequency_test(trials, header, title_suffix: str = ''):
+    """Plot per-pulse H-wave and M-wave MRA across a Frequency Test train (V3 FT).
+
+    Shows mean ± std of pulse_h_wave_mra and pulse_m_wave_mra across all trials,
+    normalised to pulse 1 to show depression.
+    """
+    import plotly.graph_objects as go
+
+    if not trials:
+        print("No trials to plot.")
+        return
+
+    n_pulses = header.n_pulses_per_train if hasattr(header, 'n_pulses_per_train') else 0
+    h_arrays = [getattr(t, 'pulse_h_wave_mra', np.array([])) for t in trials]
+    m_arrays = [getattr(t, 'pulse_m_wave_mra', np.array([])) for t in trials]
+    h_valid  = [a for a in h_arrays if len(a) > 0]
+    m_valid  = [a for a in m_arrays if len(a) > 0]
+
+    if not h_valid and not m_valid:
+        print("No pulse MRA data available.")
+        return
+
+    pulse_idx = list(range(1, (len(h_valid[0]) if h_valid else len(m_valid[0])) + 1))
+    fig = go.Figure()
+    if h_valid:
+        h_mat = np.vstack(h_valid)
+        fig.add_trace(go.Scatter(x=pulse_idx, y=h_mat.mean(axis=0).tolist(),
+                                  error_y=dict(type='data', array=h_mat.std(axis=0).tolist()),
+                                  name='H-wave MRA (µV)', mode='lines+markers',
+                                  line=dict(color='royalblue')))
+    if m_valid:
+        m_mat = np.vstack(m_valid)
+        fig.add_trace(go.Scatter(x=pulse_idx, y=m_mat.mean(axis=0).tolist(),
+                                  error_y=dict(type='data', array=m_mat.std(axis=0).tolist()),
+                                  name='M-wave MRA (µV)', mode='lines+markers',
+                                  line=dict(color='firebrick')))
+
+    title = f'Frequency Test — {header.subject_id}'
+    if hasattr(header, 'event_period_us') and header.event_period_us > 0:
+        hz = round(1e6 / header.event_period_us, 1)
+        title += f'  ({hz} Hz train)'
+    if title_suffix:
+        title += f'  {title_suffix}'
+    fig.update_layout(title=title, xaxis_title='Pulse # in train',
+                      yaxis_title='MRA (µV)', height=450,
+                      legend=dict(orientation='h', yanchor='bottom', y=1.02))
+    fig.show()
 
 
 def plot_amplitude_distribution(trials, header):
