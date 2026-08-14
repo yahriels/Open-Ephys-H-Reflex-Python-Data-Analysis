@@ -903,14 +903,14 @@ def find_hrs_files(directory: str):
     hrs4_files  = globmod.glob(os.path.join(directory, "*.hrs4"))
     hrs5_files  = globmod.glob(os.path.join(directory, "*.hrs5"))
     hrs6_files  = globmod.glob(os.path.join(directory, "*.hrs6"))
-    hrsft_files = globmod.glob(os.path.join(directory, "*.hrsft"))
+    hrsft_files = globmod.glob(os.path.join(directory, "*.hrft"))
 
     if not any([hrs1_files, hrs2_files, hrs3_files, hrs4_files,
                 hrs5_files, hrs6_files, hrsft_files]):
         raise FileNotFoundError(f"No .hrs* files found in '{directory}'")
     for ext, files in [('.hrs1', hrs1_files), ('.hrs2', hrs2_files), ('.hrs3', hrs3_files),
                        ('.hrs4', hrs4_files), ('.hrs5', hrs5_files), ('.hrs6', hrs6_files),
-                       ('.hrsft', hrsft_files)]:
+                       ('.hrft', hrsft_files)]:
         if len(files) > 1:
             print(f"Warning: multiple {ext} files found, using: {files[0]}")
 
@@ -943,7 +943,7 @@ def detect_app_version(directory: str) -> int:
     5. .hrs2 only → "Control Mode" in description → V2, else V1
     6. No files → V1 (default)
     """
-    for ext in ('*.hrs4', '*.hrs5', '*.hrs6', '*.hrsft'):
+    for ext in ('*.hrs4', '*.hrs5', '*.hrs6', '*.hrft'):
         if globmod.glob(os.path.join(directory, ext)):
             return 3
 
@@ -1767,6 +1767,354 @@ def plot_frequency_test(trials, header, title_suffix: str = ''):
                       yaxis_title='MRA (µV)', height=450,
                       legend=dict(orientation='h', yanchor='bottom', y=1.02))
     fig.show()
+
+
+def plot_ft_depression_curve(trials, header, sample_rate=None, title_suffix=''):
+    """Mean ± 1σ H-wave and M-wave MRA per pulse position across all FT trials.
+
+    The most-recent trial is overlaid as a dashed line so you can compare the
+    last-observed depression profile against the session average.
+    """
+    import matplotlib.pyplot as plt
+
+    if not trials:
+        print("No trials to plot.")
+        return
+
+    h_arrays = [getattr(t, 'pulse_h_wave_mra', np.array([])) for t in trials]
+    m_arrays = [getattr(t, 'pulse_m_wave_mra', np.array([])) for t in trials]
+    h_valid  = [a for a in h_arrays if len(a) > 0]
+    m_valid  = [a for a in m_arrays if len(a) > 0]
+
+    if not h_valid and not m_valid:
+        print("No pulse MRA data available.")
+        return
+
+    n_pulses  = len(h_valid[0]) if h_valid else len(m_valid[0])
+    pulse_idx = np.arange(1, n_pulses + 1)
+    hz        = round(1e6 / header.event_period_us, 1) if getattr(header, 'event_period_us', 0) else '?'
+    try:
+        amp_str = f'{float(getattr(trials[0], "stimulation_amplitude_ma", 0.0)):.3f} mA'
+    except (TypeError, ValueError):
+        amp_str = '? mA'
+
+    fig, ax = plt.subplots(figsize=(max(8, n_pulses * 0.85), 5))
+
+    if h_valid:
+        h_mat  = np.vstack(h_valid)
+        h_mean = h_mat.mean(axis=0)
+        h_std  = h_mat.std(axis=0)
+        ax.plot(pulse_idx, h_mean, 'o-', color='royalblue', lw=2, ms=7,
+                label=f'H-wave mean (n={len(h_valid)})', zorder=4)
+        ax.fill_between(pulse_idx, h_mean - h_std, h_mean + h_std,
+                        color='royalblue', alpha=0.18, zorder=3)
+        ax.plot(pulse_idx, h_valid[-1], 'o--', color='royalblue', lw=1.2, ms=4,
+                alpha=0.55, label='H-wave (last trial)', zorder=3)
+
+    if m_valid:
+        m_mat  = np.vstack(m_valid)
+        m_mean = m_mat.mean(axis=0)
+        m_std  = m_mat.std(axis=0)
+        ax.plot(pulse_idx, m_mean, 's-', color='firebrick', lw=2, ms=7,
+                label=f'M-wave mean (n={len(m_valid)})', zorder=4)
+        ax.fill_between(pulse_idx, m_mean - m_std, m_mean + m_std,
+                        color='firebrick', alpha=0.18, zorder=3)
+        ax.plot(pulse_idx, m_valid[-1], 's--', color='firebrick', lw=1.2, ms=4,
+                alpha=0.55, label='M-wave (last trial)', zorder=3)
+
+    ax.set_xlabel('Pulse # in train', fontsize=11)
+    ax.set_ylabel('MRA (µV)', fontsize=11)
+    ax.set_xticks(pulse_idx)
+    title = f'H/M Wave Per Pulse  ·  {hz} Hz  ·  {amp_str}  ·  n={len(trials)} trials'
+    if title_suffix:
+        title += f'  ·  {title_suffix}'
+    ax.set_title(title, fontsize=11)
+    ax.legend(loc='upper right', fontsize=9)
+    ax.grid(axis='y', alpha=0.3, ls='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_ft_averaged_waveforms(trials, header, pre_pulse_ms=2.0, post_pulse_ms=20.0,
+                                m_start_ms=2.0, m_end_ms=4.0,
+                                h_start_ms=6.0, h_end_ms=10.0,
+                                sample_rate=None, n_per_page=6, page=0):
+    """Paged 2×3 grid of averaged EMG waveforms per pulse position, mirroring plot_hrs2_analysis.
+
+    Each tile shows individual trial segments (low alpha) + bold mean waveform for one
+    pulse position. M-wave window is blue-shaded with dashed borders; H-wave is green.
+    MRA annotations (hlines + text) match the HRS2 analysis style.
+    A colorbar at the top maps pulse # to colour (coolwarm: blue=1, red=last).
+
+    Returns total_pages (int).
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+    from matplotlib.gridspec import GridSpec
+
+    sr       = sample_rate or getattr(header, 'sample_rate', SAMPLE_RATE)
+    n_pulses = getattr(header, 'n_pulses_per_train', 0)
+    if n_pulses == 0:
+        n_pulses = max((len(getattr(t, 'pulse_h_wave_mra', [])) for t in trials), default=0)
+    if n_pulses == 0:
+        print("No pulse data available.")
+        return 1
+
+    period_us = getattr(header, 'event_period_us', 0)
+    if period_us == 0:
+        print("event_period_us not set — cannot reconstruct pulse timing.")
+        return 1
+
+    pulse_period_samples = round(period_us / 1e6 * sr)
+    pre_samp  = round(pre_pulse_ms  * sr / 1000)
+    post_samp = round(post_pulse_ms * sr / 1000)
+    t_ms      = np.linspace(-pre_pulse_ms, post_pulse_ms, pre_samp + post_samp)
+    hz        = round(1e6 / period_us, 1)
+    colors    = cm.coolwarm(np.linspace(0, 1, max(n_pulses, 2)))
+
+    total_pages = max(1, int(np.ceil(n_pulses / n_per_page)))
+    page        = max(0, min(page, total_pages - 1))
+    start_k     = page * n_per_page
+    end_k       = min(start_k + n_per_page, n_pulses)
+
+    # Extract and average segments for each pulse position on this page
+    pulse_data = []
+    for k in range(start_k, end_k):
+        segs, h_mras, m_mras = [], [], []
+        for t in trials:
+            onset = getattr(t, 'onset_sample_index', -1)
+            if onset < 0:
+                continue
+            emg     = np.array(t.trial_data, dtype=float)
+            onset_k = onset + k * pulse_period_samples
+            s, e    = onset_k - pre_samp, onset_k + post_samp
+            if s >= 0 and e <= len(emg):
+                segs.append(emg[s:e])
+            h_arr = getattr(t, 'pulse_h_wave_mra', [])
+            m_arr = getattr(t, 'pulse_m_wave_mra', [])
+            if k < len(h_arr):
+                h_mras.append(float(h_arr[k]))
+            if k < len(m_arr):
+                m_mras.append(float(m_arr[k]))
+        pulse_data.append((k, segs,
+                           float(np.mean(h_mras)) if h_mras else 0.0,
+                           float(np.mean(m_mras)) if m_mras else 0.0))
+
+    ncols, nrows = 3, 2
+    fig = plt.figure(figsize=(15.0, 7.5))
+    gs  = GridSpec(nrows + 1, ncols,
+                   height_ratios=[0.10] + [1] * nrows,
+                   hspace=0.55, wspace=0.35,
+                   top=0.93, bottom=0.08, left=0.07, right=0.97)
+
+    # Colorbar spanning all columns — pulse # → colour legend
+    cbar_ax = fig.add_subplot(gs[0, :])
+    sm = plt.cm.ScalarMappable(cmap='coolwarm',
+                                norm=plt.Normalize(1, max(n_pulses, 2)))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label(f'Pulse # in train  (blue = pulse 1  ·  red = pulse {n_pulses})',
+                   fontsize=9)
+    ticks = sorted({1, max(1, n_pulses // 2), n_pulses})
+    cbar.set_ticks(ticks)
+    cbar.set_ticklabels([f'Pulse {tt}' for tt in ticks])
+
+    for idx, (k, segs, h_mra, m_mra) in enumerate(pulse_data):
+        row, col = divmod(idx, ncols)
+        ax       = fig.add_subplot(gs[row + 1, col])
+        color    = colors[k]
+
+        # M-wave: blue shading + dashed borders
+        ax.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.13, zorder=1)
+        ax.axvline(m_start_ms, color='blue',  ls='--', lw=1.2, alpha=0.8, zorder=2)
+        ax.axvline(m_end_ms,   color='blue',  ls='--', lw=1.2, alpha=0.8, zorder=2)
+        # H-wave: green shading + dashed borders
+        ax.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.13, zorder=1)
+        ax.axvline(h_start_ms, color='green', ls='--', lw=1.2, alpha=0.8, zorder=2)
+        ax.axvline(h_end_ms,   color='green', ls='--', lw=1.2, alpha=0.8, zorder=2)
+        # Stim onset
+        ax.axvline(0, color='#aaa', lw=0.8, ls=':', zorder=1)
+
+        # Individual trial traces (low alpha, gray)
+        for seg in segs:
+            ax.plot(t_ms[:len(seg)], seg, color='#888', lw=0.5, alpha=0.18, zorder=2)
+
+        # Bold mean waveform
+        if segs:
+            mean_seg = np.mean(np.vstack(segs), axis=0)
+            ax.plot(t_ms[:len(mean_seg)], mean_seg, color='black', lw=2.0, zorder=4)
+
+        # MRA annotation: hline at MRA level + text label (matching HRS2 style)
+        trans  = ax.get_xaxis_transform()
+        m_mid  = (m_start_ms + m_end_ms) / 2
+        h_mid  = (h_start_ms + h_end_ms) / 2
+        if m_mra != 0:
+            ax.hlines(m_mra, m_start_ms, m_end_ms,
+                      colors='blue', lw=1.5, ls=':', zorder=5)
+            ax.text(m_mid, 0.91, f'M: {m_mra:.1f} µV',
+                    transform=trans, ha='center', va='bottom', fontsize=7,
+                    color='blue',
+                    bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1))
+        if h_mra != 0:
+            ax.hlines(h_mra, h_start_ms, h_end_ms,
+                      colors='darkgreen', lw=1.5, ls=':', zorder=5)
+            ax.text(h_mid, 0.83, f'H: {h_mra:.1f} µV',
+                    transform=trans, ha='center', va='bottom', fontsize=7,
+                    color='darkgreen',
+                    bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1))
+
+        ax.set_title(f'Pulse {k + 1} / {n_pulses}', fontsize=9,
+                     color=color, fontweight='bold')
+        ax.set_xlabel('ms', fontsize=8)
+        ax.set_ylabel('µV', fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.grid(axis='y', alpha=0.2, ls='--')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+    # Hide unused tiles
+    for idx in range(len(pulse_data), ncols * nrows):
+        row, col = divmod(idx, ncols)
+        fig.add_subplot(gs[row + 1, col]).set_visible(False)
+
+    try:
+        amp_str = f'{float(getattr(trials[0], "stimulation_amplitude_ma", 0.0)):.3f} mA'
+    except (TypeError, ValueError):
+        amp_str = '? mA'
+    fig.suptitle(
+        f'Averaged Pulse Waveforms  ·  {hz} Hz  ·  {amp_str}  ·  '
+        f'n={len(trials)} trials  ·  Page {page + 1} / {total_pages}',
+        fontsize=11, y=0.99)
+    plt.show()
+
+    return total_pages
+
+
+def plot_ft_peak_curve(trials, header, sample_rate=None,
+                        m_start_ms=2.0, m_end_ms=4.0,
+                        h_start_ms=6.0, h_end_ms=10.0,
+                        title_suffix=''):
+    """Peak |EMG| within H/M windows per pulse position, averaged across all FT trials.
+
+    Complements plot_ft_depression_curve (which uses pre-stored MRA values).
+    Peak = max(|EMG|) extracted directly from trial_data within each wave window.
+    """
+    import matplotlib.pyplot as plt
+
+    sr       = sample_rate or getattr(header, 'sample_rate', SAMPLE_RATE)
+    n_pulses = getattr(header, 'n_pulses_per_train', 0)
+    if n_pulses == 0:
+        n_pulses = max((len(getattr(t, 'pulse_h_wave_mra', [])) for t in trials), default=0)
+    if n_pulses == 0:
+        print("No pulse data available.")
+        return
+
+    period_us = getattr(header, 'event_period_us', 0)
+    if period_us == 0:
+        print("event_period_us not set.")
+        return
+
+    pulse_period_samples = round(period_us / 1e6 * sr)
+    h_peaks_all, m_peaks_all = [], []
+
+    for t in trials:
+        onset = getattr(t, 'onset_sample_index', -1)
+        if onset < 0:
+            continue
+        emg_abs = np.abs(np.array(t.trial_data, dtype=float))
+        h_row, m_row = [], []
+        for k in range(n_pulses):
+            onset_k = onset + k * pulse_period_samples
+            h_s = onset_k + round(h_start_ms * sr / 1000)
+            h_e = onset_k + round(h_end_ms   * sr / 1000)
+            m_s = onset_k + round(m_start_ms * sr / 1000)
+            m_e = onset_k + round(m_end_ms   * sr / 1000)
+            h_seg = emg_abs[h_s:h_e]
+            m_seg = emg_abs[m_s:m_e]
+            h_row.append(float(np.max(h_seg)) if len(h_seg) > 0 else 0.0)
+            m_row.append(float(np.max(m_seg)) if len(m_seg) > 0 else 0.0)
+        h_peaks_all.append(h_row)
+        m_peaks_all.append(m_row)
+
+    if not h_peaks_all:
+        print("No valid trial data for peak calculation.")
+        return
+
+    h_mat     = np.array(h_peaks_all)
+    m_mat     = np.array(m_peaks_all)
+    pulse_idx = np.arange(1, n_pulses + 1)
+    hz = round(1e6 / period_us, 1)
+    try:
+        amp_str = f'{float(getattr(trials[0], "stimulation_amplitude_ma", 0.0)):.3f} mA'
+    except (TypeError, ValueError):
+        amp_str = '? mA'
+
+    fig, ax = plt.subplots(figsize=(max(8, n_pulses * 0.85), 5))
+
+    h_mean, h_std = h_mat.mean(axis=0), h_mat.std(axis=0)
+    m_mean, m_std = m_mat.mean(axis=0), m_mat.std(axis=0)
+
+    ax.plot(pulse_idx, h_mean, 'o-', color='royalblue', lw=2, ms=7,
+            label=f'H-wave peak (n={len(h_peaks_all)})', zorder=4)
+    ax.fill_between(pulse_idx, h_mean - h_std, h_mean + h_std,
+                    color='royalblue', alpha=0.18, zorder=3)
+    ax.plot(pulse_idx, h_mat[-1], 'o--', color='royalblue', lw=1.2, ms=4,
+            alpha=0.55, label='H-wave peak (last trial)', zorder=3)
+
+    ax.plot(pulse_idx, m_mean, 's-', color='firebrick', lw=2, ms=7,
+            label=f'M-wave peak (n={len(m_peaks_all)})', zorder=4)
+    ax.fill_between(pulse_idx, m_mean - m_std, m_mean + m_std,
+                    color='firebrick', alpha=0.18, zorder=3)
+    ax.plot(pulse_idx, m_mat[-1], 's--', color='firebrick', lw=1.2, ms=4,
+            alpha=0.55, label='M-wave peak (last trial)', zorder=3)
+
+    ax.set_xlabel('Pulse # in train', fontsize=11)
+    ax.set_ylabel('Peak |EMG|  (µV)', fontsize=11)
+    ax.set_xticks(pulse_idx)
+    title = f'H/M Peak Per Pulse  ·  {hz} Hz  ·  {amp_str}  ·  n={len(trials)} trials'
+    if title_suffix:
+        title += f'  ·  {title_suffix}'
+    ax.set_title(title, fontsize=11)
+    ax.legend(loc='upper right', fontsize=9)
+    ax.grid(axis='y', alpha=0.3, ls='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_ft_background_emg(trials, header):
+    """Histogram of pre-trial background EMG mean across all FT trials."""
+    import matplotlib.pyplot as plt
+
+    bg_vals = [v for v in
+               (getattr(t, 'background_emg_mean', 0.0) for t in trials) if v > 0]
+    if not bg_vals:
+        print("No background EMG data available.")
+        return
+
+    bg        = np.array(bg_vals, dtype=float)
+    q1, med, q3 = np.percentile(bg, [25, 50, 75])
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(bg, bins=30, color='steelblue', edgecolor='white', alpha=0.8)
+    ax.axvline(q1,  color='orange', lw=1.5, ls='--', label=f'Q1 = {q1:.2f} µV')
+    ax.axvline(med, color='crimson', lw=2.0, ls='-',  label=f'Median = {med:.2f} µV')
+    ax.axvline(q3,  color='orange', lw=1.5, ls='--', label=f'Q3 = {q3:.2f} µV')
+    ax.set_xlabel('Background EMG Mean (µV)', fontsize=11)
+    ax.set_ylabel('Trial count', fontsize=11)
+    ax.set_title(
+        f'Background EMG Distribution  ·  {len(bg_vals)} trials  '
+        f'[median = {med:.2f}, IQR = {q1:.2f}–{q3:.2f} µV]',
+        fontsize=11)
+    ax.legend(fontsize=9)
+    ax.grid(axis='y', alpha=0.3, ls='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+    plt.show()
 
 
 def plot_amplitude_distribution(trials, header):
@@ -9994,3 +10342,250 @@ def plot_background_grand_means(hrs2_trials, emg_blocks, header, sample_rate):
     plt.show()
 
     return {'trial_bg_gm': trial_bg_gm, 'q1': gm_q1, 'median': gm_med, 'q3': gm_q3}
+
+
+# ── Notebook viewer utilities ──────────────────────────────────────────────────
+
+def make_viewer(all_recordings, active_rec_label, render_fn, stage_filter=None):
+    """
+    Creates a self-contained interactive viewer widget with per-viewer Recording + Stage dropdowns.
+
+    Parameters
+    ----------
+    all_recordings : dict
+        {label: {stage_map, sample_rate, hrs1_header, ...}} as built by the load cell.
+    active_rec_label : str
+        Initial recording label to display.
+    render_fn : callable
+        render_fn(trials, header, emg_blocks, stage_label, rec_label, sample_rate, hrs1_header)
+        Called inside an Output context.
+    stage_filter : callable, optional
+        stage_filter(key, trials, header, emg_blocks, label) -> bool
+        Only stages returning True appear in the Stage dropdown.
+
+    Returns
+    -------
+    (widget, render_fn)
+        widget: VBox with dropdowns + output area; call display(widget).
+        render_fn: call once after display() to populate the initial view.
+    """
+    from ipywidgets import Dropdown, VBox, Output
+
+    _out = Output()
+
+    def _stage_opts_for(rec_label):
+        sm = all_recordings[rec_label]['stage_map']
+        result = []
+        for sk, (_t, _h, _e, lbl) in sm.items():
+            if not _t:
+                continue
+            if stage_filter is not None and not stage_filter(sk, _t, _h, _e, lbl):
+                continue
+            result.append((lbl, sk))
+        return result
+
+    _init_opts = _stage_opts_for(active_rec_label)
+    _rec_d = Dropdown(
+        options=list(all_recordings.keys()), value=active_rec_label,
+        description='Recording:', layout={'width': '600px'}
+    )
+    _stage_d = Dropdown(
+        options=_init_opts, description='Stage:', layout={'width': '480px'}
+    )
+    if _init_opts:
+        _stage_d.value = _init_opts[0][1]
+
+    def _render():
+        rec_label = _rec_d.value
+        stage_key = _stage_d.value
+        rec = all_recordings[rec_label]
+        sm  = rec['stage_map']
+        with _out:
+            _out.clear_output(wait=True)
+            if not stage_key or stage_key not in sm:
+                print(f'No compatible stages available for {rec_label!r}.')
+                return
+            _t, _h, _e, _lbl = sm[stage_key]
+            render_fn(_t, _h, _e, _lbl, rec_label, rec['sample_rate'], rec['hrs1_header'])
+
+    def _on_stage_change(change):
+        _render()
+
+    def _on_rec_change(change):
+        new_opts = _stage_opts_for(_rec_d.value)
+        _stage_d.unobserve(_on_stage_change, names='value')
+        _stage_d.options = new_opts
+        _stage_d.value   = new_opts[0][1] if new_opts else None
+        _stage_d.observe(_on_stage_change, names='value')
+        _render()
+
+    _rec_d.observe(_on_rec_change, names='value')
+    _stage_d.observe(_on_stage_change, names='value')
+
+    controls = ([_rec_d] if len(all_recordings) > 1 else []) + [_stage_d]
+    return VBox(controls + [_out]), _render
+
+
+def compute_h_comparison_data(all_recordings, pre_ms, post_ms, h_start_ms, h_end_ms,
+                               m_start_ms=2.0, m_end_ms=4.0):
+    """
+    Pre-compute per-trial H-reflex size, M-wave size, and background MRA for the
+    cross-recording comparison plot.
+
+    Per trial:
+      bg_mra  = mean|emg(t < 0)|
+      h_size  = mean|emg(t in [h_start_ms, h_end_ms])| - bg_mra
+      m_size  = mean|emg(t in [m_start_ms, m_end_ms])| - bg_mra
+      bg_size = bg_mra  (raw pre-stim background level)
+
+    Call once after loading recordings and setting analysis parameters. Returns a
+    cache dict that plot_h_reflex_comparison() consumes directly.
+
+    Parameters
+    ----------
+    all_recordings : dict  — as built by the notebook load cell
+    pre_ms, post_ms : float — trial window bounds (ms before/after stim onset)
+    h_start_ms, h_end_ms : float — H-wave window bounds
+    m_start_ms, m_end_ms : float — M-wave window bounds
+
+    Returns
+    -------
+    dict : {rec_label: {stage_key: {'h_sizes', 'm_sizes', 'bg_sizes': np.ndarray, 'mean_amp': float}}}
+        Each array has one value per trial with a valid pre-stim window.
+    """
+    result = {}
+    for rec_label, rec in all_recordings.items():
+        result[rec_label] = {}
+        sr = rec['sample_rate'] or getattr(rec['hrs1_header'], 'sample_rate', SAMPLE_RATE)
+        ms_per_sample = 1000.0 / sr
+
+        for stage_key, (trials, _, _, _) in rec['stage_map'].items():
+            if not trials:
+                continue
+
+            h_sizes, m_sizes, bg_sizes = [], [], []
+            for t in trials:
+                try:
+                    t_ms, emg, *_ = get_trial_window(
+                        t, pre_ms, post_ms, ms_per_sample=ms_per_sample)
+                    bg_mask = t_ms < 0
+                    if not bg_mask.any():
+                        continue
+                    bg_mra = float(np.mean(np.abs(emg[bg_mask])))
+                    bg_sizes.append(bg_mra)
+                    h_mask = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
+                    if h_mask.any():
+                        h_sizes.append(float(np.mean(np.abs(emg[h_mask]))) - bg_mra)
+                    m_mask = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+                    if m_mask.any():
+                        m_sizes.append(float(np.mean(np.abs(emg[m_mask]))) - bg_mra)
+                except Exception:
+                    continue
+
+            if not bg_sizes:
+                continue
+
+            amps     = [t.stimulation_amplitude_ma for t in trials]
+            mean_amp = float(np.mean(amps))
+            std_amp  = float(np.std(amps, ddof=min(1, len(amps) - 1)))
+            result[rec_label][stage_key] = {
+                'h_sizes':  np.array(h_sizes,  dtype=float),
+                'm_sizes':  np.array(m_sizes,  dtype=float),
+                'bg_sizes': np.array(bg_sizes, dtype=float),
+                'mean_amp': mean_amp,
+                'std_amp':  std_amp,
+            }
+
+    return result
+
+
+def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
+                             metric='h_reflex'):
+    """
+    Render a cross-recording comparison box-and-whisker plot.
+
+    Each box shows the per-trial distribution across ALL trials in that recording.
+
+    Parameters
+    ----------
+    h_cache : dict — return value of compute_h_comparison_data()
+    recording_dirs : list — RECORDING_DIRS list of (label, path, sr) tuples; sets x-axis order
+    stage_key : str — which stage to display (e.g. 'control_mode')
+    stage_labels : dict — {stage_key: display_label}
+    metric : str — 'h_reflex', 'm_wave', or 'background'
+    """
+    import matplotlib.pyplot as plt
+
+    stage_lbl = stage_labels.get(stage_key, stage_key)
+
+    _metric_cfg = {
+        'h_reflex':   ('h_sizes',  'H-Reflex Size  (µV)  [H-MRA − BG-MRA]',  'H-Reflex Size Across Recordings'),
+        'm_wave':     ('m_sizes',  'M-Wave Size  (µV)  [M-MRA − BG-MRA]',     'M-Wave Size Across Recordings'),
+        'background': ('bg_sizes', 'Background MRA  (µV)',                      'EMG Background Level Across Recordings'),
+    }
+    sizes_key, ylabel, title_base = _metric_cfg.get(metric, _metric_cfg['h_reflex'])
+
+    # Collect data in RECORDING_DIRS order; skip recordings missing this stage/data
+    ordered = [lbl for lbl, _, _ in recording_dirs if lbl in h_cache]
+    valid = []
+    for lbl in ordered:
+        entry = h_cache[lbl].get(stage_key)
+        if entry is not None:
+            sizes = entry.get(sizes_key, np.array([]))
+            if len(sizes) >= 1:
+                valid.append((lbl, sizes, entry['mean_amp'], entry.get('std_amp', 0.0)))
+
+    if not valid:
+        print(f'No data for stage {stage_lbl!r} / metric {metric!r} in any recording.')
+        return
+
+    n  = len(valid)
+    bw = 0.46
+    fig, ax = plt.subplots(figsize=(max(6, n * 2.0), 5))
+
+    all_flat = np.concatenate([d for _, d, _, _ in valid])
+    y_span   = float(all_flat.max() - all_flat.min()) or 1.0
+
+    means, xlbls = [], []
+    for i, (rl, sizes, mean_amp, std_amp) in enumerate(valid):
+        n_trials = len(sizes)
+        mn = float(np.mean(sizes))
+        sd = float(np.std(sizes, ddof=min(1, n_trials - 1)))
+        means.append(mn)
+        xlbls.append(f'{rl}\nσ={std_amp:.3f} mA')
+
+        if n_trials >= 2:
+            q1, med, q3 = (float(v) for v in np.percentile(sizes, [25, 50, 75]))
+            ax.bar(i, q3 - q1, bottom=q1, width=bw,
+                   color='lightsteelblue', edgecolor='steelblue', lw=1.5,
+                   alpha=0.75, zorder=3)
+            ax.hlines(med, i - bw / 2, i + bw / 2,
+                      colors='steelblue', lw=2.5, zorder=4)
+            ax.vlines(i, mn - sd, mn + sd, colors='#1e3a5f', lw=1.5, zorder=4)
+            ax.hlines([mn - sd, mn + sd], i - 0.13, i + 0.13,
+                      colors='#1e3a5f', lw=1.5, zorder=4)
+
+        ax.plot(i, mn, 'D', color='#1e3a5f', ms=8, zorder=5)
+
+        top = (mn + sd) if n_trials >= 2 else mn
+        ax.text(i, top + y_span * 0.04,
+                f'n={n_trials}\namp = {mean_amp:.3f} ± {std_amp:.3f} mA\nμ = {mn:.3f} ± {sd:.3f} µV',
+                ha='center', va='bottom', fontsize=8, color='#444', zorder=6)
+
+    if len(means) > 1:
+        ax.plot(range(n), means, '--', color='#1e3a5f', lw=1.5, alpha=0.65, zorder=2)
+
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(xlbls, rotation=20, ha='right', fontsize=9)
+    ax.set_ylabel(ylabel, fontsize=10)
+    ax.set_title(
+        f'{title_base}  ·  {stage_lbl}\n'
+        f'box = IQR  ·  — = median  ·  ◆ = mean  ·  whiskers = mean ± 1σ  ·  n = trials',
+        fontsize=10)
+    ax.set_xlim(-0.65, n - 0.35)
+    ax.margins(y=0.22)
+    ax.grid(axis='y', alpha=0.3, ls='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+    plt.show()
