@@ -49,7 +49,8 @@ SIMULATION_RANDOM_SEED = 42
 
 SAMPLE_RATE = 5000.0                     # Hz
 BIN_SAMPLES = int(BIN_DURATION_MS * SAMPLE_RATE / 1000)    # 250 samples
-TRIAL_RECORD_MS = 100                    # ms post-stim recording window
+TRIAL_RECORD_MS = 100                    # ms post-stim recording window (MH/DCP stages)
+CONDITIONING_TRIAL_RECORD_MS = 577.0    # ms recording window for conditioning stages (.hrs4/.hrs5/.hrs6)
 TRIAL_RECORD_SAMPLES = int(TRIAL_RECORD_MS * SAMPLE_RATE / 1000)  # 500 samples
 MS_PER_SAMPLE = 1000.0 / SAMPLE_RATE    # 0.2 ms/sample
 
@@ -178,6 +179,11 @@ class MhRecHeader:
     stage_description: str = ""
     stage_type: int = 0
     app_version: str = ""   # file_version >= 8 (.hrs1/.hrs2) or >= 9 (.hrs3)
+    # --- file_version >= 9 fields (S1 MH Recruitment Curve only) ---
+    sweep_min_amplitude: float = float('nan')
+    sweep_max_amplitude: float = float('nan')
+    sweep_step_size: float = float('nan')
+    sweep_sequential: bool = False
     # Derived after reading trials: len(trial_data) / (TRIAL_RECORD_MS / 1000).
     # Defaults to 5000.0 for files with no trials.
     sample_rate: float = 5000.0
@@ -215,6 +221,10 @@ class MhRecTrial:
     # --- file_version >= 7 fields ---
     digital_onset_sample_num: int = -1   # absolute OE sample of DIGITAL IN rising edge; -1 = none
     digital_onset_channel: int = -1      # OE digital channel index (0-based); -1 = none
+    # --- file_version >= 9 fields (S1 MH Recruitment Curve only) ---
+    digital_event_sample_offsets: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int32))
+    digital_event_channels: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int32))
+    digital_event_states: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int8))
     # --- file_version >= 9 fields (S2 Control Mode; inherited by V3 stages) ---
     h_wave_response:          float = float('nan')
     m_wave_response:          float = float('nan')
@@ -251,26 +261,49 @@ class FrequencyTestHeader(MhRecHeader):
 @dataclass
 class FrequencyTestTrial(MhRecTrial):
     """Frequency Test trial (V3 .hrsft, block_id=8)."""
-    pulse_h_wave_mra: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
-    pulse_m_wave_mra: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    pulse_h_wave_mra:      np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    pulse_m_wave_mra:      np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    # Per-trial pulse parameters (file_version >= 2, written by H-Reflex App once it stores these)
+    # Defaults to 0 so existing files load without changes.
+    n_pulses_trial:        int = 0
+    event_period_us_trial: int = 0
+    pulse_width_us_trial:  int = 0
 
 
 @dataclass
 class UpCondPelletTrial(MhRecTrial):
-    """Up Condition Pellet trial (V3 .hrs4, block_id=9)."""
-    pellet_delivered: int = 0
+    """Up Condition Pellet trial (V3 .hrs4, block_id=9).
+
+    h_wave_response, m_wave_response, hm_ratio, m_wave_* inherited from MhRecTrial.
+    """
+    success_threshold: float = float('nan')
+    is_success:        int   = 0
+    pellet_delivered:  int   = 0
+    aux_flag:          int   = 0   # file_version >= 3 extra int8 field
 
 
 @dataclass
 class DownCondVnsTrial(MhRecTrial):
-    """Down Condition VNS trial (V3 .hrs5, block_id=10)."""
-    vns_delivered: int = 0
+    """Down Condition VNS trial (V3 .hrs5, block_id=10).
+
+    h_wave_response, m_wave_response, hm_ratio, m_wave_* inherited from MhRecTrial.
+    """
+    success_threshold: float = float('nan')
+    is_success:        int   = 0
+    vns_delivered:     int   = 0
+    aux_flag:          int   = 0   # file_version >= 3 extra int8 field
 
 
 @dataclass
 class UpCondVnsTrial(MhRecTrial):
-    """Up Condition VNS trial (V3 .hrs6, block_id=11)."""
-    vns_delivered: int = 0
+    """Up Condition VNS trial (V3 .hrs6, block_id=11).
+
+    h_wave_response, m_wave_response, hm_ratio, m_wave_* inherited from MhRecTrial.
+    """
+    success_threshold: float = float('nan')
+    is_success:        int   = 0
+    vns_delivered:     int   = 0
+    aux_flag:          int   = 0   # file_version >= 3 extra int8 field
 
 
 # ====================================================================
@@ -339,6 +372,10 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0,
     if file_version >= 7:
         t.digital_onset_sample_num = hrs_read_val(fid, 'int64')
         t.digital_onset_channel    = hrs_read_val(fid, 'int32')
+    if block_id == BLOCK_MH_TRIAL and file_version >= 9:
+        t.digital_event_sample_offsets = np.array(hrs_read_array(fid, 'int32'), dtype=np.int32)
+        t.digital_event_channels       = np.array(hrs_read_array(fid, 'int32'), dtype=np.int32)
+        t.digital_event_states         = np.array(hrs_read_array(fid, 'int8'),  dtype=np.int8)
     if block_id == BLOCK_CONTROL_MODE_TRIAL and file_version >= 9:
         t.h_wave_response         = hrs_read_val(fid, 'float32')
         t.m_wave_response         = hrs_read_val(fid, 'float32')
@@ -349,43 +386,78 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0,
         t.m_wave_adjust_step_ma   = hrs_read_val(fid, 'float32')
         t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
+        if file_version >= 10:
+            # fv=10 may append extra fields after the M-wave block.
+            # Peek at the next 4 bytes: if they form a known block_id the
+            # writer omitted the extra fields; otherwise skip them (25 bytes:
+            # 6×int32 + 1×uint8 observed in BASELINE files from 2026-08-25+).
+            _peek4 = fid.read(4)
+            if len(_peek4) == 4:
+                _next_bid = struct.unpack('<i', _peek4)[0]
+                if _next_bid in (BLOCK_EMG_DATA, BLOCK_MH_TRIAL,
+                                 BLOCK_CONTROL_MODE_TRIAL):
+                    fid.seek(-4, 1)   # no extra fields; put the 4 bytes back
+                else:
+                    fid.read(21)      # skip remaining 21 bytes (total 25 skipped)
     return t
 
 
-def _read_mh_trial_block_full(fid: BinaryIO) -> MhRecTrial:
-    """Read all MhRecTrial base fields unconditionally (V3 new stages)."""
+def _read_mh_trial_block_full(fid: BinaryIO, file_version: int) -> MhRecTrial:
+    """Read MhRecTrial base fields for V3 conditioning stages (.hrs4/.hrs5/.hrs6/.hrsft).
+
+    The conditioning stage file_version schema is different from .hrs1/.hrs2:
+      v0: start_time, min/max threshold, stim_amp, trial_data
+      v1: + sync_data
+      v2: + all timing fields (trigger_wall_time … first_post_trigger_frame_sample_id)
+              + unipolar_trial_data, stim_adc_data, background_emg_mean, background_bins
+              + stim_polarity_reversed, digital_onset_sample_num, digital_onset_channel
+    All fields from v2 onward are written as a block — the per-field version gates used
+    in _read_mh_trial_block (v3/v4/v5/v6/v7) do NOT apply here.
+    """
     t = MhRecTrial()
-    t.start_time                         = hrs_read_datetime(fid)
-    t.min_initiation_threshold           = hrs_read_val(fid, 'float32')
-    t.max_initiation_threshold           = hrs_read_val(fid, 'float32')
-    t.stimulation_amplitude_ma           = hrs_read_val(fid, 'float32')
-    t.trial_data                         = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
-    t.sync_data                          = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
-    t.trigger_wall_time_ms               = hrs_read_val(fid, 'uint64')
-    t.onset_sample_index                 = hrs_read_val(fid, 'int32')
-    t.onset_detected                     = hrs_read_val(fid, 'int8')
-    t.stim_end_sample_index              = hrs_read_val(fid, 'int32')
-    t.stim_duration_samples              = hrs_read_val(fid, 'int32')
-    t.stim_duration_ms                   = hrs_read_val(fid, 'float32')
-    t.sync_peak_voltage                  = hrs_read_val(fid, 'float32')
-    t.n_pre_trigger_frames_discarded     = hrs_read_val(fid, 'int32')
-    t.frame_received_timestamps_ms       = np.array(hrs_read_array(fid, 'uint64'), dtype=np.uint64)
-    t.first_post_trigger_frame_sample_id = hrs_read_val(fid, 'uint64')
-    t.unipolar_trial_data                = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
-    t.stim_adc_data                      = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
-    t.background_emg_mean                = hrs_read_val(fid, 'float32')
-    t.background_bins                    = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
-    t.stim_polarity_reversed             = hrs_read_val(fid, 'int8')
-    t.digital_onset_sample_num           = hrs_read_val(fid, 'int64')
-    t.digital_onset_channel              = hrs_read_val(fid, 'int32')
+    t.start_time                = hrs_read_datetime(fid)
+    t.min_initiation_threshold  = hrs_read_val(fid, 'float32')
+    t.max_initiation_threshold  = hrs_read_val(fid, 'float32')
+    t.stimulation_amplitude_ma  = hrs_read_val(fid, 'float32')
+    t.trial_data = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    if file_version >= 1:
+        t.sync_data = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    if file_version >= 2:
+        t.trigger_wall_time_ms               = hrs_read_val(fid, 'uint64')
+        t.onset_sample_index                 = hrs_read_val(fid, 'int32')
+        t.onset_detected                     = hrs_read_val(fid, 'int8')
+        t.stim_end_sample_index              = hrs_read_val(fid, 'int32')
+        t.stim_duration_samples              = hrs_read_val(fid, 'int32')
+        t.stim_duration_ms                   = hrs_read_val(fid, 'float32')
+        t.sync_peak_voltage                  = hrs_read_val(fid, 'float32')
+        t.n_pre_trigger_frames_discarded     = hrs_read_val(fid, 'int32')
+        t.frame_received_timestamps_ms       = np.array(hrs_read_array(fid, 'uint64'), dtype=np.uint64)
+        t.first_post_trigger_frame_sample_id = hrs_read_val(fid, 'uint64')
+        t.unipolar_trial_data      = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+        t.stim_adc_data            = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+        t.background_emg_mean      = hrs_read_val(fid, 'float32')
+        t.background_bins          = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+        t.stim_polarity_reversed   = hrs_read_val(fid, 'int8')
+        t.digital_onset_sample_num = hrs_read_val(fid, 'int64')
+        t.digital_onset_channel    = hrs_read_val(fid, 'int32')
     return t
 
 
 def _read_up_cond_pellet_trial_block(fid: BinaryIO, file_version: int) -> UpCondPelletTrial:
     """Read one Up Condition Pellet trial block (V3 .hrs4, block_id=9)."""
-    base = _read_mh_trial_block_full(fid)
+    base = _read_mh_trial_block_full(fid, file_version)
     t = UpCondPelletTrial.__new__(UpCondPelletTrial)
     t.__dict__.update(base.__dict__)
+    t.success_threshold = float('nan')
+    t.is_success        = 0
+    t.pellet_delivered  = 0
+    t.aux_flag          = 0
+    if file_version >= 2:
+        t.h_wave_response   = hrs_read_val(fid, 'float32')
+        t.m_wave_response   = hrs_read_val(fid, 'float32')
+        t.hm_ratio          = hrs_read_val(fid, 'float32')
+        t.success_threshold = hrs_read_val(fid, 'float32')
+        t.is_success        = hrs_read_val(fid, 'int8')
     t.pellet_delivered = hrs_read_val(fid, 'int8')
     if file_version >= 2:
         t.m_wave_window_median    = hrs_read_val(fid, 'float32')
@@ -394,14 +466,26 @@ def _read_up_cond_pellet_trial_block(fid: BinaryIO, file_version: int) -> UpCond
         t.m_wave_adjust_step_ma   = hrs_read_val(fid, 'float32')
         t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
+    if file_version >= 3:
+        t.aux_flag = hrs_read_val(fid, 'int8')
     return t
 
 
 def _read_down_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> DownCondVnsTrial:
     """Read one Down Condition VNS trial block (V3 .hrs5, block_id=10)."""
-    base = _read_mh_trial_block_full(fid)
+    base = _read_mh_trial_block_full(fid, file_version)
     t = DownCondVnsTrial.__new__(DownCondVnsTrial)
     t.__dict__.update(base.__dict__)
+    t.success_threshold = float('nan')
+    t.is_success        = 0
+    t.vns_delivered     = 0
+    t.aux_flag          = 0
+    if file_version >= 2:
+        t.h_wave_response   = hrs_read_val(fid, 'float32')
+        t.m_wave_response   = hrs_read_val(fid, 'float32')
+        t.hm_ratio          = hrs_read_val(fid, 'float32')
+        t.success_threshold = hrs_read_val(fid, 'float32')
+        t.is_success        = hrs_read_val(fid, 'int8')
     t.vns_delivered = hrs_read_val(fid, 'int8')
     if file_version >= 2:
         t.m_wave_window_median    = hrs_read_val(fid, 'float32')
@@ -410,14 +494,26 @@ def _read_down_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> DownCon
         t.m_wave_adjust_step_ma   = hrs_read_val(fid, 'float32')
         t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
+    if file_version >= 3:
+        t.aux_flag = hrs_read_val(fid, 'int8')
     return t
 
 
 def _read_up_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> UpCondVnsTrial:
     """Read one Up Condition VNS trial block (V3 .hrs6, block_id=11)."""
-    base = _read_mh_trial_block_full(fid)
+    base = _read_mh_trial_block_full(fid, file_version)
     t = UpCondVnsTrial.__new__(UpCondVnsTrial)
     t.__dict__.update(base.__dict__)
+    t.success_threshold = float('nan')
+    t.is_success        = 0
+    t.vns_delivered     = 0
+    t.aux_flag          = 0
+    if file_version >= 2:
+        t.h_wave_response   = hrs_read_val(fid, 'float32')
+        t.m_wave_response   = hrs_read_val(fid, 'float32')
+        t.hm_ratio          = hrs_read_val(fid, 'float32')
+        t.success_threshold = hrs_read_val(fid, 'float32')
+        t.is_success        = hrs_read_val(fid, 'int8')
     t.vns_delivered = hrs_read_val(fid, 'int8')
     if file_version >= 2:
         t.m_wave_window_median    = hrs_read_val(fid, 'float32')
@@ -426,16 +522,30 @@ def _read_up_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> UpCondVns
         t.m_wave_adjust_step_ma   = hrs_read_val(fid, 'float32')
         t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
+    if file_version >= 3:
+        t.aux_flag = hrs_read_val(fid, 'int8')
     return t
 
 
 def _read_frequency_test_trial_block(fid: BinaryIO, file_version: int) -> FrequencyTestTrial:
     """Read one Frequency Test trial block (V3 .hrsft, block_id=8)."""
-    base = _read_mh_trial_block_full(fid)
+    # FT format at fv >= 1 always includes the full set of timing fields that
+    # _read_mh_trial_block_full gates at fv >= 2 for conditioning stages.
+    base = _read_mh_trial_block_full(fid, max(file_version, 2))
     t = FrequencyTestTrial.__new__(FrequencyTestTrial)
     t.__dict__.update(base.__dict__)
     t.pulse_h_wave_mra = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
     t.pulse_m_wave_mra = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    # Per-trial pulse parameters added in file_version 2 (H-Reflex App V2 recordings).
+    # Match this version gate to the file_version you bump to in the H-Reflex App.
+    if file_version >= 2:
+        t.n_pulses_trial        = hrs_read_val(fid, 'int32')
+        t.event_period_us_trial = hrs_read_val(fid, 'int32')
+        t.pulse_width_us_trial  = hrs_read_val(fid, 'int32')
+    else:
+        t.n_pulses_trial        = 0
+        t.event_period_us_trial = 0
+        t.pulse_width_us_trial  = 0
     return t
 
 
@@ -571,6 +681,11 @@ def read_hrs2(filepath: str):
         header.stage_type        = hrs_read_val(fid, 'int32')
         if header.file_version >= 8:
             header.app_version = hrs_read_string(fid)
+        if header.file_version >= 9 and 'MH Recruitment' in header.stage_description:
+            header.sweep_min_amplitude = hrs_read_val(fid, 'float32')
+            header.sweep_max_amplitude = hrs_read_val(fid, 'float32')
+            header.sweep_step_size     = hrs_read_val(fid, 'float32')
+            header.sweep_sequential    = bool(hrs_read_val(fid, 'int8'))
 
         while True:
             chunk = fid.read(4)
@@ -738,6 +853,10 @@ def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn):
         header.stage_description  = hrs_read_string(fid)
         header.stage_type         = hrs_read_val(fid, 'int32')
         header.app_version        = hrs_read_string(fid)
+        if header.file_version >= 3:
+            # 12 extra header bytes added in conditioning-stage file_version 3
+            # (3 × int32 session-level fields; value 0 in all known files).
+            fid.read(12)
 
         _UNIX_MS_LO = 5e11
         _UNIX_MS_HI = 3e12
@@ -749,34 +868,56 @@ def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn):
             if block_id == block_id_expected:
                 try:
                     trials.append(reader_fn(fid, header.file_version))
-                except (struct.error, EOFError):
+                except (struct.error, EOFError, ValueError, MemoryError):
                     break
             elif block_id == BLOCK_EMG_DATA:
                 pos = fid.tell()
-                peek = fid.read(24)
+                peek = fid.read(56)  # enough for up to 32-byte prefix + 24 timestamp bytes
                 fid.seek(pos)
                 if len(peek) < 24:
                     break
-                ts0 = struct.unpack('<Q', peek[0:8])[0]
-                ts1 = struct.unpack('<Q', peek[8:16])[0]
-                ts2 = struct.unpack('<Q', peek[16:24])[0]
-                _is_emg = (
-                    _UNIX_MS_LO < ts0 < _UNIX_MS_HI and
-                    _UNIX_MS_LO < ts1 < _UNIX_MS_HI and
-                    _UNIX_MS_LO < ts2 < _UNIX_MS_HI and
-                    ts1 >= ts0 and ts2 >= ts1 and
-                    (ts2 - ts0) < 3_600_000
-                )
-                if _is_emg:
+                # Detect where the 3-timestamp signature starts (0 = old format;
+                # newer files prepend N×int32 metadata fields before the timestamps).
+                _prefix_size = None
+                for _off in range(0, min(33, len(peek) - 23), 4):
+                    _t0 = struct.unpack('<Q', peek[_off:_off+8])[0]
+                    _t1 = struct.unpack('<Q', peek[_off+8:_off+16])[0]
+                    _t2 = struct.unpack('<Q', peek[_off+16:_off+24])[0]
+                    if (_UNIX_MS_LO < _t0 < _UNIX_MS_HI and
+                            _UNIX_MS_LO < _t1 < _UNIX_MS_HI and
+                            _UNIX_MS_LO < _t2 < _UNIX_MS_HI and
+                            _t1 >= _t0 and _t2 >= _t1 and
+                            (_t2 - _t0) < 3_600_000):
+                        _prefix_size = _off
+                        break
+                if _prefix_size is not None:
+                    if _prefix_size > 0:
+                        fid.read(_prefix_size)  # skip metadata prefix
                     try:
                         emg_blocks.append(_read_emg_data_block(fid))
-                    except (struct.error, EOFError):
+                    except (struct.error, EOFError, ValueError, MemoryError):
                         break
                 else:
-                    try:
-                        trials.append(reader_fn(fid, header.file_version))
-                    except (struct.error, EOFError):
-                        break
+                    # No timestamp signature found.  App versions after 2026-09-01
+                    # write periodic checkpoint blocks (block_id=BLOCK_EMG_DATA but
+                    # no EMG payload) that embed the next trial's block_id after a
+                    # short prefix.  Scan forward (skipping the first 4 bytes to
+                    # avoid treating the trial-count field as a block_id) for the
+                    # expected trial block_id and resume from there.
+                    _ckpt_peek = fid.read(128)
+                    fid.seek(pos)
+                    _recovered = False
+                    for _soff in range(4, len(_ckpt_peek) - 3, 4):
+                        _cand = struct.unpack('<i', _ckpt_peek[_soff:_soff + 4])[0]
+                        if _cand == block_id_expected:
+                            fid.seek(pos + _soff)
+                            _recovered = True
+                            break
+                    if not _recovered:
+                        try:
+                            trials.append(reader_fn(fid, header.file_version))
+                        except (struct.error, EOFError, ValueError, MemoryError):
+                            break
             else:
                 print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
                 break
@@ -792,7 +933,7 @@ def read_hrs4(filepath: str):
     trials, emg_blocks = _make_v3_block_loop(
         filepath, header, BLOCK_UP_COND_PELLET_TRIAL, _read_up_cond_pellet_trial_block)
     if trials:
-        header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
+        header.sample_rate = 10000.0
     return header, trials, emg_blocks
 
 
@@ -805,7 +946,7 @@ def read_hrs5(filepath: str):
     trials, emg_blocks = _make_v3_block_loop(
         filepath, header, BLOCK_DOWN_COND_VNS_TRIAL, _read_down_cond_vns_trial_block)
     if trials:
-        header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
+        header.sample_rate = 10000.0
     return header, trials, emg_blocks
 
 
@@ -818,7 +959,7 @@ def read_hrs6(filepath: str):
     trials, emg_blocks = _make_v3_block_loop(
         filepath, header, BLOCK_UP_COND_VNS_TRIAL, _read_up_cond_vns_trial_block)
     if trials:
-        header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
+        header.sample_rate = 10000.0
     return header, trials, emg_blocks
 
 
@@ -886,7 +1027,7 @@ def read_hrs_ft(filepath: str):
                 break
 
     if trials:
-        header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
+        header.sample_rate = 10000.0   # FT uses same 10 kHz ADC as all V3 stages
     return header, trials, emg_blocks
 
 
@@ -923,6 +1064,15 @@ def find_hrs_files(directory: str):
         hrs6_files[0]  if hrs6_files  else None,
         hrsft_files[0] if hrsft_files else None,
     )
+
+
+def find_all_hrs_ft_files(directory: str):
+    """Return all .hrft files in a recording directory, sorted by filename.
+
+    Unlike find_hrs_files, this returns every file found rather than just the first,
+    allowing callers to load one file per pulse-train frequency.
+    """
+    return sorted(globmod.glob(os.path.join(directory, "*.hrft")))
 
 
 def detect_app_version(directory: str) -> int:
@@ -1488,8 +1638,11 @@ def plot_hm_ratio_summary(trials_by_polarity, header,
                                                    record_samples=_rec_s)
             mm = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
             hm = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
-            mv = float(np.nanmean(np.abs(emg[mm]))) if mm.any() else np.nan
-            hv = float(np.nanmean(np.abs(emg[hm]))) if hm.any() else np.nan
+            _bg_mask_hm = t_ms < 0
+            _bg_hm = (float(np.nanmean(np.abs(emg[_bg_mask_hm])))
+                      if _bg_mask_hm.any() else 0.0)
+            mv = (float(np.nanmean(np.abs(emg[mm]))) - _bg_hm) if mm.any() else np.nan
+            hv = (float(np.nanmean(np.abs(emg[hm]))) - _bg_hm) if hm.any() else np.nan
             if np.isfinite(mv):
                 mv_all.append(mv)
             if np.isfinite(hv):
@@ -1509,9 +1662,9 @@ def plot_hm_ratio_summary(trials_by_polarity, header,
     bar_w  = min(0.55, 0.8 / max(n_grps, 1))
 
     metrics = [
-        ('m',  ax_m,  'M-wave MRA (µV)', 'M-wave'),
-        ('h',  ax_h,  'H-wave MRA (µV)', 'H-wave'),
-        ('hm', ax_hm, 'H:M Ratio (MRA)', 'H:M Ratio'),
+        ('m',  ax_m,  'M-wave Size (µV)', 'M-wave'),
+        ('h',  ax_h,  'H-wave Size (µV)', 'H-wave'),
+        ('hm', ax_hm, 'H:M Ratio (Size)', 'H:M Ratio'),
     ]
     stats_lines: list = []
     for key, ax, ylabel, title in metrics:
@@ -1542,7 +1695,7 @@ def plot_hm_ratio_summary(trials_by_polarity, header,
                 bbox=dict(boxstyle='round,pad=0.5', fc='white', ec='#cccccc', alpha=0.95))
 
     fig.suptitle(
-        f'M / H / H:M Summary (MRA)  —  {header.subject_id}\n'
+        f'M / H / H:M Summary  —  {header.subject_id}\n'
         f'M: {m_start_ms}–{m_end_ms} ms  |  H: {h_start_ms}–{h_end_ms} ms',
         fontsize=11
     )
@@ -1579,7 +1732,7 @@ def plot_hm_ratio_summary(trials_by_polarity, header,
         ax2.set_xticks(range(1, _n_amps + 1))
         ax2.set_xticklabels([f'{a:.2f} mA' for a in _all_amps],
                             rotation=45, ha='right', fontsize=9)
-        ax2.set_ylabel('H:M Ratio (MRA)', fontsize=11)
+        ax2.set_ylabel('H:M Ratio (Size)', fontsize=11)
         ax2.set_title(
             f'H:M Ratio by Stimulation Amplitude — {header.subject_id}\n'
             f'M: {m_start_ms}–{m_end_ms} ms  |  H: {h_start_ms}–{h_end_ms} ms',
@@ -1596,9 +1749,9 @@ def plot_hm_ratio_summary(trials_by_polarity, header,
 
     # ── Figure 3: Distribution histograms — M-wave, H-wave, H:M ─────────────
     _dist_metrics = [
-        ('m',  f'M-wave MRA (µV)\n[{m_start_ms}–{m_end_ms} ms]', 'M-wave MRA'),
-        ('h',  f'H-wave MRA (µV)\n[{h_start_ms}–{h_end_ms} ms]', 'H-wave MRA'),
-        ('hm', 'H:M Ratio (MRA)',                                  'H:M Ratio'),
+        ('m',  f'M-wave Size (µV)\n[{m_start_ms}–{m_end_ms} ms]', 'M-wave Size'),
+        ('h',  f'H-wave Size (µV)\n[{h_start_ms}–{h_end_ms} ms]', 'H-wave Size'),
+        ('hm', 'H:M Ratio (Size)',                                  'H:M Ratio'),
     ]
     fig3, axes3 = plt.subplots(1, 3, figsize=(17, 5))
 
@@ -1676,13 +1829,26 @@ def plot_hm_ratio_summary(trials_by_polarity, header,
     plt.show()
 
 
-def plot_mwave_control_error(trials, header, title_suffix: str = ''):
-    """Plot M-wave stabilization control error and stim amplitude over trials (V3 S2+).
+def plot_mwave_control_error(trials, header, title_suffix: str = '',
+                              m_start_ms: float = 2.0, m_end_ms: float = 4.0,
+                              pre_ms: float = 15.0, post_ms: float = 20.0,
+                              sample_rate: float = SAMPLE_RATE,
+                              target_uv=None, inner_pct: float = 25.0,
+                              outer_pct: float = 50.0):
+    """Plot M-wave size and stim amplitude over trials (V3 S2+).
 
-    Left Y axis : m_wave_error (µV); falls back to m_wave_window_median when all NaN.
+    Left Y axis : M-wave Size (µV) = MRA in M-window − pre-stim background.
     Right Y axis: stimulation_amplitude_ma (mA, orange).
 
-    Requires trials with file_version >= 9 fields populated (V3 Control Mode / S4/S5/S6).
+    Reference lines drawn when a target can be determined:
+      Solid black line  — target set-point (per-trial stored value or target_uv override)
+      Green dashed      — target ± inner_pct% tolerance band
+      Red dotted        — target ± outer_pct% algorithm bounds (skipped if outer_pct <= 0)
+
+    Args:
+        target_uv  : fixed override (µV); None = auto-read m_wave_set_value_uv from trials.
+        inner_pct  : ± tolerance band percentage (default 25%).
+        outer_pct  : ± algorithm-bounds percentage (default 50%); set ≤0 to hide.
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -1691,31 +1857,106 @@ def plot_mwave_control_error(trials, header, title_suffix: str = ''):
         print("No trials to plot.")
         return
 
-    trial_nums   = list(range(1, len(trials) + 1))
-    errors       = [getattr(t, 'm_wave_error',        float('nan')) for t in trials]
-    medians      = [getattr(t, 'm_wave_window_median', float('nan')) for t in trials]
-    stim_amps    = [t.stimulation_amplitude_ma for t in trials]
+    _ms_ps = 1000.0 / sample_rate
+    _rec_s = int(TRIAL_RECORD_MS * sample_rate / 1000)
 
-    has_error = any(not (e != e) for e in errors)  # nan check: e != e iff nan
-    y_left       = errors  if has_error else medians
-    y_left_label = 'M-wave Error (µV)' if has_error else 'M-wave Window Median (µV)'
+    trial_nums = list(range(1, len(trials) + 1))
+    stim_amps  = [t.stimulation_amplitude_ma for t in trials]
+
+    # ── M-wave size from raw EMG ──────────────────────────────────────────────
+    m_sizes = []
+    for t in trials:
+        try:
+            t_ms, emg, _, _, _ = get_trial_window(t, pre_ms, post_ms,
+                                                   ms_per_sample=_ms_ps,
+                                                   record_samples=_rec_s)
+            mm      = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+            bg_mask = t_ms < 0
+            bg      = float(np.nanmean(np.abs(emg[bg_mask]))) if bg_mask.any() else 0.0
+            m_size  = float(np.nanmean(np.abs(emg[mm]))) - bg if mm.any() else float('nan')
+        except Exception:
+            m_size = float('nan')
+        m_sizes.append(m_size)
+
+    # ── Resolve target reference values ──────────────────────────────────────
+    if target_uv is not None:
+        ref_vals  = [float(target_uv)] * len(trials)
+        ref_label = f'Target ({target_uv:.1f} µV, override)'
+    else:
+        raw_sv = [getattr(t, 'm_wave_set_value_uv', float('nan')) for t in trials]
+        valid  = [v for v in raw_sv if not np.isnan(v)]
+        if valid:
+            ref_vals  = raw_sv
+            ref_label = 'Target set-point (recording)'
+        else:
+            ref_vals  = None
+            ref_label = None
 
     fig = make_subplots(specs=[[{'secondary_y': True}]])
+
+    # ── M-wave size trace ─────────────────────────────────────────────────────
     fig.add_trace(
-        go.Scatter(x=trial_nums, y=y_left, name=y_left_label,
-                   mode='lines+markers', marker=dict(size=3), line=dict(color='steelblue')),
+        go.Scatter(x=trial_nums, y=m_sizes, name='M-wave Size (µV)',
+                   mode='lines+markers', marker=dict(size=3),
+                   line=dict(color='steelblue')),
         secondary_y=False)
+
+    # ── Reference lines ───────────────────────────────────────────────────────
+    if ref_vals is not None:
+        # Target set-point (solid black)
+        fig.add_trace(
+            go.Scatter(x=trial_nums, y=ref_vals, name=ref_label,
+                       mode='lines', line=dict(color='black', width=1.5),
+                       showlegend=True),
+            secondary_y=False)
+
+        # ±inner_pct tolerance band (green dashed)
+        if inner_pct and inner_pct > 0:
+            _nan = float('nan')
+            i_hi = [v * (1 + inner_pct / 100) if not np.isnan(v) else _nan for v in ref_vals]
+            i_lo = [v * (1 - inner_pct / 100) if not np.isnan(v) else _nan for v in ref_vals]
+            fig.add_trace(
+                go.Scatter(x=trial_nums, y=i_hi,
+                           name=f'±{inner_pct:.0f}% tolerance',
+                           mode='lines', line=dict(color='green', width=1, dash='dash'),
+                           showlegend=True),
+                secondary_y=False)
+            fig.add_trace(
+                go.Scatter(x=trial_nums, y=i_lo,
+                           mode='lines', line=dict(color='green', width=1, dash='dash'),
+                           showlegend=False),
+                secondary_y=False)
+
+        # ±outer_pct algorithm bounds (red dotted)
+        if outer_pct and outer_pct > 0:
+            _nan = float('nan')
+            o_hi = [v * (1 + outer_pct / 100) if not np.isnan(v) else _nan for v in ref_vals]
+            o_lo = [v * (1 - outer_pct / 100) if not np.isnan(v) else _nan for v in ref_vals]
+            fig.add_trace(
+                go.Scatter(x=trial_nums, y=o_hi,
+                           name=f'±{outer_pct:.0f}% bounds',
+                           mode='lines', line=dict(color='red', width=1, dash='dot'),
+                           showlegend=True),
+                secondary_y=False)
+            fig.add_trace(
+                go.Scatter(x=trial_nums, y=o_lo,
+                           mode='lines', line=dict(color='red', width=1, dash='dot'),
+                           showlegend=False),
+                secondary_y=False)
+
+    # ── Stim amplitude (right axis) ───────────────────────────────────────────
     fig.add_trace(
         go.Scatter(x=trial_nums, y=stim_amps, name='Stim Amplitude (mA)',
-                   mode='lines+markers', marker=dict(size=3), line=dict(color='orange')),
+                   mode='lines+markers', marker=dict(size=3),
+                   line=dict(color='orange')),
         secondary_y=True)
 
-    title = f'M-Wave Control Error — {header.subject_id}'
+    title = f'M-Wave Control — {header.subject_id}'
     if title_suffix:
         title += f'  {title_suffix}'
-    fig.update_layout(title=title, xaxis_title='Trial #', height=400,
+    fig.update_layout(title=title, xaxis_title='Trial #', height=450,
                       legend=dict(orientation='h', yanchor='bottom', y=1.02))
-    fig.update_yaxes(title_text=y_left_label, secondary_y=False)
+    fig.update_yaxes(title_text='M-wave Size (µV)', secondary_y=False)
     fig.update_yaxes(title_text='Stim Amplitude (mA)', secondary_y=True)
     fig.show()
 
@@ -1769,63 +2010,41 @@ def plot_frequency_test(trials, header, title_suffix: str = ''):
     fig.show()
 
 
-def plot_ft_depression_curve(trials, header, sample_rate=None, title_suffix=''):
-    """Mean ± 1σ H-wave and M-wave MRA per pulse position across all FT trials.
+def plot_ft_depression_curve(trial, header, sample_rate=None, title_suffix=''):
+    """H-wave and M-wave MRA per pulse for a single FT trial.
 
-    The most-recent trial is overlaid as a dashed line so you can compare the
-    last-observed depression profile against the session average.
+    Uses the pre-stored pulse_h_wave_mra / pulse_m_wave_mra values computed by
+    the app (mean rectified average within each wave window for each pulse).
     """
     import matplotlib.pyplot as plt
 
-    if not trials:
-        print("No trials to plot.")
+    h_vals = list(getattr(trial, 'pulse_h_wave_mra', []))
+    m_vals = list(getattr(trial, 'pulse_m_wave_mra', []))
+    n_pulses = max(len(h_vals), len(m_vals))
+    if n_pulses == 0:
+        print("No per-pulse MRA data available.")
         return
 
-    h_arrays = [getattr(t, 'pulse_h_wave_mra', np.array([])) for t in trials]
-    m_arrays = [getattr(t, 'pulse_m_wave_mra', np.array([])) for t in trials]
-    h_valid  = [a for a in h_arrays if len(a) > 0]
-    m_valid  = [a for a in m_arrays if len(a) > 0]
-
-    if not h_valid and not m_valid:
-        print("No pulse MRA data available.")
-        return
-
-    n_pulses  = len(h_valid[0]) if h_valid else len(m_valid[0])
     pulse_idx = np.arange(1, n_pulses + 1)
-    hz        = round(1e6 / header.event_period_us, 1) if getattr(header, 'event_period_us', 0) else '?'
+    hz = round(1e6 / header.event_period_us, 1) if getattr(header, 'event_period_us', 0) else '?'
     try:
-        amp_str = f'{float(getattr(trials[0], "stimulation_amplitude_ma", 0.0)):.3f} mA'
+        amp_str = f'{float(getattr(trial, "stimulation_amplitude_ma", 0.0)):.3f} mA'
     except (TypeError, ValueError):
         amp_str = '? mA'
 
     fig, ax = plt.subplots(figsize=(max(8, n_pulses * 0.85), 5))
 
-    if h_valid:
-        h_mat  = np.vstack(h_valid)
-        h_mean = h_mat.mean(axis=0)
-        h_std  = h_mat.std(axis=0)
-        ax.plot(pulse_idx, h_mean, 'o-', color='royalblue', lw=2, ms=7,
-                label=f'H-wave mean (n={len(h_valid)})', zorder=4)
-        ax.fill_between(pulse_idx, h_mean - h_std, h_mean + h_std,
-                        color='royalblue', alpha=0.18, zorder=3)
-        ax.plot(pulse_idx, h_valid[-1], 'o--', color='royalblue', lw=1.2, ms=4,
-                alpha=0.55, label='H-wave (last trial)', zorder=3)
-
-    if m_valid:
-        m_mat  = np.vstack(m_valid)
-        m_mean = m_mat.mean(axis=0)
-        m_std  = m_mat.std(axis=0)
-        ax.plot(pulse_idx, m_mean, 's-', color='firebrick', lw=2, ms=7,
-                label=f'M-wave mean (n={len(m_valid)})', zorder=4)
-        ax.fill_between(pulse_idx, m_mean - m_std, m_mean + m_std,
-                        color='firebrick', alpha=0.18, zorder=3)
-        ax.plot(pulse_idx, m_valid[-1], 's--', color='firebrick', lw=1.2, ms=4,
-                alpha=0.55, label='M-wave (last trial)', zorder=3)
+    if h_vals:
+        ax.plot(pulse_idx[:len(h_vals)], h_vals, 'o-', color='royalblue',
+                lw=2, ms=7, label='H-wave MRA', zorder=4)
+    if m_vals:
+        ax.plot(pulse_idx[:len(m_vals)], m_vals, 's-', color='firebrick',
+                lw=2, ms=7, label='M-wave MRA', zorder=4)
 
     ax.set_xlabel('Pulse # in train', fontsize=11)
-    ax.set_ylabel('MRA (µV)', fontsize=11)
+    ax.set_ylabel('MRA  (µV)', fontsize=11)
     ax.set_xticks(pulse_idx)
-    title = f'H/M Wave Per Pulse  ·  {hz} Hz  ·  {amp_str}  ·  n={len(trials)} trials'
+    title = f'H/M MRA Per Pulse  ·  {hz} Hz  ·  {amp_str}'
     if title_suffix:
         title += f'  ·  {title_suffix}'
     ax.set_title(title, fontsize=11)
@@ -1837,176 +2056,294 @@ def plot_ft_depression_curve(trials, header, sample_rate=None, title_suffix=''):
     plt.show()
 
 
-def plot_ft_averaged_waveforms(trials, header, pre_pulse_ms=2.0, post_pulse_ms=20.0,
+def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20.0,
                                 m_start_ms=2.0, m_end_ms=4.0,
                                 h_start_ms=6.0, h_end_ms=10.0,
-                                sample_rate=None, n_per_page=6, page=0):
-    """Paged 2×3 grid of averaged EMG waveforms per pulse position, mirroring plot_hrs2_analysis.
+                                sample_rate=None,
+                                zoom_pulse=None,
+                                style='gradient',
+                                show_legend=True,
+                                legend_style='colorbar',
+                                y_min=None, y_max=None,
+                                fig_w=11.0, fig_h=5.0,
+                                simplified=False,
+                                compare_pulse=2,
+                                show_sync=False):
+    """All pulse waveforms from a single FT trial overlaid on one plot.
 
-    Each tile shows individual trial segments (low alpha) + bold mean waveform for one
-    pulse position. M-wave window is blue-shaded with dashed borders; H-wave is green.
-    MRA annotations (hlines + text) match the HRS2 analysis style.
-    A colorbar at the top maps pulse # to colour (coolwarm: blue=1, red=last).
-
-    Returns total_pages (int).
+    zoom_pulse    : int (0-based) or None.  None = all equal; int = highlight that
+                    pulse bold, fade all others.  Ignored in simplified mode.
+    style         : 'gradient' (coolwarm blue→red), 'bold_ends' (gradient, first+last
+                    thick), 'distinct' (tab20 qualitative colours).  Ignored in simplified.
+    legend_style  : 'colorbar' (gradient bar, gradient/bold_ends only) or 'labeled'.
+    simplified    : If True, show three traces — pulse 1 (blue), pulse compare_pulse
+                    (orange), and the mean of the last-half pulses (purple), with the
+                    individual last-half traces in a lighter background shade.
+    compare_pulse : 0-based index of the second named trace in simplified mode (default 2).
+    show_sync     : If True, add a subplot below showing the ADC sync channel (trial.sync_data)
+                    windowed around each displayed pulse.
     """
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
-    from matplotlib.gridspec import GridSpec
+    import matplotlib.lines as mlines
 
     sr       = sample_rate or getattr(header, 'sample_rate', SAMPLE_RATE)
     n_pulses = getattr(header, 'n_pulses_per_train', 0)
     if n_pulses == 0:
-        n_pulses = max((len(getattr(t, 'pulse_h_wave_mra', [])) for t in trials), default=0)
+        n_pulses = len(getattr(trial, 'pulse_h_wave_mra', []))
     if n_pulses == 0:
         print("No pulse data available.")
-        return 1
+        return
 
     period_us = getattr(header, 'event_period_us', 0)
     if period_us == 0:
         print("event_period_us not set — cannot reconstruct pulse timing.")
-        return 1
+        return
 
     pulse_period_samples = round(period_us / 1e6 * sr)
+    onset = getattr(trial, 'onset_sample_index', -1)
+    if onset < 0:
+        bin_ms = getattr(header, 'bin_duration_ms', BIN_DURATION_MS) or BIN_DURATION_MS
+        onset  = round(bin_ms * sr / 1000)
+
+    emg       = np.array(trial.trial_data, dtype=float)
+    sync_arr  = np.array(getattr(trial, 'sync_data', []), dtype=float)
+    has_sync  = show_sync and len(sync_arr) == len(emg)
+
     pre_samp  = round(pre_pulse_ms  * sr / 1000)
     post_samp = round(post_pulse_ms * sr / 1000)
-    t_ms      = np.linspace(-pre_pulse_ms, post_pulse_ms, pre_samp + post_samp)
+    win_len   = pre_samp + post_samp
+    t_ms      = np.linspace(-pre_pulse_ms, post_pulse_ms, win_len)
     hz        = round(1e6 / period_us, 1)
-    colors    = cm.coolwarm(np.linspace(0, 1, max(n_pulses, 2)))
-
-    total_pages = max(1, int(np.ceil(n_pulses / n_per_page)))
-    page        = max(0, min(page, total_pages - 1))
-    start_k     = page * n_per_page
-    end_k       = min(start_k + n_per_page, n_pulses)
-
-    # Extract and average segments for each pulse position on this page
-    pulse_data = []
-    for k in range(start_k, end_k):
-        segs, h_mras, m_mras = [], [], []
-        for t in trials:
-            onset = getattr(t, 'onset_sample_index', -1)
-            if onset < 0:
-                continue
-            emg     = np.array(t.trial_data, dtype=float)
-            onset_k = onset + k * pulse_period_samples
-            s, e    = onset_k - pre_samp, onset_k + post_samp
-            if s >= 0 and e <= len(emg):
-                segs.append(emg[s:e])
-            h_arr = getattr(t, 'pulse_h_wave_mra', [])
-            m_arr = getattr(t, 'pulse_m_wave_mra', [])
-            if k < len(h_arr):
-                h_mras.append(float(h_arr[k]))
-            if k < len(m_arr):
-                m_mras.append(float(m_arr[k]))
-        pulse_data.append((k, segs,
-                           float(np.mean(h_mras)) if h_mras else 0.0,
-                           float(np.mean(m_mras)) if m_mras else 0.0))
-
-    ncols, nrows = 3, 2
-    fig = plt.figure(figsize=(15.0, 7.5))
-    gs  = GridSpec(nrows + 1, ncols,
-                   height_ratios=[0.10] + [1] * nrows,
-                   hspace=0.55, wspace=0.35,
-                   top=0.93, bottom=0.08, left=0.07, right=0.97)
-
-    # Colorbar spanning all columns — pulse # → colour legend
-    cbar_ax = fig.add_subplot(gs[0, :])
-    sm = plt.cm.ScalarMappable(cmap='coolwarm',
-                                norm=plt.Normalize(1, max(n_pulses, 2)))
-    sm.set_array([])
-    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
-    cbar.set_label(f'Pulse # in train  (blue = pulse 1  ·  red = pulse {n_pulses})',
-                   fontsize=9)
-    ticks = sorted({1, max(1, n_pulses // 2), n_pulses})
-    cbar.set_ticks(ticks)
-    cbar.set_ticklabels([f'Pulse {tt}' for tt in ticks])
-
-    for idx, (k, segs, h_mra, m_mra) in enumerate(pulse_data):
-        row, col = divmod(idx, ncols)
-        ax       = fig.add_subplot(gs[row + 1, col])
-        color    = colors[k]
-
-        # M-wave: blue shading + dashed borders
-        ax.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.13, zorder=1)
-        ax.axvline(m_start_ms, color='blue',  ls='--', lw=1.2, alpha=0.8, zorder=2)
-        ax.axvline(m_end_ms,   color='blue',  ls='--', lw=1.2, alpha=0.8, zorder=2)
-        # H-wave: green shading + dashed borders
-        ax.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.13, zorder=1)
-        ax.axvline(h_start_ms, color='green', ls='--', lw=1.2, alpha=0.8, zorder=2)
-        ax.axvline(h_end_ms,   color='green', ls='--', lw=1.2, alpha=0.8, zorder=2)
-        # Stim onset
-        ax.axvline(0, color='#aaa', lw=0.8, ls=':', zorder=1)
-
-        # Individual trial traces (low alpha, gray)
-        for seg in segs:
-            ax.plot(t_ms[:len(seg)], seg, color='#888', lw=0.5, alpha=0.18, zorder=2)
-
-        # Bold mean waveform
-        if segs:
-            mean_seg = np.mean(np.vstack(segs), axis=0)
-            ax.plot(t_ms[:len(mean_seg)], mean_seg, color='black', lw=2.0, zorder=4)
-
-        # MRA annotation: hline at MRA level + text label (matching HRS2 style)
-        trans  = ax.get_xaxis_transform()
-        m_mid  = (m_start_ms + m_end_ms) / 2
-        h_mid  = (h_start_ms + h_end_ms) / 2
-        if m_mra != 0:
-            ax.hlines(m_mra, m_start_ms, m_end_ms,
-                      colors='blue', lw=1.5, ls=':', zorder=5)
-            ax.text(m_mid, 0.91, f'M: {m_mra:.1f} µV',
-                    transform=trans, ha='center', va='bottom', fontsize=7,
-                    color='blue',
-                    bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1))
-        if h_mra != 0:
-            ax.hlines(h_mra, h_start_ms, h_end_ms,
-                      colors='darkgreen', lw=1.5, ls=':', zorder=5)
-            ax.text(h_mid, 0.83, f'H: {h_mra:.1f} µV',
-                    transform=trans, ha='center', va='bottom', fontsize=7,
-                    color='darkgreen',
-                    bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1))
-
-        ax.set_title(f'Pulse {k + 1} / {n_pulses}', fontsize=9,
-                     color=color, fontweight='bold')
-        ax.set_xlabel('ms', fontsize=8)
-        ax.set_ylabel('µV', fontsize=8)
-        ax.tick_params(labelsize=7)
-        ax.grid(axis='y', alpha=0.2, ls='--')
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-
-    # Hide unused tiles
-    for idx in range(len(pulse_data), ncols * nrows):
-        row, col = divmod(idx, ncols)
-        fig.add_subplot(gs[row + 1, col]).set_visible(False)
 
     try:
-        amp_str = f'{float(getattr(trials[0], "stimulation_amplitude_ma", 0.0)):.3f} mA'
+        amp_str = f'{float(getattr(trial, "stimulation_amplitude_ma", 0.0)):.3f} mA'
     except (TypeError, ValueError):
         amp_str = '? mA'
-    fig.suptitle(
-        f'Averaged Pulse Waveforms  ·  {hz} Hz  ·  {amp_str}  ·  '
-        f'n={len(trials)} trials  ·  Page {page + 1} / {total_pages}',
-        fontsize=11, y=0.99)
+
+    def _extract(arr, k):
+        """Extract a window around pulse k from arr; returns None if out of bounds."""
+        onset_k = onset + k * pulse_period_samples
+        s, e = onset_k - pre_samp, onset_k + post_samp
+        if s < 0 or e > len(arr):
+            return None
+        return arr[s:e]
+
+    # ── Figure layout ─────────────────────────────────────────────────────────
+    use_cbar = (not simplified) and show_legend and legend_style == 'colorbar' and style != 'distinct'
+    fig_h_use = fig_h * (1.45 if has_sync else 1.0)
+
+    if has_sync:
+        if use_cbar:
+            fig = plt.figure(figsize=(fig_w, fig_h_use))
+            gs  = fig.add_gridspec(2, 2, width_ratios=[10, 0.4],
+                                   height_ratios=[3, 1], wspace=0.06, hspace=0.38)
+            ax      = fig.add_subplot(gs[0, 0])
+            cax     = fig.add_subplot(gs[0, 1])
+            sync_ax = fig.add_subplot(gs[1, 0])
+        else:
+            fig, (ax, sync_ax) = plt.subplots(
+                2, 1, figsize=(fig_w, fig_h_use),
+                gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.38})
+            cax = None
+    else:
+        sync_ax = None
+        if use_cbar:
+            fig, (ax, cax) = plt.subplots(
+                1, 2, figsize=(fig_w, fig_h),
+                gridspec_kw={'width_ratios': [10, 0.4], 'wspace': 0.06})
+        else:
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            cax = None
+
+    # ── Window shading (shared helper) ────────────────────────────────────────
+    def _shade(a):
+        a.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.10, zorder=1)
+        a.axvline(m_start_ms, color='blue',  ls='--', lw=1.0, alpha=0.7, zorder=2)
+        a.axvline(m_end_ms,   color='blue',  ls='--', lw=1.0, alpha=0.7, zorder=2)
+        a.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.10, zorder=1)
+        a.axvline(h_start_ms, color='green', ls='--', lw=1.0, alpha=0.7, zorder=2)
+        a.axvline(h_end_ms,   color='green', ls='--', lw=1.0, alpha=0.7, zorder=2)
+        a.axvline(0, color='#aaa', lw=0.8, ls=':', zorder=1)
+
+    _shade(ax)
+
+    trans = ax.get_xaxis_transform()
+    ax.text((m_start_ms + m_end_ms) / 2, -0.01, 'M-wave',
+            transform=trans, ha='center', va='top', fontsize=8,
+            color='blue', fontweight='bold')
+    ax.text((h_start_ms + h_end_ms) / 2, -0.01, 'H-wave',
+            transform=trans, ha='center', va='top', fontsize=8,
+            color='darkgreen', fontweight='bold')
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SIMPLIFIED VIEW
+    # ─────────────────────────────────────────────────────────────────────────
+    if simplified:
+        half_idx   = max(1, n_pulses // 2)          # last-half starts here
+        lh_ids     = list(range(half_idx, n_pulses))
+        comp_idx   = min(max(0, compare_pulse), n_pulses - 1)
+
+        C1   = '#2166ac'   # pulse 1   — blue
+        CN   = '#d6604d'   # pulse N   — orange-red
+        CLH  = '#6a0dad'   # last-half avg — purple
+        CLHi = '#b39ddb'   # last-half individuals — light purple
+
+        # Extract and plot last-half individuals (background)
+        lh_segs      = [_extract(emg, k) for k in lh_ids]
+        lh_segs      = [s for s in lh_segs if s is not None]
+        lh_sync_segs = [_extract(sync_arr, k) for k in lh_ids] if has_sync else []
+        lh_sync_segs = [s for s in lh_sync_segs if s is not None]
+
+        for seg in lh_segs:
+            ax.plot(t_ms[:len(seg)], seg, color=CLHi, lw=0.9, alpha=0.22, zorder=2)
+        if sync_ax is not None:
+            for seg in lh_sync_segs:
+                sync_ax.plot(t_ms[:len(seg)], seg, color=CLHi, lw=0.9, alpha=0.22, zorder=2)
+
+        # Last-half average
+        if lh_segs:
+            min_len  = min(len(s) for s in lh_segs)
+            avg_seg  = np.mean(np.array([s[:min_len] for s in lh_segs]), axis=0)
+            ax.plot(t_ms[:len(avg_seg)], avg_seg, color=CLH, lw=2.5, alpha=1.0, zorder=5,
+                    label=f'Last-half avg  (pulses {half_idx + 1}–{n_pulses})')
+            if sync_ax is not None and lh_sync_segs:
+                min_sl = min(len(s) for s in lh_sync_segs)
+                avg_s  = np.mean(np.array([s[:min_sl] for s in lh_sync_segs]), axis=0)
+                sync_ax.plot(t_ms[:len(avg_s)], avg_s, color=CLH, lw=2.5, alpha=1.0, zorder=5)
+
+        # Pulse N (compare)
+        segN = _extract(emg, comp_idx)
+        if segN is not None:
+            ax.plot(t_ms[:len(segN)], segN, color=CN, lw=2.5, alpha=1.0, zorder=6,
+                    label=f'Pulse {comp_idx + 1}')
+        if sync_ax is not None:
+            snN = _extract(sync_arr, comp_idx)
+            if snN is not None:
+                sync_ax.plot(t_ms[:len(snN)], snN, color=CN, lw=2.5, alpha=1.0, zorder=6)
+
+        # Pulse 1 (on top)
+        seg0 = _extract(emg, 0)
+        if seg0 is not None:
+            ax.plot(t_ms[:len(seg0)], seg0, color=C1, lw=2.5, alpha=1.0, zorder=7,
+                    label='Pulse 1')
+        if sync_ax is not None:
+            sn0 = _extract(sync_arr, 0)
+            if sn0 is not None:
+                sync_ax.plot(t_ms[:len(sn0)], sn0, color=C1, lw=2.5, alpha=1.0, zorder=7)
+
+        if show_legend:
+            ax.legend(loc='upper right', fontsize=8, framealpha=0.75)
+
+        ax.set_title(
+            f'Simplified View  ·  {hz} Hz  ·  {n_pulses} pulses  ·  {amp_str}',
+            fontsize=11)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # FULL VIEW (all pulses)
+    # ─────────────────────────────────────────────────────────────────────────
+    else:
+        # Colours by style
+        if style == 'distinct':
+            _cm    = plt.cm.tab20 if n_pulses <= 20 else plt.cm.hsv
+            colors = [_cm(i / max(n_pulses - 1, 1)) for i in range(n_pulses)]
+        else:
+            colors = list(cm.coolwarm(np.linspace(0, 1, max(n_pulses, 2))))
+
+        # Per-pulse linewidth and alpha
+        if zoom_pulse is None:
+            if style == 'bold_ends':
+                lw_arr = [1.2] * n_pulses;  a_arr = [0.65] * n_pulses
+                if n_pulses >= 1: lw_arr[0]  = 3.0;  a_arr[0]  = 1.0
+                if n_pulses >= 2: lw_arr[-1] = 3.0;  a_arr[-1] = 1.0
+            else:
+                lw_arr = [2.0] * n_pulses;  a_arr = [0.92] * n_pulses
+        else:
+            lw_arr = [0.8] * n_pulses;  a_arr = [0.15] * n_pulses
+            if 0 <= zoom_pulse < n_pulses:
+                lw_arr[zoom_pulse] = 3.5;  a_arr[zoom_pulse] = 1.0
+
+        # Traces — reverse so pulse 1 renders on top
+        for k in range(n_pulses - 1, -1, -1):
+            seg = _extract(emg, k)
+            if seg is None:
+                continue
+            ax.plot(t_ms[:len(seg)], seg, color=colors[k],
+                    lw=lw_arr[k], alpha=a_arr[k], zorder=n_pulses - k + 3)
+            if sync_ax is not None:
+                sseg = _extract(sync_arr, k)
+                if sseg is not None:
+                    sync_ax.plot(t_ms[:len(sseg)], sseg, color=colors[k],
+                                 lw=lw_arr[k], alpha=a_arr[k], zorder=n_pulses - k + 3)
+
+        zoom_label = ''
+        if zoom_pulse is not None and 0 <= zoom_pulse < n_pulses:
+            zoom_label = f'  ·  Pulse {zoom_pulse + 1} highlighted'
+        ax.set_title(
+            f'Pulse Waveforms  ·  {hz} Hz  ·  {n_pulses} pulses  ·  {amp_str}{zoom_label}',
+            fontsize=11)
+
+        # Legend
+        if show_legend:
+            if use_cbar:
+                sm = plt.cm.ScalarMappable(cmap='coolwarm',
+                                            norm=plt.Normalize(1, max(n_pulses, 2)))
+                sm.set_array([])
+                cbar = fig.colorbar(sm, cax=cax)
+                cbar.set_label('Pulse #', fontsize=9)
+                ticks = sorted({1, max(1, n_pulses // 2), n_pulses})
+                cbar.set_ticks(ticks)
+                cbar.set_ticklabels([str(tt) for tt in ticks])
+            else:
+                step  = max(1, n_pulses // 8)
+                shown = list(range(0, n_pulses, step))
+                if (n_pulses - 1) not in shown:
+                    shown.append(n_pulses - 1)
+                handles = [mlines.Line2D([0], [0], color=colors[k], lw=2.0,
+                                          label=f'Pulse {k + 1}') for k in shown]
+                ax.legend(handles=handles, loc='upper right', fontsize=7,
+                          ncol=max(1, len(handles) // 8), framealpha=0.7)
+
+    # ── Shared axis formatting ─────────────────────────────────────────────────
+    ax.set_xlabel('Time relative to pulse onset (ms)', fontsize=11)
+    ax.set_ylabel('EMG (µV)', fontsize=11)
+    ax.set_xlim(-pre_pulse_ms, post_pulse_ms)
+    if y_min is not None and y_max is not None:
+        ax.set_ylim(y_min, y_max)
+    ax.grid(axis='y', alpha=0.25, ls='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    # ── Sync subplot formatting ────────────────────────────────────────────────
+    if sync_ax is not None:
+        _shade(sync_ax)
+        sync_ax.set_xlabel('Time relative to pulse onset (ms)', fontsize=9)
+        sync_ax.set_ylabel('Sync (V)', fontsize=9)
+        sync_ax.set_xlim(-pre_pulse_ms, post_pulse_ms)
+        sync_ax.tick_params(labelsize=8)
+        sync_ax.spines['top'].set_visible(False)
+        sync_ax.spines['right'].set_visible(False)
+        sync_ax.set_title('Sync / Stim channel', fontsize=9)
+
+    plt.tight_layout()
     plt.show()
 
-    return total_pages
 
-
-def plot_ft_peak_curve(trials, header, sample_rate=None,
+def plot_ft_peak_curve(trial, header, sample_rate=None,
                         m_start_ms=2.0, m_end_ms=4.0,
                         h_start_ms=6.0, h_end_ms=10.0,
                         title_suffix=''):
-    """Peak |EMG| within H/M windows per pulse position, averaged across all FT trials.
+    """Peak |EMG| within H/M windows per pulse for a single FT trial.
 
-    Complements plot_ft_depression_curve (which uses pre-stored MRA values).
     Peak = max(|EMG|) extracted directly from trial_data within each wave window.
+    Complements plot_ft_depression_curve (which uses pre-stored MRA values).
     """
     import matplotlib.pyplot as plt
 
     sr       = sample_rate or getattr(header, 'sample_rate', SAMPLE_RATE)
     n_pulses = getattr(header, 'n_pulses_per_train', 0)
     if n_pulses == 0:
-        n_pulses = max((len(getattr(t, 'pulse_h_wave_mra', [])) for t in trials), default=0)
+        n_pulses = len(getattr(trial, 'pulse_h_wave_mra', []))
     if n_pulses == 0:
         print("No pulse data available.")
         return
@@ -2017,63 +2354,41 @@ def plot_ft_peak_curve(trials, header, sample_rate=None,
         return
 
     pulse_period_samples = round(period_us / 1e6 * sr)
-    h_peaks_all, m_peaks_all = [], []
+    onset = getattr(trial, 'onset_sample_index', -1)
+    if onset < 0:
+        bin_ms = getattr(header, 'bin_duration_ms', BIN_DURATION_MS) or BIN_DURATION_MS
+        onset  = round(bin_ms * sr / 1000)
 
-    for t in trials:
-        onset = getattr(t, 'onset_sample_index', -1)
-        if onset < 0:
-            continue
-        emg_abs = np.abs(np.array(t.trial_data, dtype=float))
-        h_row, m_row = [], []
-        for k in range(n_pulses):
-            onset_k = onset + k * pulse_period_samples
-            h_s = onset_k + round(h_start_ms * sr / 1000)
-            h_e = onset_k + round(h_end_ms   * sr / 1000)
-            m_s = onset_k + round(m_start_ms * sr / 1000)
-            m_e = onset_k + round(m_end_ms   * sr / 1000)
-            h_seg = emg_abs[h_s:h_e]
-            m_seg = emg_abs[m_s:m_e]
-            h_row.append(float(np.max(h_seg)) if len(h_seg) > 0 else 0.0)
-            m_row.append(float(np.max(m_seg)) if len(m_seg) > 0 else 0.0)
-        h_peaks_all.append(h_row)
-        m_peaks_all.append(m_row)
+    emg_abs = np.abs(np.array(trial.trial_data, dtype=float))
+    h_peaks, m_peaks = [], []
+    for k in range(n_pulses):
+        onset_k = onset + k * pulse_period_samples
+        h_s = onset_k + round(h_start_ms * sr / 1000)
+        h_e = onset_k + round(h_end_ms   * sr / 1000)
+        m_s = onset_k + round(m_start_ms * sr / 1000)
+        m_e = onset_k + round(m_end_ms   * sr / 1000)
+        h_seg = emg_abs[h_s:h_e]
+        m_seg = emg_abs[m_s:m_e]
+        h_peaks.append(float(np.max(h_seg)) if len(h_seg) > 0 else 0.0)
+        m_peaks.append(float(np.max(m_seg)) if len(m_seg) > 0 else 0.0)
 
-    if not h_peaks_all:
-        print("No valid trial data for peak calculation.")
-        return
-
-    h_mat     = np.array(h_peaks_all)
-    m_mat     = np.array(m_peaks_all)
     pulse_idx = np.arange(1, n_pulses + 1)
     hz = round(1e6 / period_us, 1)
     try:
-        amp_str = f'{float(getattr(trials[0], "stimulation_amplitude_ma", 0.0)):.3f} mA'
+        amp_str = f'{float(getattr(trial, "stimulation_amplitude_ma", 0.0)):.3f} mA'
     except (TypeError, ValueError):
         amp_str = '? mA'
 
     fig, ax = plt.subplots(figsize=(max(8, n_pulses * 0.85), 5))
-
-    h_mean, h_std = h_mat.mean(axis=0), h_mat.std(axis=0)
-    m_mean, m_std = m_mat.mean(axis=0), m_mat.std(axis=0)
-
-    ax.plot(pulse_idx, h_mean, 'o-', color='royalblue', lw=2, ms=7,
-            label=f'H-wave peak (n={len(h_peaks_all)})', zorder=4)
-    ax.fill_between(pulse_idx, h_mean - h_std, h_mean + h_std,
-                    color='royalblue', alpha=0.18, zorder=3)
-    ax.plot(pulse_idx, h_mat[-1], 'o--', color='royalblue', lw=1.2, ms=4,
-            alpha=0.55, label='H-wave peak (last trial)', zorder=3)
-
-    ax.plot(pulse_idx, m_mean, 's-', color='firebrick', lw=2, ms=7,
-            label=f'M-wave peak (n={len(m_peaks_all)})', zorder=4)
-    ax.fill_between(pulse_idx, m_mean - m_std, m_mean + m_std,
-                    color='firebrick', alpha=0.18, zorder=3)
-    ax.plot(pulse_idx, m_mat[-1], 's--', color='firebrick', lw=1.2, ms=4,
-            alpha=0.55, label='M-wave peak (last trial)', zorder=3)
+    ax.plot(pulse_idx, h_peaks, 'o-', color='royalblue', lw=2, ms=7,
+            label='H-wave peak', zorder=4)
+    ax.plot(pulse_idx, m_peaks, 's-', color='firebrick', lw=2, ms=7,
+            label='M-wave peak', zorder=4)
 
     ax.set_xlabel('Pulse # in train', fontsize=11)
     ax.set_ylabel('Peak |EMG|  (µV)', fontsize=11)
     ax.set_xticks(pulse_idx)
-    title = f'H/M Peak Per Pulse  ·  {hz} Hz  ·  {amp_str}  ·  n={len(trials)} trials'
+    title = f'H/M Peak Per Pulse  ·  {hz} Hz  ·  {amp_str}'
     if title_suffix:
         title += f'  ·  {title_suffix}'
     ax.set_title(title, fontsize=11)
@@ -2739,23 +3054,27 @@ def plot_hwave_regression(trials, emg_blocks=None,
     _bin_s = int(BIN_DURATION_MS * sample_rate / 1000)
     _rec_s = int(TRIAL_RECORD_MS  * sample_rate / 1000)
 
-    # ── per-trial H-wave MRA ──────────────────────────────────────────────
+    # ── per-trial H-wave Size (MRA − pre-stim BG) ────────────────────────
     h_mra = []
     for _tr in trials:
         _t, _emg, _, _, _ = get_trial_window(
             _tr, pre_ms, post_ms,
             ms_per_sample=_ms_ps, bin_samples=_bin_s, record_samples=_rec_s)
         _hm = (_t >= h_start_ms) & (_t <= h_end_ms)
-        h_mra.append(float(np.nanmean(np.abs(_emg[_hm]))) if _hm.any() else float('nan'))
+        _bg_mask_hr = _t < 0
+        _bg_hr = float(np.nanmean(np.abs(_emg[_bg_mask_hr]))) if _bg_mask_hr.any() else 0.0
+        h_mra.append((float(np.nanmean(np.abs(_emg[_hm]))) - _bg_hr) if _hm.any() else float('nan'))
 
-    # ── per-trial M-wave MRA ──────────────────────────────────────────────
+    # ── per-trial M-wave Size (MRA − pre-stim BG) ────────────────────────
     m_mra = []
     for _tr in trials:
         _t, _emg, _, _, _ = get_trial_window(
             _tr, pre_ms, post_ms,
             ms_per_sample=_ms_ps, bin_samples=_bin_s, record_samples=_rec_s)
         _mm = (_t >= m_start_ms) & (_t <= m_end_ms)
-        m_mra.append(float(np.nanmean(np.abs(_emg[_mm]))) if _mm.any() else float('nan'))
+        _bg_mask_mr = _t < 0
+        _bg_mr = float(np.nanmean(np.abs(_emg[_bg_mask_mr]))) if _bg_mask_mr.any() else 0.0
+        m_mra.append((float(np.nanmean(np.abs(_emg[_mm]))) - _bg_mr) if _mm.any() else float('nan'))
 
     # ── per-trial background bins and grand mean ──────────────────────────
     bins_list = []
@@ -2807,7 +3126,7 @@ def plot_hwave_regression(trials, emg_blocks=None,
     _ax1.plot(_xfit, _yfit, color='crimson', linewidth=2.0,
               label=f'y = {_sl:.2f}x + {_ic:.2f}\nR² = {_r2:.3f},  p = {_p:.3g}')
     _ax1.set_xlabel('Pre-stim background EMG (µV)', fontsize=12)
-    _ax1.set_ylabel('H-wave MRA (µV)', fontsize=12)
+    _ax1.set_ylabel('H-wave Size (µV)', fontsize=12)
     _ax1.set_title(f'H-wave vs Background EMG{_sfx}', fontsize=13)
     _ax1.legend(fontsize=10)
     _ax1.grid(True, alpha=0.3)
@@ -2823,9 +3142,9 @@ def plot_hwave_regression(trials, emg_blocks=None,
                      label=f'n = {len(_valid_mh)} trials')
         _ax2.plot(_xfit2, _yfit2, color='crimson', linewidth=2.0,
                   label=f'y = {_sl2:.2f}x + {_ic2:.2f}\nR² = {_r2_mh:.3f},  p = {_p2:.3g}')
-        _ax2.set_xlabel('M-wave MRA (µV)', fontsize=12)
-        _ax2.set_ylabel('H-wave MRA (µV)', fontsize=12)
-        _ax2.set_title(f'H-wave vs M-wave MRA{_sfx}', fontsize=13)
+        _ax2.set_xlabel('M-wave Size (µV)', fontsize=12)
+        _ax2.set_ylabel('H-wave Size (µV)', fontsize=12)
+        _ax2.set_title(f'H-wave vs M-wave Size{_sfx}', fontsize=13)
         _ax2.legend(fontsize=10)
         _ax2.grid(True, alpha=0.3)
     else:
@@ -2924,12 +3243,17 @@ def plot_hrs2_analysis(trials, header,
             _mse = float(np.mean(_se)) if _se else 0.5
             _mm  = (_t_ref >= m_start_ms) & (_t_ref <= m_end_ms)
             _hm  = (_t_ref >= h_start_ms) & (_t_ref <= h_end_ms)
+            _pre_mask_a = _t_ref < 0
+            # Per-trial: rectify each trial first, then average across trials.
+            # This matches compute_h_comparison_data and xr_df per-trial metrics.
+            _pre_a = (float(np.nanmean(_pab[:, _pre_mask_a]))
+                      if _pre_mask_a.any() else 0.0)
             _m_t   = float((m_start_ms + m_end_ms) / 2)
-            _m_a   = float(np.mean(_avg_ab[_mm])) if _mm.any() else float('nan')
+            _m_a   = float(np.nanmean(_pab[:, _mm])) if _mm.any() else float('nan')
             _m_ci  = int(len(_t_ref[_mm]) // 2) if _mm.any() else 0
             _m_bip = float(_avg_b[_mm][_m_ci]) if _mm.any() else float('nan')
             _h_t   = float((h_start_ms + h_end_ms) / 2)
-            _h_a   = float(np.mean(_avg_ab[_hm])) if _hm.any() else float('nan')
+            _h_a   = float(np.nanmean(_pab[:, _hm])) if _hm.any() else float('nan')
             _h_ci  = int(len(_t_ref[_hm]) // 2) if _hm.any() else 0
             _h_bip = float(_avg_b[_hm][_h_ci]) if _hm.any() else float('nan')
             _trs = _trial_groups[_amp]
@@ -2949,6 +3273,8 @@ def plot_hrs2_analysis(trials, header,
                 'padded_abs_uni': _pau, 'avg_abs_uni': _avg_au,
                 'm_peak_time': _m_t, 'm_peak_amp': _m_a, 'm_peak_bip': _m_bip,
                 'h_peak_time': _h_t, 'h_peak_amp': _h_a, 'h_peak_bip': _h_bip,
+                'm_size': (_m_a - _pre_a if not np.isnan(_m_a) else float('nan')),
+                'h_size': (_h_a - _pre_a if not np.isnan(_h_a) else float('nan')),
                 'trials': _trs,
                 'bg_mean': _bg_mean, 'bg_lo': _bg_lo, 'bg_hi': _bg_hi,
                 'is_merged': _is_mg, 'amp_lo': _amp_lo_v, 'amp_hi': _amp_hi_v,
@@ -3042,20 +3368,22 @@ def plot_hrs2_analysis(trials, header,
         ax.axvline(h_start_ms, color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
         ax.axvline(h_end_ms,   color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
 
-        m_a = abs(d['m_peak_amp'])
-        h_a = abs(d['h_peak_amp'])
+        m_a    = abs(d['m_peak_amp'])
+        h_a    = abs(d['h_peak_amp'])
+        m_size = d.get('m_size', float('nan'))
+        h_size = d.get('h_size', float('nan'))
         if not np.isnan(m_a):
             ax.hlines(m_a, m_start_ms, m_end_ms, colors='blue', linestyles='dotted',
-                      linewidth=lw * 2.5, zorder=5, label=f'M-MRA: {m_a:.1f} uV')
-            ax.text((m_start_ms + m_end_ms) / 2, 0.93, f'M: {m_a:.1f} uV',
+                      linewidth=lw * 2.5, zorder=5, label=f'M-Size: {m_size:.1f} µV')
+            ax.text((m_start_ms + m_end_ms) / 2, 0.93, f'M Size: {m_size:.1f} µV',
                     transform=ax.get_xaxis_transform(),
                     color='blue', fontsize=fsz - 1, ha='center', va='top',
                     bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='blue', alpha=0.85),
                     zorder=8)
         if not np.isnan(h_a):
             ax.hlines(h_a, h_start_ms, h_end_ms, colors='green', linestyles='dotted',
-                      linewidth=lw * 2.5, zorder=5, label=f'H-MRA: {h_a:.1f} uV')
-            ax.text((h_start_ms + h_end_ms) / 2, 0.93, f'H: {h_a:.1f} uV',
+                      linewidth=lw * 2.5, zorder=5, label=f'H-Size: {h_size:.1f} µV')
+            ax.text((h_start_ms + h_end_ms) / 2, 0.93, f'H Size: {h_size:.1f} µV',
                     transform=ax.get_xaxis_transform(),
                     color='darkgreen', fontsize=fsz - 1, ha='center', va='top',
                     bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
@@ -3397,12 +3725,15 @@ def plot_hrs2_analysis(trials, header,
                                                    ms_per_sample=_ms_ps,
                                                    bin_samples=_bin_s,
                                                    record_samples=_rec_s)
+            _bg_mask_rc = t_ms < 0
+            _bg_rc = (float(np.nanmean(np.abs(emg[_bg_mask_rc])))
+                      if _bg_mask_rc.any() else 0.0)
             m_mask = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
             if np.any(m_mask):
-                _md[amp_key].append(np.mean(np.abs(emg[m_mask])))
+                _md[amp_key].append(np.mean(np.abs(emg[m_mask])) - _bg_rc)
             h_mask = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
             if np.any(h_mask):
-                _hd[amp_key].append(np.mean(np.abs(emg[h_mask])))
+                _hd[amp_key].append(np.mean(np.abs(emg[h_mask])) - _bg_rc)
         _sa  = sorted(set(_md.keys()) | set(_hd.keys()))
         _mls = [_md.get(a, [0]) for a in _sa]
         _hls = [_hd.get(a, [0]) for a in _sa]
@@ -3456,7 +3787,7 @@ def plot_hrs2_analysis(trials, header,
             ax.text(_cur_Hmax_k + 0.02, _H_max_k + 2, 'b', fontsize=12, color='black')
             ax.text(_cur_Hmax_k - 0.08, _H_max_k + 2, 'a', fontsize=12, color='black')
             ax.set_xlabel('Current (normalized to current at 50% Mmax)', fontsize=18)
-            ax.set_ylabel('H and M wave amplitude (% of Mmax)', fontsize=18)
+            ax.set_ylabel('H and M wave size (% of Mmax)', fontsize=18)
             ax.set_title(f'HRS2 Normalized Recruitment Curve - {header.subject_id}{_lbl_sfx}',
                          fontsize=15)
             ax.legend()
@@ -3474,7 +3805,7 @@ def plot_hrs2_analysis(trials, header,
             ax.set_xticks(_sa)
             ax.set_xticklabels([f'{a:.3f}' for a in _sa], rotation=45, ha='right', fontsize=9)
             ax.set_xlabel('Stimulation Amplitude (mA)', fontsize=18)
-            ax.set_ylabel('MRA Amplitude (µV)', fontsize=18)
+            ax.set_ylabel('Size (µV) [MRA − BG]', fontsize=18)
             ax.set_title(f'HRS2 Recruitment Curve - {header.subject_id}{_lbl_sfx}', fontsize=15)
             ax.legend()
             ax.grid(True, alpha=0.3)
@@ -3671,12 +4002,17 @@ def plot_hrs2_trials(trials, header,
 
         _mm = (t >= m_start_ms) & (t <= m_end_ms)
         _hm = (t >= h_start_ms) & (t <= h_end_ms)
+        _pre_mask_mh = t < 0
+        _pre_emg_mh = (float(np.nanmean(np.abs(d['emg'][_pre_mask_mh])))
+                       if _pre_mask_mh.sum() >= 2 else 0.0)
         _m_mra = float(np.nanmean(np.abs(emg[_mm]))) if _mm.any() else float('nan')
         _h_mra = float(np.nanmean(np.abs(emg[_hm]))) if _hm.any() else float('nan')
+        _m_size = _m_mra - _pre_emg_mh
+        _h_size = _h_mra - _pre_emg_mh
         if not np.isnan(_m_mra):
             ax.hlines(_m_mra, m_start_ms, m_end_ms, colors='blue', linestyles='dotted',
                       linewidth=lw * 2.5, zorder=5)
-            ax.text((m_start_ms + m_end_ms) / 2, 0.93, f'M: {_m_mra:.1f} uV',
+            ax.text((m_start_ms + m_end_ms) / 2, 0.93, f'M Size: {_m_size:.1f} µV',
                     transform=ax.get_xaxis_transform(),
                     color='blue', fontsize=fsz - 1, ha='center', va='top',
                     bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='blue', alpha=0.85),
@@ -3684,7 +4020,7 @@ def plot_hrs2_trials(trials, header,
         if not np.isnan(_h_mra):
             ax.hlines(_h_mra, h_start_ms, h_end_ms, colors='green', linestyles='dotted',
                       linewidth=lw * 2.5, zorder=5)
-            ax.text((h_start_ms + h_end_ms) / 2, 0.93, f'H: {_h_mra:.1f} uV',
+            ax.text((h_start_ms + h_end_ms) / 2, 0.93, f'H Size: {_h_size:.1f} µV',
                     transform=ax.get_xaxis_transform(),
                     color='darkgreen', fontsize=fsz - 1, ha='center', va='top',
                     bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
@@ -9861,15 +10197,18 @@ def plot_bin_overview(
                 if t_ref is None:
                     t_ref = tm
                 stacks.append(emg[:len(t_ref)])
+                _bg_mask_bo = tm < 0
+                _bg_bo = (float(np.nanmean(np.abs(emg[_bg_mask_bo])))
+                          if _bg_mask_bo.any() else 0.0)
                 mm = (tm >= m_start_ms) & (tm <= m_end_ms)
                 hm = (tm >= h_start_ms) & (tm <= h_end_ms)
                 if mm.any():
-                    mv_l.append(float(np.nanmean(np.abs(emg[mm]))))
+                    mv_l.append(float(np.nanmean(np.abs(emg[mm]))) - _bg_bo)
                 if hm.any():
-                    hv_l.append(float(np.nanmean(np.abs(emg[hm]))))
+                    hv_l.append(float(np.nanmean(np.abs(emg[hm]))) - _bg_bo)
                 if mm.any() and hm.any():
-                    mv = float(np.nanmean(np.abs(emg[mm])))
-                    hv = float(np.nanmean(np.abs(emg[hm])))
+                    mv = float(np.nanmean(np.abs(emg[mm]))) - _bg_bo
+                    hv = float(np.nanmean(np.abs(emg[hm]))) - _bg_bo
                     if mv > 0:
                         hm_l.append(hv / mv)
             if stacks:
@@ -9935,8 +10274,8 @@ def plot_bin_overview(
                     ax.set_title(title, fontsize=10, fontweight='bold')
                     ax.grid(True, axis='y', alpha=0.3)
 
-                _bar(ax_m,  m_mra,  'MRA (µV)', 'M-wave',    fmt='.1f')
-                _bar(ax_h,  h_mra,  'MRA (µV)', 'H-wave',    fmt='.1f')
+                _bar(ax_m,  m_mra,  'Size (µV)', 'M-wave',    fmt='.1f')
+                _bar(ax_h,  h_mra,  'Size (µV)', 'H-wave',    fmt='.1f')
                 _bar(ax_hm, hm_mra, 'H:M',           'H:M Ratio', fmt='.3f')
 
                 ax_txt.axis('off')
@@ -10056,9 +10395,9 @@ def plot_bin_overview(
                 ]
                 for lbl, slbl in zip(present, short_lbls):
                     stat_lines.append(f'{slbl}   (n={ns[lbl]})')
-                    for key, vd in [('M-wave MRA (µV)',  m_mra),
-                                    ('H-wave MRA (µV)',  h_mra),
-                                    ('H:M Ratio',             hm_mra)]:
+                    for key, vd in [('M-wave Size (µV)', m_mra),
+                                    ('H-wave Size (µV)', h_mra),
+                                    ('H:M Ratio',        hm_mra)]:
                         v = np.array([x for x in vd[lbl] if np.isfinite(x)])
                         if len(v):
                             mu  = float(np.mean(v))
@@ -10232,10 +10571,10 @@ def print_bin_statistics(
     sample_rate, pre_avg_ms, post_avg_ms,
     m_start_ms, m_end_ms, h_start_ms, h_end_ms,
 ):
-    """Print per-bin x per-polarity numeric statistics (trial count, M-MRA, H-MRA, H:M)."""
+    """Print per-bin x per-polarity numeric statistics (trial count, M-Size, H-Size, H:M)."""
     ms_per_sample = 1000.0 / sample_rate
     hdr = (f"{'Polarity':<20}  {'Bin':<38}  {'n':>5}  "
-           f"{'M-MRA µV':>10}  {'H-MRA µV':>10}  {'H:M':>8}")
+           f"{'M-Size µV':>10}  {'H-Size µV':>10}  {'H:M':>8}")
     print(hdr)
     print("-" * len(hdr))
 
@@ -10249,15 +10588,18 @@ def print_bin_statistics(
             m_mra, h_mra, hm = [], [], []
             for tr in bin_trs:
                 tm, emg, _, _, _ = get_trial_window(tr, pre_avg_ms, post_avg_ms, ms_per_sample=ms_per_sample)
+                _bg_mask_bs = tm < 0
+                _bg_bs = (float(np.nanmean(np.abs(emg[_bg_mask_bs])))
+                          if _bg_mask_bs.any() else 0.0)
                 mm      = (tm >= m_start_ms) & (tm <= m_end_ms)
                 hm_mask = (tm >= h_start_ms) & (tm <= h_end_ms)
                 if mm.any():
-                    m_mra.append(float(np.nanmean(np.abs(emg[mm]))))
+                    m_mra.append(float(np.nanmean(np.abs(emg[mm]))) - _bg_bs)
                 if hm_mask.any():
-                    h_mra.append(float(np.nanmean(np.abs(emg[hm_mask]))))
+                    h_mra.append(float(np.nanmean(np.abs(emg[hm_mask]))) - _bg_bs)
                 if mm.any() and hm_mask.any():
-                    mv = float(np.nanmean(np.abs(emg[mm])))
-                    hv = float(np.nanmean(np.abs(emg[hm_mask])))
+                    mv = float(np.nanmean(np.abs(emg[mm]))) - _bg_bs
+                    hv = float(np.nanmean(np.abs(emg[hm_mask]))) - _bg_bs
                     if mv > 0:
                         hm.append(hv / mv)
             m_s  = f"{np.nanmean(m_mra):.1f}" if m_mra else "—"
@@ -10432,14 +10774,11 @@ def compute_h_comparison_data(all_recordings, pre_ms, post_ms, h_start_ms, h_end
     Pre-compute per-trial H-reflex size, M-wave size, and background MRA for the
     cross-recording comparison plot.
 
-    Per trial:
+    Per trial (rectify first, then average — matches waveform viewer annotations):
       bg_mra  = mean|emg(t < 0)|
       h_size  = mean|emg(t in [h_start_ms, h_end_ms])| - bg_mra
       m_size  = mean|emg(t in [m_start_ms, m_end_ms])| - bg_mra
-      bg_size = bg_mra  (raw pre-stim background level)
-
-    Call once after loading recordings and setting analysis parameters. Returns a
-    cache dict that plot_h_reflex_comparison() consumes directly.
+      bg_size = bg_mra
 
     Parameters
     ----------
@@ -10450,7 +10789,8 @@ def compute_h_comparison_data(all_recordings, pre_ms, post_ms, h_start_ms, h_end
 
     Returns
     -------
-    dict : {rec_label: {stage_key: {'h_sizes', 'm_sizes', 'bg_sizes': np.ndarray, 'mean_amp': float}}}
+    dict : {rec_label: {stage_key: {'h_sizes', 'm_sizes', 'bg_sizes': np.ndarray,
+                                    'mean_amp': float, 'std_amp': float}}}
         Each array has one value per trial with a valid pre-stim window.
     """
     result = {}
@@ -10458,6 +10798,7 @@ def compute_h_comparison_data(all_recordings, pre_ms, post_ms, h_start_ms, h_end
         result[rec_label] = {}
         sr = rec['sample_rate'] or getattr(rec['hrs1_header'], 'sample_rate', SAMPLE_RATE)
         ms_per_sample = 1000.0 / sr
+        rec_samples   = int(TRIAL_RECORD_MS * sr / 1000)
 
         for stage_key, (trials, _, _, _) in rec['stage_map'].items():
             if not trials:
@@ -10467,7 +10808,9 @@ def compute_h_comparison_data(all_recordings, pre_ms, post_ms, h_start_ms, h_end
             for t in trials:
                 try:
                     t_ms, emg, *_ = get_trial_window(
-                        t, pre_ms, post_ms, ms_per_sample=ms_per_sample)
+                        t, pre_ms, post_ms,
+                        ms_per_sample=ms_per_sample,
+                        record_samples=rec_samples)
                     bg_mask = t_ms < 0
                     if not bg_mask.any():
                         continue
@@ -10584,8 +10927,1569 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
         fontsize=10)
     ax.set_xlim(-0.65, n - 0.35)
     ax.margins(y=0.22)
+    ax.set_ylim(bottom=0)
     ax.grid(axis='y', alpha=0.3, ls='--')
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     plt.tight_layout()
     plt.show()
+
+
+# ── Plotly MH Recruitment Curve Helpers ──────────────────────────────────────
+# Used by Plotly_Read_H-Reflex_App_Simplified.ipynb.
+# Requires plotly; imports are done locally so the rest of helpers stays usable
+# without plotly installed.
+
+
+def _plotly_yrange(amp_data):
+    """Auto y-range from mean ± 1 SD across all amplitude groups."""
+    all_bip = np.concatenate([
+        np.concatenate([d['avg_bip'] - d['std_bip'], d['avg_bip'] + d['std_bip']])
+        for d in amp_data
+    ])
+    all_bip = all_bip[~np.isnan(all_bip)]
+    if len(all_bip):
+        y_lo = float(np.nanmin(all_bip))
+        y_hi = float(np.nanmax(all_bip))
+        pad  = max(0.12 * (y_hi - y_lo), 50.0)
+        return y_lo - pad, y_hi + pad
+    return -2000.0, 2000.0
+
+
+def _plotly_panel_shapes(d, m_start_ms, m_end_ms, h_start_ms, h_end_ms,
+                          xref='x', yref='paper'):
+    """Plotly shape dicts for one amplitude panel (stim window + M/H regions)."""
+    return [
+        dict(type='rect', xref=xref, yref=yref, layer='below',
+             x0=0,          y0=0, x1=d['mean_stim_end'], y1=1,
+             fillcolor='rgba(255,0,0,0.10)', line_width=0),
+        dict(type='rect', xref=xref, yref=yref, layer='below',
+             x0=m_start_ms, y0=0, x1=m_end_ms,           y1=1,
+             fillcolor='rgba(0,0,200,0.10)', line_width=0),
+        dict(type='rect', xref=xref, yref=yref, layer='below',
+             x0=h_start_ms, y0=0, x1=h_end_ms,           y1=1,
+             fillcolor='rgba(0,160,0,0.10)', line_width=0),
+        dict(type='line', xref=xref, yref=yref,
+             x0=0,                  y0=0, x1=0,                  y1=1,
+             line=dict(color='red', dash='dash', width=1.0)),
+        dict(type='line', xref=xref, yref=yref,
+             x0=d['mean_stim_end'], y0=0, x1=d['mean_stim_end'], y1=1,
+             line=dict(color='red', dash='dash', width=1.0)),
+        dict(type='line', xref=xref, yref=yref,
+             x0=d['m_peak_time'],   y0=0, x1=d['m_peak_time'],   y1=1,
+             line=dict(color='royalblue', dash='dot', width=0.8)),
+        dict(type='line', xref=xref, yref=yref,
+             x0=d['h_peak_time'],   y0=0, x1=d['h_peak_time'],   y1=1,
+             line=dict(color='green', dash='dot', width=0.8)),
+    ]
+
+
+def prepare_plotly_amp_data(trials, sample_rate, pre_ms, post_ms,
+                             m_start_ms, m_end_ms, h_start_ms, h_end_ms):
+    """Group trials by amplitude and compute averaged waveforms for Plotly viewers.
+
+    Returns a list of dicts (sorted by amplitude), each containing:
+      amp, t_ref, n, mean_stim_end,
+      padded_bip, avg_bip, std_bip,
+      padded_adc, avg_adc,
+      padded_uni, avg_uni,
+      padded_abs_bip, avg_abs_bip,
+      padded_abs_uni, avg_abs_uni,
+      m_peak_time, m_peak_amp, m_peak_bip,
+      h_peak_time, h_peak_amp, h_peak_bip.
+    """
+    from collections import defaultdict
+    ms_per_sample = 1000.0 / float(sample_rate)
+
+    groups = defaultdict(list)
+    for trial in trials:
+        key = round(trial.stimulation_amplitude_ma, 2)
+        t_win, bip_win, adc_win, stim_end, _ = get_trial_window(
+            trial, pre_ms, post_ms, ms_per_sample=ms_per_sample)
+        _, uni_win, _, _, _ = get_trial_window(
+            trial, pre_ms, post_ms, use_unipolar=True, ms_per_sample=ms_per_sample)
+        groups[key].append((t_win, bip_win, adc_win, uni_win, stim_end))
+
+    def _pad(rows, n_pts):
+        p = np.full((len(rows), n_pts), np.nan)
+        for k, a in enumerate(rows):
+            if a is not None and len(a) > 0:
+                n = min(len(a), n_pts)
+                p[k, :n] = np.asarray(a[:n], dtype=float)
+        return p
+
+    amp_data = []
+    for amp in sorted(groups.keys()):
+        wins  = groups[amp]
+        t_ref = wins[0][0]
+        n_pts = len(t_ref)
+
+        pb  = _pad([w[1] for w in wins], n_pts)
+        pa  = _pad([w[2] for w in wins], n_pts)
+        pu  = _pad([w[3] for w in wins], n_pts)
+        pab = np.abs(pb)
+        pau = np.abs(pu)
+
+        avg_b  = np.nanmean(pb,  axis=0)
+        avg_ab = np.nanmean(pab, axis=0)
+        std_b  = np.nanstd(pb,   axis=0)
+        se     = [w[4] for w in wins if w[4] is not None]
+
+        mm = (t_ref >= m_start_ms) & (t_ref <= m_end_ms)
+        hm = (t_ref >= h_start_ms) & (t_ref <= h_end_ms)
+        bg_mask_pp = t_ref < 0
+        bg_mra_pp  = (float(np.nanmean(avg_ab[bg_mask_pp]))
+                      if bg_mask_pp.any() else 0.0)
+        mi = int(np.argmax(avg_ab[mm])) if mm.any() else 0
+        hi = int(np.argmax(avg_ab[hm])) if hm.any() else 0
+        m_t    = float(t_ref[mm][mi])  if mm.any() else m_start_ms
+        m_a    = float(avg_ab[mm][mi]) if mm.any() else float('nan')
+        m_bip  = float(avg_b[mm][mi])  if mm.any() else float('nan')
+        h_t    = float(t_ref[hm][hi])  if hm.any() else h_start_ms
+        h_a    = float(avg_ab[hm][hi]) if hm.any() else float('nan')
+        h_bip  = float(avg_b[hm][hi])  if hm.any() else float('nan')
+        m_size = (float(np.mean(avg_ab[mm])) - bg_mra_pp) if mm.any() else float('nan')
+        h_size = (float(np.mean(avg_ab[hm])) - bg_mra_pp) if hm.any() else float('nan')
+
+        amp_data.append({
+            'amp': amp, 't_ref': t_ref, 'n': len(wins),
+            'mean_stim_end': float(np.mean(se)) if se else 0.5,
+            'padded_bip': pb,   'avg_bip': avg_b,              'std_bip': std_b,
+            'padded_adc': pa,   'avg_adc': np.nanmean(pa, axis=0),
+            'padded_uni': pu,   'avg_uni': np.nanmean(pu, axis=0),
+            'padded_abs_bip': pab, 'avg_abs_bip': avg_ab,
+            'padded_abs_uni': pau, 'avg_abs_uni': np.nanmean(pau, axis=0),
+            'm_peak_time': m_t, 'm_peak_amp': m_a, 'm_peak_bip': m_bip,
+            'h_peak_time': h_t, 'h_peak_amp': h_a, 'h_peak_bip': h_bip,
+            'm_size': m_size, 'h_size': h_size,
+        })
+
+    return amp_data
+
+
+def plot_plotly_amplitude_grid(amp_data, subject_id, n_per_page=6,
+                                pre_ms=2.0, post_ms=15.0,
+                                m_start_ms=2.0, m_end_ms=4.5,
+                                h_start_ms=5.0, h_end_ms=9.0):
+    """2×3 paged grid of averaged bipolar waveforms, one panel per amplitude.
+
+    Returns a Plotly Figure.  Call fig.show() to display or fig.write_html() to export.
+    Slider (bottom) navigates pages; legend toggles Bipolar raw / |Bipolar| avg;
+    Y-range dropdown sets axis limits for all 6 panels.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import math
+
+    n_amps  = len(amp_data)
+    n_pages = math.ceil(n_amps / n_per_page)
+    y_lo, y_hi = _plotly_yrange(amp_data)
+
+    def _ax(pos):
+        return '' if pos == 0 else str(pos + 1)
+
+    def _shapes_for_page(page_idx):
+        shapes = []
+        pd = amp_data[page_idx * n_per_page: (page_idx + 1) * n_per_page]
+        for j, d in enumerate(pd):
+            xr   = 'x' + _ax(j)
+            ydom = 'y' + _ax(j) + ' domain'
+            shapes += _plotly_panel_shapes(d, m_start_ms, m_end_ms,
+                                           h_start_ms, h_end_ms,
+                                           xref=xr, yref=ydom)
+        return shapes
+
+    init_titles = [
+        f"{amp_data[j]['amp']:.2f} mA  (n={amp_data[j]['n']})" if j < n_amps else ''
+        for j in range(n_per_page)
+    ]
+    fig = make_subplots(
+        rows=2, cols=3,
+        subplot_titles=init_titles,
+        horizontal_spacing=0.09, vertical_spacing=0.16,
+    )
+
+    amp_traces = []
+    for i, d in enumerate(amp_data):
+        page = i // n_per_page
+        pos  = i %  n_per_page
+        row  = pos // 3 + 1
+        col  = pos %  3 + 1
+        vis0 = (page == 0)
+        t    = d['t_ref']
+        ti   = {'page': page, 'pos': pos, 'indiv_bip': []}
+
+        for row_d in d['padded_bip']:
+            k = len(fig.data)
+            fig.add_trace(go.Scatter(x=t, y=row_d,
+                line=dict(color='rgba(220,70,70,0.45)', width=0.7),
+                showlegend=False, hoverinfo='skip',
+                legendgroup='bip_raw', visible=vis0), row=row, col=col)
+            ti['indiv_bip'].append(k)
+
+        ti['sd_lo'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_bip'] - d['std_bip'],
+            line=dict(width=0), showlegend=False, hoverinfo='skip',
+            legendgroup='bip_raw', visible=vis0), row=row, col=col)
+
+        ti['sd_hi'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_bip'] + d['std_bip'],
+            fill='tonexty', fillcolor='rgba(180,60,60,0.15)',
+            line=dict(width=0), showlegend=False, hoverinfo='skip',
+            legendgroup='bip_raw', visible=vis0), row=row, col=col)
+
+        ti['avg_bip'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_bip'],
+            line=dict(color='black', width=2.0), showlegend=False,
+            hovertemplate=f"{d['amp']:.2f} mA — %{{x:.2f}} ms: %{{y:.1f}} µV<extra></extra>",
+            legendgroup='bip_raw', visible=vis0), row=row, col=col)
+
+        ti['abs_bip'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_abs_bip'],
+            line=dict(color='gray', width=1.8),
+            showlegend=False, hoverinfo='skip',
+            legendgroup='abs_bip', visible=vis0), row=row, col=col)
+
+        ti['m_peak'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=[d['m_peak_time']], y=[d['m_peak_bip']],
+            mode='markers',
+            marker=dict(symbol='star', size=9, color='royalblue',
+                        line=dict(color='darkblue', width=0.5)),
+            showlegend=False,
+            hovertemplate=f"M Size: {d.get('m_size', d['m_peak_amp']):.1f} µV @ {d['m_peak_time']:.2f} ms<extra></extra>",
+            visible=vis0), row=row, col=col)
+
+        ti['h_peak'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=[d['h_peak_time']], y=[d['h_peak_bip']],
+            mode='markers',
+            marker=dict(symbol='star', size=9, color='green',
+                        line=dict(color='darkgreen', width=0.5)),
+            showlegend=False,
+            hovertemplate=f"H Size: {d.get('h_size', d['h_peak_amp']):.1f} µV @ {d['h_peak_time']:.2f} ms<extra></extra>",
+            visible=vis0), row=row, col=col)
+
+        amp_traces.append(ti)
+
+    legend_bip_idx = len(fig.data)
+    fig.add_trace(go.Scatter(x=[], y=[], mode='lines',
+        line=dict(color='black', width=2.5),
+        name='Bipolar raw', legendgroup='bip_raw',
+        showlegend=True, hoverinfo='none', visible=True))
+
+    legend_abs_idx = len(fig.data)
+    fig.add_trace(go.Scatter(x=[], y=[], mode='lines',
+        line=dict(color='gray', width=1.8),
+        name='|Bipolar| avg', legendgroup='abs_bip',
+        showlegend=True, hoverinfo='none', visible=True))
+
+    n_total = len(fig.data)
+
+    def _vis(page_idx):
+        vis = [False] * n_total
+        vis[legend_bip_idx] = vis[legend_abs_idx] = True
+        for ti in amp_traces:
+            if ti['page'] != page_idx:
+                continue
+            for k in ti['indiv_bip']:
+                vis[k] = True
+            vis[ti['sd_lo']] = vis[ti['sd_hi']]  = True
+            vis[ti['avg_bip']] = vis[ti['abs_bip']] = True
+            vis[ti['m_peak']]  = vis[ti['h_peak']]  = True
+        return vis
+
+    def _title(page_idx):
+        ns = page_idx * n_per_page + 1
+        ne = min((page_idx + 1) * n_per_page, n_amps)
+        return (f"{subject_id}  |  HRS2 Grid · Amps {ns}–{ne} of {n_amps}"
+                f"  (Page {page_idx+1}/{n_pages})"
+                f"<br><sup>Slider ▸ navigate pages · Legend: toggle signals · Y-range ▼</sup>")
+
+    def _anno_updates(page_idx):
+        pd = amp_data[page_idx * n_per_page: (page_idx + 1) * n_per_page]
+        return {f'annotations[{j}].text':
+                (f"{pd[j]['amp']:.2f} mA  (n={pd[j]['n']})" if j < len(pd) else '')
+                for j in range(n_per_page)}
+
+    steps = []
+    for p in range(n_pages):
+        ns = p * n_per_page + 1
+        ne = min((p + 1) * n_per_page, n_amps)
+        args2 = {'title.text': _title(p), 'shapes': _shapes_for_page(p)}
+        args2.update(_anno_updates(p))
+        steps.append(dict(
+            method='update',
+            label=f"Pg {p+1}  ({ns}–{ne})",
+            args=[{'visible': _vis(p)}, args2],
+        ))
+
+    def _all_yranges(lo, hi):
+        return {f'yaxis{_ax(j)}.range': [lo, hi] for j in range(n_per_page)}
+
+    y_btns = [
+        dict(label='Auto',     method='relayout', args=[_all_yranges(y_lo, y_hi)]),
+        dict(label='±500 µV',  method='relayout', args=[_all_yranges(-500,   500)]),
+        dict(label='±1000 µV', method='relayout', args=[_all_yranges(-1000, 1000)]),
+        dict(label='±2000 µV', method='relayout', args=[_all_yranges(-2000, 2000)]),
+        dict(label='±5000 µV', method='relayout', args=[_all_yranges(-5000, 5000)]),
+    ]
+
+    xax = dict(range=[-pre_ms, post_ms], tickmode='linear', dtick=1,
+               showgrid=True, gridcolor='rgba(0,0,0,0.08)',
+               zeroline=True, zerolinecolor='rgba(0,0,0,0.35)', zerolinewidth=1,
+               title_text='ms')
+    yax = dict(range=[y_lo, y_hi], showgrid=True,
+               gridcolor='rgba(0,0,0,0.08)', title_text='µV')
+    ax_upd = {}
+    for j in range(n_per_page):
+        ax_upd[f'xaxis{_ax(j)}'] = xax
+        ax_upd[f'yaxis{_ax(j)}'] = yax
+
+    fig.update_layout(
+        **ax_upd,
+        title=dict(text=_title(0), font=dict(size=12)),
+        updatemenus=[dict(buttons=y_btns, direction='down', showactive=True,
+                          pad=dict(t=5), x=1.01, xanchor='left', y=1.0, yanchor='top',
+                          bgcolor='white', bordercolor='#bbb', font=dict(size=10))],
+        sliders=[dict(steps=steps, active=0,
+                      currentvalue=dict(visible=True, prefix='', xanchor='center',
+                                        font=dict(size=11, color='#333')),
+                      pad=dict(t=10, b=10), len=0.80,
+                      x=0.0, xanchor='left', y=0.0, yanchor='top',
+                      bgcolor='#f5f5f5', bordercolor='#ccc', borderwidth=1,
+                      ticklen=4, tickcolor='#aaa', font=dict(size=9))],
+        legend=dict(title=dict(text='<b>Signal</b><br><sup>click to toggle</sup>'),
+                    x=1.01, y=0.50, xanchor='left', yanchor='middle',
+                    bgcolor='rgba(255,255,255,0.9)', bordercolor='#ccc', borderwidth=1),
+        shapes=_shapes_for_page(0),
+        height=660, margin=dict(r=175, t=85, b=80),
+        hovermode='x unified', plot_bgcolor='white',
+    )
+    return fig
+
+
+def plot_plotly_amplitude_detail(amp_data, subject_id,
+                                  pre_ms=2.0, post_ms=15.0,
+                                  m_start_ms=2.0, m_end_ms=4.5,
+                                  h_start_ms=5.0, h_end_ms=9.0):
+    """Single-amplitude detail view with amplitude dropdown and overlay toggles.
+
+    Returns a Plotly Figure.
+    Amplitude dropdown (top-right) switches groups; legend entries toggle overlays.
+    ADC channel plotted on a secondary y-axis.
+    """
+    import plotly.graph_objects as go
+
+    y_lo, y_hi = _plotly_yrange(amp_data)
+    fig = go.Figure()
+    wave_traces = []
+
+    for i, d in enumerate(amp_data):
+        v0 = (i == 0)
+        t  = d['t_ref']
+        wt = {'indiv_bip': []}
+
+        for row_d in d['padded_bip']:
+            k = len(fig.data)
+            fig.add_trace(go.Scatter(x=t, y=row_d,
+                line=dict(color='rgba(220,70,70,0.45)', width=0.7),
+                showlegend=False, hoverinfo='skip', visible=v0))
+            wt['indiv_bip'].append(k)
+
+        wt['sd_lo'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_bip'] - d['std_bip'],
+            line=dict(width=0), showlegend=False, hoverinfo='skip', visible=v0))
+
+        wt['sd_hi'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_bip'] + d['std_bip'],
+            fill='tonexty', fillcolor='rgba(220,80,80,0.22)',
+            line=dict(width=0), showlegend=False, hoverinfo='skip', visible=v0))
+
+        wt['avg_bip'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_bip'],
+            line=dict(color='black', width=2.5),
+            name='Avg Bipolar ±1 SD', showlegend=True, visible=v0,
+            hovertemplate='%{x:.2f} ms: %{y:.1f} µV<extra></extra>'))
+
+        wt['m_peak'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=[d['m_peak_time']], y=[d['m_peak_bip']],
+            mode='markers+text',
+            marker=dict(symbol='star', size=13, color='royalblue',
+                        line=dict(color='darkblue', width=1)),
+            text=[f"{d['m_peak_amp']:.1f} µV"],
+            textposition='top center', textfont=dict(color='royalblue', size=10),
+            name='M-peak', showlegend=True, visible=v0,
+            hovertemplate=f"M-peak: {d['m_peak_amp']:.1f} µV @ {d['m_peak_time']:.2f} ms<extra></extra>"))
+
+        wt['h_peak'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=[d['h_peak_time']], y=[d['h_peak_bip']],
+            mode='markers+text',
+            marker=dict(symbol='star', size=13, color='green',
+                        line=dict(color='darkgreen', width=1)),
+            text=[f"{d['h_peak_amp']:.1f} µV"],
+            textposition='top center', textfont=dict(color='green', size=10),
+            name='H-peak', showlegend=True, visible=v0,
+            hovertemplate=f"H-peak: {d['h_peak_amp']:.1f} µV @ {d['h_peak_time']:.2f} ms<extra></extra>"))
+
+        wt['abs_bip'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_abs_bip'],
+            line=dict(color='gray', width=1.8), name='|Bipolar| avg',
+            showlegend=True, visible='legendonly' if v0 else False))
+
+        wt['uni'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_uni'],
+            line=dict(color='darkorange', width=1.8), name='Unipolar avg',
+            showlegend=True, visible='legendonly' if v0 else False))
+
+        wt['abs_uni'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_abs_uni'],
+            line=dict(color='mediumpurple', width=1.8), name='|Unipolar| avg',
+            showlegend=True, visible='legendonly' if v0 else False))
+
+        wt['adc'] = len(fig.data)
+        fig.add_trace(go.Scatter(x=t, y=d['avg_adc'],
+            line=dict(color='mediumseagreen', width=1.8), name='ADC sync',
+            showlegend=True, yaxis='y2',
+            visible='legendonly' if v0 else False))
+
+        wave_traces.append(wt)
+
+    n_total = len(fig.data)
+
+    def _vis(amp_idx):
+        vis = [False] * n_total
+        wt  = wave_traces[amp_idx]
+        for k in wt['indiv_bip']:
+            vis[k] = True
+        vis[wt['sd_lo']]  = vis[wt['sd_hi']]  = True
+        vis[wt['avg_bip']] = vis[wt['m_peak']] = vis[wt['h_peak']] = True
+        vis[wt['abs_bip']] = vis[wt['uni']] = vis[wt['abs_uni']] = vis[wt['adc']] = 'legendonly'
+        return vis
+
+    def _title(d):
+        return (f"HRS2 Detail — {d['amp']:.2f} mA  (n={d['n']})  |  {subject_id}"
+                f"<br><sup>Amplitude ▼ top-right · Legend: click to toggle · Y-range ▼ below</sup>")
+
+    amp_btns = []
+    for i, d in enumerate(amp_data):
+        amp_btns.append(dict(
+            label=f"{d['amp']:.2f} mA  (n={d['n']})",
+            method='update',
+            args=[{'visible': _vis(i)},
+                  {'title.text': _title(d),
+                   'shapes': _plotly_panel_shapes(d, m_start_ms, m_end_ms,
+                                                  h_start_ms, h_end_ms)}],
+        ))
+
+    y_btns = [
+        dict(label='Auto',     method='relayout', args=[{'yaxis.range': [y_lo, y_hi]}]),
+        dict(label='±500 µV',  method='relayout', args=[{'yaxis.range': [-500,   500]}]),
+        dict(label='±1000 µV', method='relayout', args=[{'yaxis.range': [-1000, 1000]}]),
+        dict(label='±2000 µV', method='relayout', args=[{'yaxis.range': [-2000, 2000]}]),
+        dict(label='±5000 µV', method='relayout', args=[{'yaxis.range': [-5000, 5000]}]),
+    ]
+
+    fig.update_layout(
+        title=dict(text=_title(amp_data[0]), font=dict(size=13)),
+        updatemenus=[
+            dict(buttons=amp_btns, direction='down', showactive=True,
+                 pad=dict(t=10), x=1.02, xanchor='left', y=1.0, yanchor='top',
+                 bgcolor='white', bordercolor='#bbb', font=dict(size=11)),
+            dict(buttons=y_btns, direction='down', showactive=True,
+                 pad=dict(t=5), x=1.02, xanchor='left', y=0.38, yanchor='top',
+                 bgcolor='white', bordercolor='#bbb', font=dict(size=10)),
+        ],
+        xaxis=dict(title='Time re: stim onset (ms)', range=[-pre_ms, post_ms],
+                   tickmode='linear', dtick=1,
+                   showgrid=True, gridcolor='rgba(0,0,0,0.08)',
+                   zeroline=True, zerolinecolor='rgba(0,0,0,0.4)', zerolinewidth=1),
+        yaxis=dict(title='EMG (µV)', range=[y_lo, y_hi],
+                   showgrid=True, gridcolor='rgba(0,0,0,0.08)'),
+        yaxis2=dict(title='ADC (V)', overlaying='y', side='right',
+                    showgrid=False, color='mediumseagreen',
+                    tickfont=dict(color='mediumseagreen')),
+        legend=dict(title=dict(text='<b>Signal</b><br><sup>click to toggle</sup>'),
+                    x=1.02, y=0.72, xanchor='left',
+                    bgcolor='rgba(255,255,255,0.9)', bordercolor='#ccc', borderwidth=1),
+        shapes=_plotly_panel_shapes(amp_data[0], m_start_ms, m_end_ms, h_start_ms, h_end_ms),
+        height=530, margin=dict(r=220, t=70),
+        hovermode='x unified', plot_bgcolor='white',
+    )
+    return fig
+
+
+def plot_plotly_recruitment_curves(amp_data, subject_id):
+    """M/H size (MRA − BG) recruitment curves from pre-computed amp_data.
+
+    Returns (fig_rc1, fig_rc2):
+      fig_rc1 — size (µV) vs stimulation amplitude (mA)
+      fig_rc2 — normalized size (% Mmax) vs normalized current (× cur50)
+    """
+    import plotly.graph_objects as go
+    from scipy.interpolate import interp1d
+
+    amps    = np.array([d['amp']    for d in amp_data])
+    m_means = np.array([d.get('m_size', d['m_peak_amp']) for d in amp_data])
+    h_means = np.array([d.get('h_size', d['h_peak_amp']) for d in amp_data])
+
+    M_max  = float(np.nanmax(m_means)) if np.nanmax(m_means) > 0 else 1.0
+    m_norm = (m_means / M_max) * 100
+    h_norm = (h_means / M_max) * 100
+
+    try:
+        cur50 = float(interp1d(m_norm, amps, kind='linear',
+                               bounds_error=False, fill_value='extrapolate')(50))
+    except Exception:
+        cur50 = float(amps[int(np.argmax(m_norm >= 50))])
+
+    norm_cur  = amps / cur50
+    H_max_pct = float(np.nanmax(h_norm))
+    idx_Hmax  = int(np.nanargmax(h_norm))
+    cur_Hmax  = float(norm_cur[idx_Hmax])
+
+    # Figure 1: raw µV size
+    fig_rc1 = go.Figure([
+        go.Scatter(x=amps.tolist(), y=m_means.tolist(),
+                   mode='lines+markers', name='M-wave',
+                   line=dict(color='royalblue'), marker=dict(size=6)),
+        go.Scatter(x=amps.tolist(), y=h_means.tolist(),
+                   mode='lines+markers', name='H-wave',
+                   line=dict(color='green'), marker=dict(size=6)),
+    ])
+    fig_rc1.update_layout(
+        title=f'HRS2 Recruitment Curve — {subject_id}',
+        xaxis=dict(title='Stimulation Amplitude (mA)',
+                   showgrid=True, gridcolor='rgba(0,0,0,0.08)'),
+        yaxis=dict(title='Size (µV) [MRA − BG]',
+                   showgrid=True, gridcolor='rgba(0,0,0,0.08)'),
+        legend=dict(x=0.02, y=0.98, xanchor='left', yanchor='top'),
+        plot_bgcolor='white', height=460,
+    )
+
+    # Figure 2: normalized
+    fig_rc2 = go.Figure([
+        go.Scatter(x=norm_cur.tolist(), y=m_norm.tolist(),
+                   mode='lines+markers', name='M-wave (% Mmax)',
+                   line=dict(color='royalblue'), marker=dict(size=6)),
+        go.Scatter(x=norm_cur.tolist(), y=h_norm.tolist(),
+                   mode='lines+markers', name='H-wave (% Mmax)',
+                   line=dict(color='green'), marker=dict(size=6)),
+    ])
+    fig_rc2.update_layout(
+        title=f'HRS2 Normalized Recruitment Curve — {subject_id}',
+        xaxis=dict(title='Current (normalized to current at 50% Mmax)',
+                   showgrid=True, gridcolor='rgba(0,0,0,0.08)'),
+        yaxis=dict(title='H and M wave amplitude (% of Mmax)',
+                   showgrid=True, gridcolor='rgba(0,0,0,0.08)'),
+        shapes=[
+            dict(type='line', xref='paper', yref='y',
+                 x0=0, x1=1, y0=H_max_pct, y1=H_max_pct,
+                 line=dict(color='green', dash='dash', width=1.2)),
+            dict(type='line', xref='x', yref='paper',
+                 x0=cur_Hmax, x1=cur_Hmax, y0=0, y1=1,
+                 line=dict(color='gray', dash='dash', width=1.2)),
+        ],
+        annotations=[
+            dict(x=cur_Hmax + 0.02, y=H_max_pct + 2,
+                 text='b', showarrow=False, font=dict(size=14)),
+            dict(x=norm_cur[idx_Hmax] - 0.08, y=H_max_pct + 2,
+                 text='a', showarrow=False, font=dict(size=14)),
+        ],
+        legend=dict(x=0.02, y=0.98, xanchor='left', yanchor='top'),
+        plot_bgcolor='white', height=460,
+    )
+
+    print(f"M_max = {M_max:.2f} µV")
+    print(f"H_max = {float(np.nanmax(h_means)):.2f} µV  ({H_max_pct:.1f}% of M_max)")
+    print(f"Current at 50% M_max = {cur50:.2f} mA")
+    print(f"Current at H_max = {amps[idx_Hmax]:.2f} mA  ({cur_Hmax:.2f}x normalized)")
+    return fig_rc1, fig_rc2
+
+
+def plot_plotly_hrs1_session(hrs1_trials, hrs1_header):
+    """Three Plotly figures summarising an HRS1 (EMG Characterization) session.
+
+    Returns (fig_gm, fig_hist, fig_waves):
+      fig_gm   — grand-mean scatter over trial number
+      fig_hist — histogram of grand means with Q1/median/Q3 lines
+      fig_waves — overlaid individual trial waveforms (first 6 trials)
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    sr  = hrs1_header.sample_rate
+    gm  = np.array([t.grand_mean for t in hrs1_trials])
+    sid = hrs1_header.subject_id
+
+    # Scatter
+    fig_gm = go.Figure(go.Scatter(
+        x=list(range(len(gm))), y=gm.tolist(),
+        mode='markers', marker=dict(color='blue', size=8),
+        hovertemplate='Trial %{x}<br>Grand Mean: %{y:.2f} µV<extra></extra>',
+    ))
+    fig_gm.update_layout(
+        title=f'HRS1 Session History — {sid}',
+        xaxis_title='Trial Number', yaxis_title='Grand Mean (µV)',
+        height=350, template='plotly_white',
+    )
+
+    # Histogram
+    q25, q50, q75 = (float(v) for v in np.percentile(gm, [25, 50, 75]))
+    fig_hist = go.Figure(go.Histogram(
+        x=gm.tolist(), nbinsx=50,
+        marker=dict(color='steelblue', line=dict(color='black', width=1)),
+        opacity=0.8,
+    ))
+    for val, label, color, dash in [
+        (q25, f'Q1 = {q25:.2f}',     'orange', 'dot'),
+        (q50, f'Median = {q50:.2f}', 'purple', 'dashdot'),
+        (q75, f'Q3 = {q75:.2f}',     'orange', 'dot'),
+    ]:
+        fig_hist.add_vline(x=val, line_color=color, line_dash=dash, line_width=2,
+                           annotation_text=label, annotation_position='top right')
+    fig_hist.update_layout(
+        title=f'HRS1 Grand Means — {sid} (n={len(gm)})',
+        xaxis_title='Grand Mean Amplitude (µV)', yaxis_title='Count',
+        height=400, template='plotly_white',
+    )
+
+    # Trial waveforms (first 6)
+    n_show = min(6, len(hrs1_trials))
+    ncols  = 3
+    nrows  = (n_show + ncols - 1) // ncols
+    fig_waves = make_subplots(
+        rows=nrows, cols=ncols,
+        subplot_titles=[f'Trial {i+1} | GM={hrs1_trials[i].grand_mean:.2f} µV'
+                        for i in range(n_show)],
+    )
+    for i in range(n_show):
+        r, c  = i // ncols + 1, i % ncols + 1
+        trial = hrs1_trials[i]
+        sig   = np.array(trial.monitored_signal)
+        bins  = np.array(trial.bins)
+        t_ms  = np.arange(len(sig)) / sr * 1000.0
+        bin_x = np.arange(len(bins)) * hrs1_header.bin_duration_ms
+        fig_waves.add_trace(go.Scatter(x=t_ms.tolist(), y=sig.tolist(),
+            mode='lines', line=dict(color='black', width=0.8),
+            name='Monitored signal', showlegend=(i == 0),
+            hovertemplate='t=%{x:.1f} ms<br>%{y:.2f} µV<extra></extra>'),
+            row=r, col=c)
+        fig_waves.add_trace(go.Scatter(x=bin_x.tolist(), y=bins.tolist(),
+            mode='lines+markers', line=dict(color='red', width=2),
+            name='Bins', showlegend=(i == 0),
+            hovertemplate='%{x:.0f} ms<br>%{y:.2f} µV<extra></extra>'),
+            row=r, col=c)
+    fig_waves.update_layout(
+        title=f'HRS1 Trial Waveforms — {sid}',
+        height=550, template='plotly_white',
+    )
+
+    print(f"Grand mean range: [{gm.min():.2f}, {gm.max():.2f}] µV  "
+          f"(mean={gm.mean():.2f}, std={gm.std():.2f})")
+    return fig_gm, fig_hist, fig_waves
+
+
+# ── Frequency-test Hz snap helpers ─────────────────────────────────────────────
+
+FT_SNAP_HZ: list = [5.0, 10.0, 15.0, 20.0, 33.0]
+"""Default list of intended pulse-train frequencies (Hz) for the frequency-test stage.
+
+Values within ±25% of a target snap to that target; values outside all targets
+are kept as-is (rounded to the nearest integer ≥ 1 Hz or to 2 dp for sub-Hz).
+Override by passing ``ft_snap_hz=`` to :func:`load_all_recordings`.
+"""
+
+
+def ft_snap_hz(hz: float, snap_list=None) -> float:
+    """Snap *hz* to the nearest entry in *snap_list* (default :data:`FT_SNAP_HZ`).
+
+    Tolerance is ±25 %.  Returns the snapped value, or ``round(hz)`` /
+    ``round(hz, 2)`` if no target is close enough.
+    """
+    if snap_list is None:
+        snap_list = FT_SNAP_HZ
+    if hz <= 0:
+        return 0.0
+    best_target, best_err = None, 0.26
+    for target in snap_list:
+        err = abs(hz - target) / target
+        if err < best_err:
+            best_err, best_target = err, target
+    if best_target is not None:
+        return float(best_target)
+    return float(round(hz)) if hz >= 1.0 else round(hz, 2)
+
+
+def ft_stim_adc_hz(trial, sr: float) -> float:
+    """Estimate pulse-train Hz from ``stim_adc_data`` threshold crossings (Tier 2).
+
+    Returns 0.0 if ``stim_adc_data`` is absent, too short, or has no clear pulses.
+    """
+    import numpy as np
+    adc = getattr(trial, 'stim_adc_data', None)
+    if adc is None or len(adc) < 20:
+        return 0.0
+    adc = np.abs(np.asarray(adc, dtype=float))
+    peak = float(np.max(adc))
+    if peak <= 0:
+        return 0.0
+    threshold = peak * 0.3
+    above = (adc > threshold).astype(np.int8)
+    edges = np.where(np.diff(above) > 0)[0]
+    if len(edges) < 2:
+        return 0.0
+    min_gap = max(1, int(sr / 100))
+    diffs = np.diff(edges)
+    diffs = diffs[diffs >= min_gap]
+    if len(diffs) < 1:
+        return 0.0
+    median_period = float(np.median(diffs))
+    return float(sr) / median_period if median_period > 0 else 0.0
+
+
+def compute_ft_trial_hz(trial, header, sr: float, snap_list=None) -> float:
+    """Return the actual pulse-train Hz for one FT trial (3-tier resolution).
+
+    Tier 1 — ``event_period_us_trial`` field (future H-Reflex App recordings).
+    Tier 2 — ``stim_adc_data`` threshold crossings (:func:`ft_stim_adc_hz`).
+    Tier 3 — Header ``event_period_us`` when valid; otherwise data-length formula.
+
+    All raw Hz estimates are snapped via :func:`ft_snap_hz`.
+    """
+    import numpy as np
+    n_p = len(getattr(trial, 'pulse_h_wave_mra', []))
+    if n_p <= 0:
+        return 0.0
+    sr_use = sr or 10000.0
+
+    period_us_trial = getattr(trial, 'event_period_us_trial', 0) or 0
+    if period_us_trial > 0:
+        return ft_snap_hz(1e6 / period_us_trial, snap_list)
+
+    hz_adc = ft_stim_adc_hz(trial, sr_use)
+    if hz_adc > 0:
+        return ft_snap_hz(hz_adc, snap_list)
+
+    header_period_us = getattr(header, 'event_period_us', 0)
+    if header_period_us > 0:
+        header_period_samp = header_period_us * sr_use / 1e6
+        onset = max(0, getattr(trial, 'onset_sample_index', 0))
+        if onset + (n_p - 1) * header_period_samp <= len(trial.trial_data) * 1.05:
+            return ft_snap_hz(1e6 / header_period_us, snap_list)
+    tot   = len(getattr(trial, 'trial_data', []))
+    onset = max(0, getattr(trial, 'onset_sample_index', 0))
+    if tot <= onset:
+        return 0.0
+    period_samp = (tot - onset) / n_p
+    hz = sr_use / period_samp if period_samp > 0 else 0.0
+    return ft_snap_hz(hz, snap_list)
+
+
+def load_all_recordings(recording_dirs, ft_snap_hz_list=None, verbose: bool = True) -> dict:
+    """Load all recordings from *recording_dirs* and return a dict keyed by label.
+
+    Parameters
+    ----------
+    recording_dirs:
+        List of ``(label, dir_path, sample_rate_hz)`` tuples — the same format
+        as ``RECORDING_DIRS`` in the notebooks.  *sample_rate_hz* may be ``None``
+        to auto-detect from the file header.
+    ft_snap_hz_list:
+        Target Hz values for frequency-test snapping.  ``None`` → :data:`FT_SNAP_HZ`.
+    verbose:
+        If ``True`` (default) print a progress line for each recording.
+
+    Returns
+    -------
+    dict
+        Maps ``label`` →
+        ``{stage_map, sample_rate, hrs1_header, ft_trials, ft_header,
+        ft_files, ft_trial_hz, app_version}``.
+    """
+    snap_list = ft_snap_hz_list or FT_SNAP_HZ
+    all_recordings = {}
+
+    for (_rlabel, _rdir, _rsr) in recording_dirs:
+        if verbose:
+            print(f'\n── Loading: {_rlabel!r}  ({_rdir})')
+        _rp1, _rp2, _rp3, _rp4, _rp5, _rp6, _rpft = find_hrs_files(_rdir)
+        _rav = detect_app_version(_rdir)
+
+        _r_cm_h  = _r_cm_t  = _r_cm_e  = None
+        _r_dcp_h = _r_dcp_t = _r_dcp_e = None
+        _r_s4_h  = _r_s4_t  = _r_s4_e  = None
+        _r_s5_h  = _r_s5_t  = _r_s5_e  = None
+        _r_s6_h  = _r_s6_t  = _r_s6_e  = None
+        _r_ft_h  = _r_ft_t  = _r_ft_e  = None
+        _r_ft_files = {}
+        _r_h2h   = _r_h1h   = None
+        _r_h2t   = _r_h2e   = []
+
+        if _rp1:
+            _r_h2h, _r_h2t, _r_h2e = read_hrs2(_rp1)
+            _r_h1h = _r_h2h
+            if verbose:
+                print(f'   .hrs1: {len(_r_h2t)} trials  (MH Recruitment)')
+        elif verbose:
+            print('   .hrs1: not found')
+        if _rp2:
+            _r_cm_h, _r_cm_t, _r_cm_e = read_hrs2(_rp2)
+            if verbose:
+                print(f'   .hrs2: {len(_r_cm_t)} trials  (Control Mode)')
+        elif verbose:
+            print('   .hrs2: not found')
+        if _rp3:
+            _r_dcp_h, _r_dcp_t, _r_dcp_e = read_hrs3(_rp3)
+            if verbose:
+                print(f'   .hrs3: {len(_r_dcp_t)} trials  (Down Condition Pellet)')
+        if _rav >= 3:
+            if _rp4:
+                _r_s4_h, _r_s4_t, _r_s4_e = read_hrs4(_rp4)
+                if verbose:
+                    print(f'   .hrs4: {len(_r_s4_t)} trials  (Up Condition Pellet)')
+            if _rp5:
+                _r_s5_h, _r_s5_t, _r_s5_e = read_hrs5(_rp5)
+                if verbose:
+                    print(f'   .hrs5: {len(_r_s5_t)} trials  (Down Condition VNS)')
+            if _rp6:
+                _r_s6_h, _r_s6_t, _r_s6_e = read_hrs6(_rp6)
+                if verbose:
+                    print(f'   .hrs6: {len(_r_s6_t)} trials  (Up Condition VNS)')
+            _all_hrft_paths = find_all_hrs_ft_files(_rdir)
+            for _fpath in _all_hrft_paths:
+                _fh, _ft, _fe = read_hrs_ft(_fpath)
+                if _ft and getattr(_fh, 'event_period_us', 0) is not None:
+                    _r_ft_files[id(_fh)] = (_fh, _ft)
+            if _r_ft_files:
+                _r_ft_h, _r_ft_t = next(iter(_r_ft_files.values()))
+                _n_total = sum(len(v[1]) for v in _r_ft_files.values())
+                if verbose:
+                    print(f'   .hrft: {_n_total} trials across {len(_r_ft_files)} file(s)')
+
+        if not _r_h2t and _r_cm_t:
+            _r_h2h = _r_cm_h; _r_h2t = _r_cm_t; _r_h2e = _r_cm_e; _r_h1h = _r_h2h
+            if verbose:
+                print('   Note: Control Mode aliased as primary analysis (no MH Recruitment stage).')
+
+        _r_detect_sr = _rsr
+        if _r_detect_sr is None:
+            _r_detect_sr = (getattr(_r_h1h, 'sample_rate', None) or
+                            getattr(_r_ft_h, 'sample_rate', None) or
+                            5000.0)
+
+        if _r_h1h is None:
+            _r_sr_val = _r_detect_sr
+            class _SampleRateStub:
+                sample_rate = _r_sr_val
+            _r_h1h = _SampleRateStub()
+
+        _r_ft_hz = [compute_ft_trial_hz(tr, _r_ft_h, _r_detect_sr, snap_list)
+                    for tr in (_r_ft_t or [])]
+        if _r_ft_hz and verbose:
+            _hz_uniq = sorted(set(_r_ft_hz))
+            print(f'   .hrft Hz values (snapped): {_hz_uniq}')
+
+        _r_sm = {}
+        if _r_h2t and (not _r_cm_t or _r_h2t is not _r_cm_t):
+            _r_sm['mh_recruitment'] = (_r_h2t, _r_h2h, _r_h2e, 'MH Recruitment Curve (.hrs1)')
+        if _r_cm_t:
+            _r_sm['control_mode']   = (_r_cm_t,  _r_cm_h,  _r_cm_e,  'Control Mode (.hrs2)')
+        if _r_dcp_t:
+            _r_sm['dcp']            = (_r_dcp_t, _r_dcp_h, _r_dcp_e, 'Down Condition Pellet (.hrs3)')
+        if _r_s4_t:
+            _r_sm['up_cond_pellet'] = (_r_s4_t,  _r_s4_h,  _r_s4_e,  'Up Condition Pellet (.hrs4)')
+        if _r_s5_t:
+            _r_sm['down_cond_vns']  = (_r_s5_t,  _r_s5_h,  _r_s5_e,  'Down Condition VNS (.hrs5)')
+        if _r_s6_t:
+            _r_sm['up_cond_vns']    = (_r_s6_t,  _r_s6_h,  _r_s6_e,  'Up Condition VNS (.hrs6)')
+        if _r_ft_files:
+            _all_ft_t = [tr for (_fh, _ft) in _r_ft_files.values() for tr in _ft]
+            if _all_ft_t:
+                _r_sm['frequency_test'] = (_all_ft_t, _r_ft_h, [], 'Frequency Test (.hrft)')
+
+        all_recordings[_rlabel] = {
+            'stage_map':    _r_sm,
+            'sample_rate':  _r_detect_sr,
+            'hrs1_header':  _r_h1h,
+            'ft_trials':    _r_ft_t,
+            'ft_header':    _r_ft_h,
+            'ft_files':     _r_ft_files,
+            'ft_trial_hz':  _r_ft_hz,
+            'app_version':  _rav,
+        }
+        if verbose:
+            print(f'   App V{_rav}  |  Stages: {list(_r_sm.keys())}  |  SR: {_r_detect_sr} Hz')
+
+    return all_recordings
+
+
+def make_ft_viewer(all_recordings: dict,
+                   post_plot_ms: float = 15.0,
+                   m_start_ms: float = 2.0,
+                   m_end_ms:   float = 4.5,
+                   h_start_ms: float = 5.0,
+                   h_end_ms:   float = 9.0):
+    """Create and return the interactive Frequency Test viewer widget.
+
+    Displays pulse-train waveforms for all ``.hrsft`` recordings in
+    *all_recordings*.  Returns a widget ready to be passed to
+    ``IPython.display.display()``.  If no FT data is found a plain label is
+    returned instead.
+
+    Parameters
+    ----------
+    all_recordings:
+        Dict returned by :func:`load_all_recordings`.
+    post_plot_ms:
+        Initial post-pulse window (ms) shown in the waveform plot.
+    m_start_ms, m_end_ms:
+        M-wave integration window (ms relative to each pulse onset).
+    h_start_ms, h_end_ms:
+        H-wave integration window (ms relative to each pulse onset).
+    """
+    import copy as _copy
+    from ipywidgets import (Dropdown, ToggleButtons, Button, Checkbox, FloatText,
+                            Output, HBox, VBox, Label)
+
+    _ft_recs = [rl for rl in all_recordings
+                if all_recordings[rl].get('ft_trials') or all_recordings[rl].get('ft_files')]
+    if not _ft_recs:
+        return Label("No Frequency Test data loaded (.hrft not found in any recording directory).")
+
+    # ── State ──────────────────────────────────────────────────────────────────
+    _ft_st = {
+        'idx':           0,
+        'zoom_pulse':    None,
+        'updating':      False,
+        'freq_filter':   None,
+        'rec_list':      list(_ft_recs),
+        'amp_filter':    None,
+        'filtered':      [],
+        'style':         'gradient',
+        'show_legend':   True,
+        'legend_style':  'colorbar',
+        'y_auto':        True,
+        'y_min':        -500.0,
+        'y_max':         500.0,
+        'fig_w':          11.0,
+        'fig_h':           5.0,
+        'pre_ms':          2.0,
+        'post_ms':   float(post_plot_ms),
+        'simplified':    False,
+        'compare_pulse': 2,      # 0-based; default = 3rd pulse
+        'show_sync':     False,
+    }
+
+    # ── Widgets ────────────────────────────────────────────────────────────────
+    _ft_rec_d = Dropdown(
+        options=_ft_recs, value=_ft_recs[0],
+        description='Recording:', layout={'width': '620px'}
+    )
+    _ft_prev_btn   = Button(description='Prev', button_style='')
+    _ft_next_btn   = Button(description='Next', button_style='primary')
+    _ft_trial_drop = Dropdown(options=[('Trial 1', 0)], value=0,
+                              description='Trial:', layout={'width': '145px'})
+    _ft_amp_drop   = Dropdown(options=[('All', None)], value=None,
+                              description='Amp:', layout={'width': '180px'})
+    _ft_freq_drop  = Dropdown(options=[('All Hz', None)], value=None,
+                              description='Freq:', layout={'width': '160px'})
+    _ft_style_tb = ToggleButtons(
+        options=[('Gradient', 'gradient'), ('Bold Ends', 'bold_ends'), ('Distinct', 'distinct')],
+        value='gradient', description='Style:', style={'button_width': '110px'}
+    )
+    _ft_legend_chk   = Checkbox(value=True, description='Show Legend', indent=False)
+    _ft_legend_style = ToggleButtons(
+        options=[('Colorbar', 'colorbar'), ('Labeled', 'labeled')],
+        value='colorbar', description='', style={'button_width': '100px'}
+    )
+    _ft_pulse_drop = Dropdown(options=[('All', None)], value=None,
+                               description='Pulse:', layout={'width': '160px'})
+    _ft_back_btn   = Button(description='Back to All', button_style='info', disabled=True)
+    _ft_yauto_chk  = Checkbox(value=True, description='Auto Y', indent=False)
+    _ft_ymin_txt   = FloatText(value=-500.0, description='Y min:', step=50,
+                               layout={'width': '165px'}, disabled=True)
+    _ft_ymax_txt   = FloatText(value=500.0,  description='Y max:', step=50,
+                               layout={'width': '165px'}, disabled=True)
+    _ft_figw_txt   = FloatText(value=11.0, description='Fig W:', step=0.5,
+                               layout={'width': '145px'})
+    _ft_figh_txt   = FloatText(value=5.0,  description='Fig H:', step=0.5,
+                               layout={'width': '145px'})
+    _ft_prems_txt  = FloatText(value=2.0,               description='Pre ms:',
+                               step=0.5, layout={'width': '148px'})
+    _ft_postms_txt = FloatText(value=float(post_plot_ms), description='Post ms:',
+                               step=1.0, layout={'width': '158px'})
+    _ft_simplified_chk  = Checkbox(value=False, description='Simplified View', indent=False)
+    _ft_compare_txt     = Dropdown(
+        options=[], value=None,
+        description='Compare pulse:', layout={'width': '210px'},
+        disabled=True,
+    )
+    _ft_show_sync_chk   = Checkbox(value=False, description='Show Sync', indent=False)
+    _ft_wave_out = Output()
+    _ft_mra_out  = Output()
+    _ft_peak_out = Output()
+
+    # ── Context helpers ────────────────────────────────────────────────────────
+    def _ft_get_ctx():
+        rl      = _ft_rec_d.value
+        rec     = all_recordings[rl]
+        ft_t    = rec.get('ft_trials', []) or []
+        ft_h    = rec.get('ft_header')
+        hz_list = rec.get('ft_trial_hz', [])
+        hz_map  = {id(t): hz for t, hz in zip(ft_t, hz_list)}
+        sr      = rec.get('sample_rate') or getattr(ft_h, 'sample_rate', None)
+        return ft_t, ft_h, sr, hz_map
+
+    def _ft_lookup_hz(trial, ft_h, sr, hz_map):
+        h = hz_map.get(id(trial))
+        if h is not None:
+            return h
+        return compute_ft_trial_hz(trial, ft_h, sr)
+
+    def _ft_corrected_header(trial, ft_h, sr):
+        n_p = len(getattr(trial, 'pulse_h_wave_mra', []))
+        if n_p <= 1:
+            return ft_h
+        header_period_us = getattr(ft_h, 'event_period_us', 0) or 0
+        sr_use = sr or 10000.0
+        if header_period_us > 0:
+            period_samp = header_period_us * sr_use / 1e6
+            onset = max(0, getattr(trial, 'onset_sample_index', 0))
+            if onset + (n_p - 1) * period_samp <= len(trial.trial_data) * 1.05:
+                return ft_h
+        tot   = len(getattr(trial, 'trial_data', []))
+        onset = max(0, getattr(trial, 'onset_sample_index', 0))
+        if tot <= onset:
+            return ft_h
+        period_samp    = (tot - onset) / n_p
+        hz_raw         = sr_use / period_samp if period_samp > 0 else 0.0
+        hz_snapped     = ft_snap_hz(hz_raw)
+        period_snapped = sr_use / hz_snapped if hz_snapped > 0 else period_samp
+        corrected_us   = max(1, int(period_snapped / sr_use * 1e6))
+        ft_h_copy = _copy.copy(ft_h)
+        ft_h_copy.event_period_us = corrected_us
+        return ft_h_copy
+
+    def _ft_compute_freqs(rl):
+        hz_list = all_recordings[rl].get('ft_trial_hz', [])
+        if hz_list:
+            return set(hz_list)
+        ft_h = all_recordings[rl].get('ft_header')
+        if ft_h and getattr(ft_h, 'event_period_us', 0):
+            return {ft_snap_hz(1e6 / ft_h.event_period_us)}
+        return set()
+
+    def _ft_rebuild_rec_list():
+        ff = _ft_st['freq_filter']
+        if ff is None:
+            _ft_st['rec_list'] = list(_ft_recs)
+        else:
+            matched = [rl for rl in _ft_recs if ff in _ft_compute_freqs(rl)]
+            _ft_st['rec_list'] = matched if matched else list(_ft_recs)
+
+    def _ft_rebuild_filtered():
+        ft_t, ft_h, sr, hz_map = _ft_get_ctx()
+        af = _ft_st['amp_filter']
+        ff = _ft_st['freq_filter']
+        filt = []
+        for t in ft_t:
+            if af is not None:
+                amp = getattr(t, 'stimulation_amplitude_ma', 0.0)
+                if abs(amp - af) >= 0.0015:
+                    continue
+            if ff is not None:
+                trial_hz = hz_map.get(id(t), compute_ft_trial_hz(t, ft_h, sr))
+                if trial_hz != ff:
+                    continue
+            filt.append(t)
+        _ft_st['filtered'] = filt if filt else list(ft_t)
+
+    # ── Render ─────────────────────────────────────────────────────────────────
+    def _ft_render_wave():
+        if not _ft_st['filtered']:
+            return
+        ft_t, ft_h, sr, hz_map = _ft_get_ctx()
+        if ft_h is None:
+            return
+        idx      = max(0, min(_ft_st['idx'], len(_ft_st['filtered']) - 1))
+        trial    = _ft_st['filtered'][idx]
+        n_tot    = len(_ft_st['filtered'])
+        hz       = _ft_lookup_hz(trial, ft_h, sr, hz_map)
+        n_p      = getattr(ft_h, 'n_pulses_per_train', 0) or \
+                   max((len(getattr(t, 'pulse_h_wave_mra', [])) for t in ft_t), default=1)
+        ft_h_use = _ft_corrected_header(trial, ft_h, sr)
+        with _ft_wave_out:
+            _ft_wave_out.clear_output(wait=True)
+            amp_info = (f'{_ft_st["amp_filter"]:.3f} mA'
+                        if _ft_st['amp_filter'] is not None else 'All amps')
+            print(f'Frequency Test  |  {hz} Hz  |  {n_p} pulses/train  |  {amp_info}'
+                  f'  |  Trial {idx + 1} of {n_tot}  [{_ft_rec_d.value}]')
+            plot_ft_averaged_waveforms(
+                trial, ft_h_use,
+                pre_pulse_ms=_ft_st['pre_ms'],
+                post_pulse_ms=_ft_st['post_ms'],
+                m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+                h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+                sample_rate=sr,
+                zoom_pulse=_ft_st['zoom_pulse'],
+                style=_ft_st['style'],
+                show_legend=_ft_st['show_legend'],
+                legend_style=_ft_st['legend_style'],
+                y_min=None if _ft_st['y_auto'] else _ft_st['y_min'],
+                y_max=None if _ft_st['y_auto'] else _ft_st['y_max'],
+                fig_w=_ft_st['fig_w'],
+                fig_h=_ft_st['fig_h'],
+                simplified=_ft_st['simplified'],
+                compare_pulse=_ft_st['compare_pulse'],
+                show_sync=_ft_st['show_sync'],
+            )
+
+    def _ft_render_curves():
+        if not _ft_st['filtered']:
+            return
+        ft_t, ft_h, sr, hz_map = _ft_get_ctx()
+        if ft_h is None:
+            return
+        idx      = max(0, min(_ft_st['idx'], len(_ft_st['filtered']) - 1))
+        trial    = _ft_st['filtered'][idx]
+        ft_h_use = _ft_corrected_header(trial, ft_h, sr)
+        with _ft_mra_out:
+            _ft_mra_out.clear_output(wait=True)
+            plot_ft_depression_curve(trial, ft_h_use, sample_rate=sr)
+        with _ft_peak_out:
+            _ft_peak_out.clear_output(wait=True)
+            plot_ft_peak_curve(
+                trial, ft_h_use, sample_rate=sr,
+                m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+                h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+            )
+
+    def _ft_render_all():
+        _ft_render_wave()
+        _ft_render_curves()
+
+    # ── Nav helpers ────────────────────────────────────────────────────────────
+    def _ft_update_trial_drop():
+        n = max(1, len(_ft_st['filtered']))
+        _ft_st['idx'] = min(_ft_st['idx'], n - 1)
+        _ft_st['updating'] = True
+        _ft_trial_drop.options = [(f'Trial {i + 1}', i) for i in range(n)]
+        _ft_trial_drop.value   = _ft_st['idx']
+        _ft_st['updating'] = False
+
+    def _ft_update_amp_drop():
+        ft_t, _, _, _ = _ft_get_ctx()
+        amps = sorted({float(getattr(t, 'stimulation_amplitude_ma', 0.0)) for t in ft_t})
+        _ft_st['updating'] = True
+        _ft_amp_drop.options = [('All', None)] + [(f'{a:.3f} mA', a) for a in amps]
+        _ft_amp_drop.value   = _ft_st['amp_filter']
+        _ft_st['updating'] = False
+
+    def _ft_update_freq_drop():
+        freqs = sorted({hz for rl in _ft_recs for hz in _ft_compute_freqs(rl)})
+        _ft_st['updating'] = True
+        _ft_freq_drop.options = [('All Hz', None)] + [(f'{f} Hz', f) for f in freqs]
+        _ft_freq_drop.value   = _ft_st['freq_filter']
+        _ft_st['updating'] = False
+
+    def _ft_update_rec_drop():
+        opts = _ft_st['rec_list'] if _ft_st['rec_list'] else list(_ft_recs)
+        _ft_st['updating'] = True
+        _ft_rec_d.options = opts
+        if _ft_rec_d.value not in opts:
+            _ft_rec_d.value = opts[0]
+        _ft_st['updating'] = False
+
+    def _ft_update_pulse_drop():
+        ft_t, ft_h, _, _ = _ft_get_ctx()
+        n_p = getattr(ft_h, 'n_pulses_per_train', 0) if ft_h else 0
+        if n_p == 0:
+            n_p = max((len(getattr(t, 'pulse_h_wave_mra', [])) for t in ft_t), default=1)
+        _ft_st['updating'] = True
+        _ft_pulse_drop.options = [('All', None)] + [(f'Pulse {k + 1}', k) for k in range(n_p)]
+        _ft_pulse_drop.value   = None
+        # Compare-pulse dropdown: pulses 2..n (skip pulse 1 since it's always shown)
+        comp_opts = [(f'Pulse {k + 1}', k) for k in range(1, n_p)]
+        _ft_compare_txt.options = comp_opts
+        cur = _ft_st['compare_pulse']
+        _ft_compare_txt.value = cur if any(v == cur for _, v in comp_opts) else (comp_opts[1][1] if len(comp_opts) > 1 else comp_opts[0][1])
+        _ft_st['updating'] = False
+
+    def _ft_init_controls():
+        _ft_st['idx']        = 0
+        _ft_st['zoom_pulse'] = None
+        _ft_rebuild_filtered()
+        _ft_update_trial_drop()
+        _ft_update_amp_drop()
+        _ft_update_pulse_drop()
+        _ft_back_btn.disabled = True
+
+    # ── Observers ──────────────────────────────────────────────────────────────
+    def _ft_on_freq(c):
+        if _ft_st['updating']:
+            return
+        _ft_st['freq_filter'] = c['new']
+        _ft_st['amp_filter']  = None
+        _ft_st['idx']         = 0
+        _ft_rebuild_rec_list()
+        _ft_update_rec_drop()
+        _ft_init_controls()
+        _ft_render_all()
+
+    def _ft_on_rec(c):
+        if _ft_st['updating']:
+            return
+        _ft_st['amp_filter'] = None
+        _ft_init_controls()
+        _ft_render_all()
+
+    def _ft_on_prev(b):
+        if _ft_st['idx'] > 0:
+            _ft_st['idx'] -= 1
+            _ft_st['updating'] = True
+            _ft_trial_drop.value = _ft_st['idx']
+            _ft_st['updating'] = False
+            _ft_render_all()
+
+    def _ft_on_next(b):
+        if _ft_st['idx'] < len(_ft_st['filtered']) - 1:
+            _ft_st['idx'] += 1
+            _ft_st['updating'] = True
+            _ft_trial_drop.value = _ft_st['idx']
+            _ft_st['updating'] = False
+            _ft_render_all()
+
+    def _ft_on_trial(c):
+        if _ft_st['updating']:
+            return
+        _ft_st['idx'] = c['new']
+        _ft_render_all()
+
+    def _ft_on_amp(c):
+        if _ft_st['updating']:
+            return
+        _ft_st['amp_filter'] = c['new']
+        _ft_st['idx'] = 0
+        _ft_rebuild_filtered()
+        _ft_update_trial_drop()
+        _ft_render_all()
+
+    def _ft_on_style(c):
+        _ft_st['style'] = c['new']
+        if c['new'] == 'distinct' and _ft_st['legend_style'] == 'colorbar':
+            _ft_st['legend_style'] = 'labeled'
+            _ft_st['updating'] = True
+            _ft_legend_style.value = 'labeled'
+            _ft_st['updating'] = False
+        _ft_render_wave()
+
+    def _ft_on_legend_chk(c):
+        _ft_st['show_legend'] = c['new']
+        _ft_legend_style.disabled = not c['new']
+        _ft_render_wave()
+
+    def _ft_on_legend_style(c):
+        if _ft_st['updating']:
+            return
+        _ft_st['legend_style'] = c['new']
+        _ft_render_wave()
+
+    def _ft_on_pulse(c):
+        if _ft_st['updating']:
+            return
+        _ft_st['zoom_pulse'] = c['new']
+        _ft_back_btn.disabled = (c['new'] is None)
+        _ft_render_wave()
+
+    def _ft_on_back(b):
+        _ft_st['zoom_pulse'] = None
+        _ft_st['updating'] = True
+        _ft_pulse_drop.value = None
+        _ft_st['updating'] = False
+        _ft_back_btn.disabled = True
+        _ft_render_wave()
+
+    def _ft_on_yauto(c):
+        _ft_st['y_auto'] = c['new']
+        _ft_ymin_txt.disabled = c['new']
+        _ft_ymax_txt.disabled = c['new']
+        _ft_render_wave()
+
+    def _ft_on_ymin(c):
+        _ft_st['y_min'] = c['new']
+        if not _ft_st['y_auto']:
+            _ft_render_wave()
+
+    def _ft_on_ymax(c):
+        _ft_st['y_max'] = c['new']
+        if not _ft_st['y_auto']:
+            _ft_render_wave()
+
+    def _ft_on_figw(c):
+        _ft_st['fig_w'] = c['new']
+        _ft_render_wave()
+
+    def _ft_on_figh(c):
+        _ft_st['fig_h'] = c['new']
+        _ft_render_wave()
+
+    def _ft_on_prems(c):
+        _ft_st['pre_ms'] = c['new']
+        _ft_render_wave()
+
+    def _ft_on_postms(c):
+        _ft_st['post_ms'] = c['new']
+        _ft_render_wave()
+
+    def _ft_on_simplified(c):
+        if _ft_st['updating']:
+            return
+        _ft_st['simplified'] = c['new']
+        # Disable style/zoom controls that don't apply in simplified mode
+        _ft_style_tb.disabled      = c['new']
+        _ft_legend_style.disabled  = c['new']
+        _ft_pulse_drop.disabled    = c['new']
+        _ft_back_btn.disabled      = c['new'] or True
+        _ft_compare_txt.disabled   = not c['new']
+        _ft_render_wave()
+
+    def _ft_on_compare(c):
+        if _ft_st['updating']:
+            return
+        _ft_st['compare_pulse'] = c['new']
+        _ft_render_wave()
+
+    def _ft_on_show_sync(c):
+        _ft_st['show_sync'] = c['new']
+        _ft_render_wave()
+
+    _ft_freq_drop.observe(_ft_on_freq,              names='value')
+    _ft_rec_d.observe(_ft_on_rec,                   names='value')
+    _ft_prev_btn.on_click(_ft_on_prev)
+    _ft_next_btn.on_click(_ft_on_next)
+    _ft_trial_drop.observe(_ft_on_trial,            names='value')
+    _ft_amp_drop.observe(_ft_on_amp,                names='value')
+    _ft_style_tb.observe(_ft_on_style,              names='value')
+    _ft_legend_chk.observe(_ft_on_legend_chk,       names='value')
+    _ft_legend_style.observe(_ft_on_legend_style,   names='value')
+    _ft_pulse_drop.observe(_ft_on_pulse,            names='value')
+    _ft_back_btn.on_click(_ft_on_back)
+    _ft_yauto_chk.observe(_ft_on_yauto,             names='value')
+    _ft_ymin_txt.observe(_ft_on_ymin,               names='value')
+    _ft_ymax_txt.observe(_ft_on_ymax,               names='value')
+    _ft_figw_txt.observe(_ft_on_figw,               names='value')
+    _ft_figh_txt.observe(_ft_on_figh,               names='value')
+    _ft_prems_txt.observe(_ft_on_prems,             names='value')
+    _ft_postms_txt.observe(_ft_on_postms,           names='value')
+    _ft_simplified_chk.observe(_ft_on_simplified,  names='value')
+    _ft_compare_txt.observe(_ft_on_compare,         names='value')
+    _ft_show_sync_chk.observe(_ft_on_show_sync,     names='value')
+
+    _ft_update_freq_drop()
+    _ft_init_controls()
+    _ft_render_all()
+
+    return VBox([
+        _ft_rec_d,
+        HBox([_ft_prev_btn, _ft_next_btn, _ft_trial_drop, _ft_amp_drop, _ft_freq_drop]),
+        HBox([_ft_style_tb, _ft_legend_chk, _ft_legend_style]),
+        HBox([_ft_pulse_drop, _ft_back_btn]),
+        HBox([_ft_yauto_chk, _ft_ymin_txt, _ft_ymax_txt,
+              _ft_figw_txt, _ft_figh_txt, _ft_prems_txt, _ft_postms_txt]),
+        HBox([_ft_simplified_chk, _ft_compare_txt, _ft_show_sync_chk]),
+        _ft_wave_out,
+        _ft_mra_out,
+        _ft_peak_out,
+    ])
+
+
+# ====================================================================
+# HRS BINARY WRITER PRIMITIVES AND WRITE FUNCTIONS
+# ====================================================================
+
+def hrs_write_val(fid: BinaryIO, value, dtype: str) -> None:
+    """Write a single scalar value (little-endian). Mirror of hrs_read_val."""
+    fid.write(struct.pack('<' + _HRS_TYPE_FMT[dtype], value))
+
+
+def hrs_write_string(fid: BinaryIO, s: str) -> None:
+    """Write a length-prefixed UTF-8 string. Mirror of hrs_read_string."""
+    encoded = (s or '').encode('utf-8')
+    hrs_write_val(fid, len(encoded), 'int32')
+    fid.write(encoded)
+
+
+def hrs_write_datetime(fid: BinaryIO, dt) -> None:
+    """Write a datetime as uint64 Unix milliseconds (new format). Mirror of hrs_read_datetime.
+
+    Always writes in the new format (uint64 Unix ms).  When re-read by hrs_read_datetime,
+    the uint64 bytes interpreted as float64 are < 1.0 (denormalised), so the reader
+    correctly takes the uint64 / 1000 branch.
+    """
+    if dt is None:
+        fid.write(struct.pack('<Q', 0))
+    else:
+        unix_ms = int(dt.timestamp() * 1000)
+        fid.write(struct.pack('<Q', unix_ms))
+
+
+def hrs_write_array(fid: BinaryIO, array, dtype: str) -> None:
+    """Write count (int32) then array data. Mirror of hrs_read_array."""
+    if array is None:
+        hrs_write_val(fid, 0, 'int32')
+        return
+    arr = np.asarray(array)
+    n = int(len(arr))
+    hrs_write_val(fid, n, 'int32')
+    if n > 0:
+        fid.write(struct.pack(f'<{n}{_HRS_TYPE_FMT[dtype]}', *arr.tolist()))
+
+
+def _write_emg_block(fid: BinaryIO, emg_block: EmgDataBlock) -> None:
+    """Write one EMG data block. Mirror of _read_emg_data_block."""
+    hrs_write_val(fid, emg_block.ts_open_ephys_sent,    'uint64')
+    hrs_write_val(fid, emg_block.ts_python_received,    'uint64')
+    hrs_write_val(fid, emg_block.ts_background_emitted, 'uint64')
+    hrs_write_val(fid, len(emg_block.channel_names),    'uint8')
+    for name in emg_block.channel_names:
+        hrs_write_string(fid, name)
+    hrs_write_val(fid, len(emg_block.raw_channels),     'uint8')
+    for ch in emg_block.raw_channels:
+        hrs_write_array(fid, ch,                        'float32')
+    hrs_write_array(fid, emg_block.diff,                'float32')
+    hrs_write_array(fid, emg_block.filtered,            'float32')
+    hrs_write_array(fid, emg_block.abs_val,             'float32')
+
+
+def _write_mh_header_block(fid: BinaryIO, header: MhRecHeader,
+                            file_version: int) -> None:
+    """Write MhRecHeader fields. Mirror of the header-reading section of read_hrs2."""
+    hrs_write_val(fid,    file_version,                'int32')
+    hrs_write_string(fid, header.subject_id)
+    hrs_write_datetime(fid, header.session_start_time)
+    hrs_write_string(fid, header.stage_name)
+    hrs_write_string(fid, header.stage_description)
+    hrs_write_val(fid,    header.stage_type,           'int32')
+    if file_version >= 8:
+        hrs_write_string(fid, header.app_version)
+
+
+def _write_mh_trial_block(fid: BinaryIO, trial: MhRecTrial,
+                           file_version: int, block_id: int) -> None:
+    """Write one version-gated MhRecTrial block. Mirror of _read_mh_trial_block."""
+    hrs_write_datetime(fid, trial.start_time)
+    hrs_write_val(fid, trial.min_initiation_threshold,           'float32')
+    hrs_write_val(fid, trial.max_initiation_threshold,           'float32')
+    hrs_write_val(fid, trial.stimulation_amplitude_ma,           'float32')
+    hrs_write_array(fid, trial.trial_data,                       'float32')
+    if file_version >= 1:
+        hrs_write_array(fid, trial.sync_data,                    'float32')
+    if file_version >= 2:
+        hrs_write_val(fid, trial.trigger_wall_time_ms,               'uint64')
+        hrs_write_val(fid, trial.onset_sample_index,                 'int32')
+        hrs_write_val(fid, trial.onset_detected,                     'int8')
+        hrs_write_val(fid, trial.stim_end_sample_index,              'int32')
+        hrs_write_val(fid, trial.stim_duration_samples,              'int32')
+        hrs_write_val(fid, trial.stim_duration_ms,                   'float32')
+        hrs_write_val(fid, trial.sync_peak_voltage,                  'float32')
+        hrs_write_val(fid, trial.n_pre_trigger_frames_discarded,     'int32')
+        hrs_write_array(fid, trial.frame_received_timestamps_ms,     'uint64')
+        hrs_write_val(fid, trial.first_post_trigger_frame_sample_id, 'uint64')
+    if file_version >= 3:
+        hrs_write_array(fid, trial.unipolar_trial_data,              'float32')
+    if file_version >= 4:
+        hrs_write_array(fid, trial.stim_adc_data,                    'float32')
+    if file_version >= 5:
+        hrs_write_val(fid, trial.background_emg_mean,                'float32')
+        if file_version >= 6:
+            hrs_write_array(fid, trial.background_bins,              'float32')
+        elif len(trial.background_bins) > 0:
+            # file_version == 5: only write bins if non-empty (mirrors reader peek heuristic:
+            # a valid block_id is <= 4, so a count > 4 signals a background_bins array).
+            hrs_write_array(fid, trial.background_bins,              'float32')
+    if file_version >= 6:
+        hrs_write_val(fid, trial.stim_polarity_reversed,             'int8')
+    if file_version >= 7:
+        hrs_write_val(fid, trial.digital_onset_sample_num,           'int64')
+        hrs_write_val(fid, trial.digital_onset_channel,              'int32')
+    if block_id == BLOCK_CONTROL_MODE_TRIAL and file_version >= 9:
+        hrs_write_val(fid, trial.h_wave_response,                    'float32')
+        hrs_write_val(fid, trial.m_wave_response,                    'float32')
+        hrs_write_val(fid, trial.hm_ratio,                           'float32')
+        hrs_write_val(fid, trial.m_wave_window_median,               'float32')
+        hrs_write_val(fid, trial.m_wave_set_value_uv,                'float32')
+        hrs_write_val(fid, trial.m_wave_error,                       'float32')
+        hrs_write_val(fid, trial.m_wave_adjust_step_ma,              'float32')
+        hrs_write_val(fid, trial.m_wave_min_intensity_ma,            'float32')
+        hrs_write_val(fid, trial.m_wave_max_intensity_ma,            'float32')
+
+
+def _write_mh_trial_block_full(fid: BinaryIO, trial: MhRecTrial) -> None:
+    """Write all MhRecTrial base fields unconditionally (V3 new stages).
+    Mirror of _read_mh_trial_block_full."""
+    hrs_write_datetime(fid, trial.start_time)
+    hrs_write_val(fid, trial.min_initiation_threshold,           'float32')
+    hrs_write_val(fid, trial.max_initiation_threshold,           'float32')
+    hrs_write_val(fid, trial.stimulation_amplitude_ma,           'float32')
+    hrs_write_array(fid, trial.trial_data,                       'float32')
+    hrs_write_array(fid, trial.sync_data,                        'float32')
+    hrs_write_val(fid, trial.trigger_wall_time_ms,               'uint64')
+    hrs_write_val(fid, trial.onset_sample_index,                 'int32')
+    hrs_write_val(fid, trial.onset_detected,                     'int8')
+    hrs_write_val(fid, trial.stim_end_sample_index,              'int32')
+    hrs_write_val(fid, trial.stim_duration_samples,              'int32')
+    hrs_write_val(fid, trial.stim_duration_ms,                   'float32')
+    hrs_write_val(fid, trial.sync_peak_voltage,                  'float32')
+    hrs_write_val(fid, trial.n_pre_trigger_frames_discarded,     'int32')
+    hrs_write_array(fid, trial.frame_received_timestamps_ms,     'uint64')
+    hrs_write_val(fid, trial.first_post_trigger_frame_sample_id, 'uint64')
+    hrs_write_array(fid, trial.unipolar_trial_data,              'float32')
+    hrs_write_array(fid, trial.stim_adc_data,                    'float32')
+    hrs_write_val(fid, trial.background_emg_mean,                'float32')
+    hrs_write_array(fid, trial.background_bins,                  'float32')
+    hrs_write_val(fid, trial.stim_polarity_reversed,             'int8')
+    hrs_write_val(fid, trial.digital_onset_sample_num,           'int64')
+    hrs_write_val(fid, trial.digital_onset_channel,              'int32')
+
+
+def write_hrs2(out_path: str, header: MhRecHeader, trials: list,
+               emg_blocks: list = None, file_version: int = None) -> None:
+    """Write a cleaned subset of HRS2 (or HRS1) data to a new binary file.
+
+    The file format is identical to what read_hrs2() reads.
+
+    Arguments:
+      out_path:     Destination file path.
+      header:       MhRecHeader dataclass (from read_hrs2).
+      trials:       List of MhRecTrial dataclasses — the kept subset.
+      emg_blocks:   List of EmgDataBlock objects corresponding to kept trials.
+                    Pass None or [] to omit EMG blocks.
+      file_version: Override file version to write; None = use header.file_version.
+
+    Note: MhRecHeader has no n_trials count field — trials are written as sequential
+    block_id + data pairs, which is exactly what read_hrs2() reads back.
+
+    Block ID auto-detection:
+      BLOCK_CONTROL_MODE_TRIAL (6) when file_version >= 9 and the first trial has a
+      non-NaN h_wave_response (Control Mode).  BLOCK_MH_TRIAL (3) otherwise.
+    """
+    fv = header.file_version if file_version is None else file_version
+    if emg_blocks is None:
+        emg_blocks = []
+
+    # Detect whether this is a Control Mode file (block_id=6) or MH Recruitment (block_id=3).
+    # Control Mode files written at file_version >= 9 store h_wave_response per trial.
+    try:
+        _first_h = trials[0].h_wave_response if trials else float('nan')
+        _is_ctrl = (fv >= 9) and not np.isnan(float(_first_h))
+    except (AttributeError, TypeError, ValueError):
+        _is_ctrl = False
+    block_id = BLOCK_CONTROL_MODE_TRIAL if _is_ctrl else BLOCK_MH_TRIAL
+
+    with open(out_path, 'wb') as fid:
+        _write_mh_header_block(fid, header, fv)
+        for trial in trials:
+            hrs_write_val(fid, block_id, 'int32')
+            _write_mh_trial_block(fid, trial, fv, block_id)
+        for emg_block in emg_blocks:
+            hrs_write_val(fid, BLOCK_EMG_DATA, 'int32')
+            _write_emg_block(fid, emg_block)
