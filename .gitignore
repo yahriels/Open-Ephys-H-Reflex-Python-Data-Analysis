@@ -14,7 +14,8 @@ dist
 Notebooks
 notebooks
 
-.vscode
+.vscode/*
+!.vscode/extensions.json
 .spyproject
 
 build

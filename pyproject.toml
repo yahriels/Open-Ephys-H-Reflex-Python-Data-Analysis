@@ -16,7 +16,21 @@ readme = "README.md"
 
 dynamic = ["version"]
 
-dependencies = ['numpy', 'pandas', 'h5py', 'zmq', 'requests']
+dependencies = [
+    'numpy',
+    'pandas',
+    'h5py',
+    'zmq',
+    'requests',
+    'matplotlib',
+    'scipy',
+    'seaborn',
+    'plotly',
+    'ipywidgets',
+    'nbformat',
+    'jupyterlab',
+    'ipykernel',
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

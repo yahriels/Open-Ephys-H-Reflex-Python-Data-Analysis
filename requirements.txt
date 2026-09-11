@@ -1,0 +1,22 @@
+# Core scientific stack
+numpy
+pandas
+scipy
+matplotlib
+seaborn
+
+# H5 / binary data
+h5py
+
+# Networking / messaging
+pyzmq
+requests
+
+# Jupyter / notebook environment
+jupyterlab
+ipykernel
+ipywidgets
+nbformat
+
+# Interactive plots
+plotly
