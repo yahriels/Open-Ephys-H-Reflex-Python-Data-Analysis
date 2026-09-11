@@ -19,3 +19,31 @@ notebooks
 .spyproject
 
 build
+
+# ── H-Reflex recording data ────────────────────────────────────────────────────
+# Binary trial files (all stages)
+*.hrs1
+*.hrs2
+*.hrs3
+*.hrs4
+*.hrs5
+*.hrs6
+*.hrsft
+
+# Open Ephys continuous recording files
+*.dat
+*.oebin
+continuous.dat
+sample_numbers.npy
+timestamps.npy
+full_words.npy
+states.npy
+sync_messages.txt
+settings.xml
+structure.oebin
+*.npy
+
+# Entire recording data directories
+src/open_ephys/analysis/Calibration/
+src/open_ephys/analysis/HRPilot-*/
+src/open_ephys/analysis/dEMG_Pilot-*/
