@@ -2400,6 +2400,245 @@ def plot_ft_peak_curve(trial, header, sample_rate=None,
     plt.show()
 
 
+def plot_ft_sync_alignment(trial, header,
+                           pre_pulse_ms=2.0, post_pulse_ms=20.0,
+                           sample_rate=None,
+                           adc_threshold=4.5,
+                           search_window_pct=0.30,
+                           fig_w=13.0):
+    """Diagnostic plot for time-synchronisation drift across a frequency-test pulse train.
+
+    For each pulse the function computes two onset estimates:
+
+    1. **Nominal** — purely clock-based: ``onset + k * period_samples``.
+    2. **Detected** — first ADC-sync threshold crossing within ±``search_window_pct``
+       of the nominal position.  Falls back to the nominal value when not found.
+    3. **Digital** — rising-edge offset from ``trial.digital_event_sample_offsets``
+       (when available, fv ≥ 9), shown as tick marks on the timing-offset panel.
+
+    Four panels are produced:
+
+    - **Top**: sync_data windowed around *nominal* onset for every pulse (coolwarm
+      colour map, blue = pulse 1 → red = last).  Horizontal drift shows up as the
+      sync pulse sliding left or right relative to the dashed zero line.
+    - **Middle-upper**: EMG windowed around *detected* (sync-corrected) onset.
+      After correction the EMG should overlap cleanly; residual spread indicates
+      actual biological variability, not timing artefact.
+    - **Middle-lower**: EMG windowed around *nominal* onset for comparison.
+    - **Bottom**: Timing offset (detected − nominal) in ms per pulse number.
+      A flat line near 0 means no drift; a slope or step means the stimulator
+      clock diverges from the recording clock.  Digital-event positions (if
+      present) are overlaid as coloured tick marks.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+
+    sr = sample_rate or getattr(header, 'sample_rate', SAMPLE_RATE)
+    ms_per_samp = 1000.0 / sr
+
+    n_pulses = getattr(header, 'n_pulses_per_train', 0)
+    if n_pulses == 0:
+        n_pulses = len(getattr(trial, 'pulse_h_wave_mra', []))
+    if n_pulses == 0:
+        print("plot_ft_sync_alignment: no pulse data available.")
+        return
+
+    period_us = getattr(header, 'event_period_us', 0)
+    # honour per-trial override (FrequencyTestTrial.event_period_us_trial)
+    period_us_trial = getattr(trial, 'event_period_us_trial', 0)
+    if period_us_trial > 0:
+        period_us = period_us_trial
+    if period_us == 0:
+        print("plot_ft_sync_alignment: event_period_us not set.")
+        return
+
+    period_samp = round(period_us / 1e6 * sr)
+    hz          = round(1e6 / period_us, 3)
+
+    onset = getattr(trial, 'onset_sample_index', -1)
+    if onset < 0:
+        bin_ms = getattr(header, 'bin_duration_ms', BIN_DURATION_MS) or BIN_DURATION_MS
+        onset  = round(bin_ms * sr / 1000)
+
+    emg      = np.array(trial.trial_data, dtype=float)
+    sync_arr = np.array(getattr(trial, 'sync_data', []), dtype=float)
+    has_sync = len(sync_arr) == len(emg) and len(sync_arr) > 0
+
+    # ── Digital events (fv >= 9) ──────────────────────────────────────────────
+    dig_offsets = np.array(getattr(trial, 'digital_event_sample_offsets', []), dtype=np.int64)
+    dig_states  = np.array(getattr(trial, 'digital_event_states',          []), dtype=np.int8)
+    dig_channels= np.array(getattr(trial, 'digital_event_channels',        []), dtype=np.int32)
+    # keep only rising edges
+    if len(dig_offsets) > 0 and len(dig_states) == len(dig_offsets):
+        rising_mask = dig_states > 0
+        dig_offsets  = dig_offsets[rising_mask]
+        dig_channels = dig_channels[rising_mask] if len(dig_channels) == len(rising_mask) else np.zeros(rising_mask.sum(), dtype=np.int32)
+    has_dig = len(dig_offsets) > 0
+
+    pre_samp  = round(pre_pulse_ms  * sr / 1000)
+    post_samp = round(post_pulse_ms * sr / 1000)
+    win_len   = pre_samp + post_samp
+    t_ms      = np.linspace(-pre_pulse_ms, post_pulse_ms, win_len)
+
+    search_half = round(period_samp * search_window_pct)
+
+    # ── Per-pulse onset detection ─────────────────────────────────────────────
+    nominal_onsets  = []
+    detected_onsets = []
+    offsets_ms      = []
+
+    for k in range(n_pulses):
+        nom = onset + k * period_samp
+        nominal_onsets.append(nom)
+
+        if has_sync:
+            lo = max(0, nom - search_half)
+            hi = min(len(sync_arr) - 1, nom + search_half)
+            seg = sync_arr[lo:hi]
+            above = np.where(seg >= adc_threshold)[0]
+            if len(above) > 0:
+                det = lo + int(above[0])
+            else:
+                det = nom
+        else:
+            det = nom
+
+        detected_onsets.append(det)
+        offsets_ms.append((det - nom) * ms_per_samp)
+
+    nominal_onsets  = np.array(nominal_onsets)
+    detected_onsets = np.array(detected_onsets)
+    offsets_ms      = np.array(offsets_ms)
+
+    # ── Assign digital events to nearest pulse ────────────────────────────────
+    dig_pulse_assignments = []  # list of (pulse_idx, offset_ms, channel)
+    if has_dig:
+        unique_ch = np.unique(dig_channels)
+        ch_colors = {ch: plt.cm.tab10(i / max(len(unique_ch) - 1, 1))
+                     for i, ch in enumerate(unique_ch)}
+        for ev_off, ev_ch in zip(dig_offsets, dig_channels):
+            dists = np.abs(nominal_onsets - ev_off)
+            nearest = int(np.argmin(dists))
+            ev_off_ms = (int(ev_off) - int(nominal_onsets[nearest])) * ms_per_samp
+            dig_pulse_assignments.append((nearest, ev_off_ms, ev_ch))
+
+    # ── Colour map (blue → red, one per pulse) ────────────────────────────────
+    colors = list(cm.coolwarm(np.linspace(0, 1, max(n_pulses, 2))))
+
+    def _win(arr, centre):
+        s, e = centre - pre_samp, centre + post_samp
+        if s < 0 or e > len(arr):
+            return None
+        return arr[s:e]
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    n_rows = 4 if has_sync else 3
+    row_ratios = [2, 2, 2, 1] if has_sync else [2, 2, 1]
+    fig, axes = plt.subplots(n_rows, 1, figsize=(fig_w, 3.2 * n_rows),
+                              gridspec_kw={'height_ratios': row_ratios, 'hspace': 0.55})
+
+    row = 0
+
+    # ── Panel 0: ADC sync around NOMINAL onset ────────────────────────────────
+    if has_sync:
+        ax_sync_nom = axes[row]; row += 1
+        for k in range(n_pulses):
+            seg = _win(sync_arr, nominal_onsets[k])
+            if seg is not None:
+                ax_sync_nom.plot(t_ms[:len(seg)], seg,
+                                 color=colors[k], lw=1.2, alpha=0.75)
+        ax_sync_nom.axvline(0, color='#aaa', lw=0.9, ls='--')
+        ax_sync_nom.axhline(adc_threshold, color='gray', lw=0.8, ls=':',
+                            label=f'threshold = {adc_threshold} V')
+        ax_sync_nom.set_ylabel('ADC sync (V)', fontsize=10)
+        ax_sync_nom.set_title(
+            f'ADC sync — windowed at NOMINAL onset  ·  {hz} Hz  ·  {n_pulses} pulses\n'
+            'Drift → sync pulse shifts L/R relative to dashed line',
+            fontsize=10)
+        ax_sync_nom.legend(fontsize=8, loc='upper right')
+        ax_sync_nom.grid(axis='y', alpha=0.25, ls='--')
+        ax_sync_nom.set_xlabel('Time from nominal onset (ms)', fontsize=9)
+
+    # ── Panel 1: EMG around DETECTED (sync-corrected) onset ──────────────────
+    ax_emg_det = axes[row]; row += 1
+    for k in range(n_pulses):
+        seg = _win(emg, detected_onsets[k])
+        if seg is not None:
+            ax_emg_det.plot(t_ms[:len(seg)], seg,
+                            color=colors[k], lw=1.0, alpha=0.65)
+    ax_emg_det.axvline(0, color='#aaa', lw=0.9, ls='--')
+    ax_emg_det.set_ylabel('EMG (µV)', fontsize=10)
+    ax_emg_det.set_title(
+        'EMG — windowed at DETECTED onset (sync-corrected)\n'
+        'Should overlap cleanly if detection is working',
+        fontsize=10)
+    ax_emg_det.grid(axis='y', alpha=0.25, ls='--')
+    ax_emg_det.set_xlabel('Time from detected onset (ms)', fontsize=9)
+
+    # ── Panel 2: EMG around NOMINAL onset (baseline comparison) ──────────────
+    ax_emg_nom = axes[row]; row += 1
+    for k in range(n_pulses):
+        seg = _win(emg, nominal_onsets[k])
+        if seg is not None:
+            ax_emg_nom.plot(t_ms[:len(seg)], seg,
+                            color=colors[k], lw=1.0, alpha=0.65)
+    ax_emg_nom.axvline(0, color='#aaa', lw=0.9, ls='--')
+    ax_emg_nom.set_ylabel('EMG (µV)', fontsize=10)
+    ax_emg_nom.set_title(
+        'EMG — windowed at NOMINAL onset (clock-based only)\n'
+        'Drift shows up as horizontal spread here',
+        fontsize=10)
+    ax_emg_nom.grid(axis='y', alpha=0.25, ls='--')
+    ax_emg_nom.set_xlabel('Time from nominal onset (ms)', fontsize=9)
+
+    # ── Panel 3: Timing offset per pulse ─────────────────────────────────────
+    ax_drift = axes[row]
+    pulse_idx = np.arange(1, n_pulses + 1)
+
+    if has_sync:
+        ax_drift.plot(pulse_idx, offsets_ms, 'o-', color='steelblue',
+                      lw=1.8, ms=5, label='ADC detected − nominal')
+    ax_drift.axhline(0, color='#aaa', lw=0.8, ls='--')
+
+    # Digital event offsets
+    if has_dig:
+        for pulse_i, ev_ms, ev_ch in dig_pulse_assignments:
+            ax_drift.plot(pulse_i + 1, ev_ms,
+                          marker='|', ms=12, mew=2,
+                          color=ch_colors[ev_ch],
+                          label=f'DIG CH{ev_ch}' if f'DIG CH{ev_ch}' not in
+                                [l.get_label() for l in ax_drift.lines] else '_')
+
+    ax_drift.set_xlabel('Pulse # in train', fontsize=10)
+    ax_drift.set_ylabel('Offset (ms)\ndetected − nominal', fontsize=9)
+    ax_drift.set_title('Timing offset per pulse  (slope = clock drift)', fontsize=10)
+    ax_drift.set_xticks(pulse_idx)
+    ax_drift.grid(alpha=0.3, ls='--')
+    handles, labels = ax_drift.get_legend_handles_labels()
+    seen = {}
+    unique_h, unique_l = [], []
+    for h, l in zip(handles, labels):
+        if l not in seen:
+            seen[l] = True; unique_h.append(h); unique_l.append(l)
+    if unique_h:
+        ax_drift.legend(unique_h, unique_l, fontsize=8, loc='best')
+
+    try:
+        amp_str = f'{float(getattr(trial, "stimulation_amplitude_ma", 0.0)):.3f} mA'
+    except (TypeError, ValueError):
+        amp_str = '? mA'
+
+    fig.suptitle(
+        f'Sync Alignment Diagnostic  ·  {hz} Hz  ·  {n_pulses} pulses  ·  {amp_str}\n'
+        f'search window = ±{search_window_pct * 100:.0f}% of period  '
+        f'(±{search_half / sr * 1000:.1f} ms)  |  '
+        f'ADC threshold = {adc_threshold} V',
+        fontsize=11, y=1.01)
+
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_ft_background_emg(trials, header):
     """Histogram of pre-trial background EMG mean across all FT trials."""
     import matplotlib.pyplot as plt
@@ -3175,10 +3414,11 @@ def plot_hrs2_analysis(trials, header,
     the normalized recruitment curve and the raw mean ± SEM curve.
     """
     import matplotlib.pyplot as plt
+    import plotly.graph_objects as go
     import scipy.stats as stats
     from scipy.interpolate import interp1d
     from ipywidgets import (Button, Output, HBox, VBox, Dropdown, Label,
-                            Checkbox, ToggleButton, FloatText, HTML)
+                            Checkbox, ToggleButton, ToggleButtons, FloatText, HTML)
     from IPython.display import display
 
     if len(trials) == 0:
@@ -3746,7 +3986,8 @@ def plot_hrs2_analysis(trials, header,
         }
 
     # ── interactive recruitment curve output ──────────────────────────────
-    _rc_out = Output()
+    _rc_out  = Output()
+    _rc_view = {'val': 'raw'}
 
     def _draw_rc_curves(pol_key):
         _d   = _rc_data[pol_key]
@@ -3771,47 +4012,72 @@ def plot_hrs2_analysis(trials, header,
         with _rc_out:
             _rc_out.clear_output(wait=True)
 
-            # normalized recruitment curve
-            fig, ax = plt.subplots(figsize=(_figsize['w'] * 10/15, _figsize['h']))
-            ax.errorbar(_nc, _norm_m, yerr=_norm_m_std, fmt='o-', color='blue',
-                        label='M-wave (% Mmax) ± STD', capsize=3)
-            ax.errorbar(_nc, _norm_h, yerr=_norm_h_std, fmt='o-', color='green',
-                        label='H-wave (% Mmax) ± STD', capsize=3)
-            _H_max_k    = float(np.max(_norm_h))
-            _idx_Hmax_k = int(np.argmax(_norm_h))
-            _cur_Hmax_k = float(_nc[_idx_Hmax_k])
-            ax.axhline(_H_max_k, color='green', linestyle='--', linewidth=1,
-                       label=f'H_max = {_H_max_k:.1f}% Mmax')
-            ax.axvline(_cur_Hmax_k, color='gray', linestyle='--', linewidth=1,
-                       label=f'Current at H_max = {_cur_Hmax_k:.2f}x')
-            ax.text(_cur_Hmax_k + 0.02, _H_max_k + 2, 'b', fontsize=12, color='black')
-            ax.text(_cur_Hmax_k - 0.08, _H_max_k + 2, 'a', fontsize=12, color='black')
-            ax.set_xlabel('Current (normalized to current at 50% Mmax)', fontsize=18)
-            ax.set_ylabel('H and M wave size (% of Mmax)', fontsize=18)
-            ax.set_title(f'HRS2 Normalized Recruitment Curve - {header.subject_id}{_lbl_sfx}',
-                         fontsize=15)
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            _apply_tiered_ticks(ax)
-            plt.tight_layout()
-            plt.show()
+            fig = go.Figure()
+            if _rc_view['val'] == 'norm':
+                # normalized recruitment curve — hover always shows the raw mA too,
+                # so zooming in on close-together points still tells you the intensity.
+                fig.add_trace(go.Scatter(
+                    x=_nc.tolist(), y=_norm_m.tolist(), customdata=_sa.tolist(),
+                    error_y=dict(type='data', array=_norm_m_std.tolist(), visible=True),
+                    mode='lines+markers', name='M-wave (% Mmax)',
+                    marker=dict(color='royalblue', size=7), line=dict(color='royalblue'),
+                    hovertemplate='Amplitude: %{customdata:.3f} mA<br>'
+                                  'Normalized current: %{x:.3f}x<br>'
+                                  'M-wave: %{y:.1f}% Mmax<extra></extra>'))
+                fig.add_trace(go.Scatter(
+                    x=_nc.tolist(), y=_norm_h.tolist(), customdata=_sa.tolist(),
+                    error_y=dict(type='data', array=_norm_h_std.tolist(), visible=True),
+                    mode='lines+markers', name='H-wave (% Mmax)',
+                    marker=dict(color='green', size=7), line=dict(color='green'),
+                    hovertemplate='Amplitude: %{customdata:.3f} mA<br>'
+                                  'Normalized current: %{x:.3f}x<br>'
+                                  'H-wave: %{y:.1f}% Mmax<extra></extra>'))
+                _H_max_k    = float(np.max(_norm_h))
+                _idx_Hmax_k = int(np.argmax(_norm_h))
+                _cur_Hmax_k = float(_nc[_idx_Hmax_k])
+                fig.add_hline(y=_H_max_k, line=dict(color='green', dash='dash', width=1),
+                              annotation_text=f'H_max = {_H_max_k:.1f}% Mmax',
+                              annotation_position='top left', annotation_font_size=11)
+                fig.add_vline(x=_cur_Hmax_k, line=dict(color='gray', dash='dash', width=1),
+                              annotation_text=f'Current at H_max = {_cur_Hmax_k:.2f}x',
+                              annotation_position='top', annotation_font_size=11)
+                fig.add_annotation(x=_cur_Hmax_k + 0.02, y=_H_max_k + 2, text='b',
+                                   showarrow=False, font=dict(size=14))
+                fig.add_annotation(x=_cur_Hmax_k - 0.08, y=_H_max_k + 2, text='a',
+                                   showarrow=False, font=dict(size=14))
+                fig.update_layout(
+                    title=f'HRS2 Normalized Recruitment Curve - {header.subject_id}{_lbl_sfx}',
+                    xaxis_title='Current (normalized to current at 50% Mmax)',
+                    yaxis_title='H and M wave size (% of Mmax)')
+            else:
+                # raw recruitment curve — x-axis is the actual stimulation amplitude,
+                # so hover already tells you the intensity of every point.
+                fig.add_trace(go.Scatter(
+                    x=_sa.tolist(), y=_d['m_means'].tolist(),
+                    error_y=dict(type='data', array=_d['m_stds'].tolist(), visible=True),
+                    mode='lines+markers', name='M-wave',
+                    marker=dict(color='royalblue', size=7), line=dict(color='royalblue'),
+                    hovertemplate='Amplitude: %{x:.3f} mA<br>M-wave: %{y:.1f} µV<extra></extra>'))
+                fig.add_trace(go.Scatter(
+                    x=_sa.tolist(), y=_d['h_means'].tolist(),
+                    error_y=dict(type='data', array=_d['h_stds'].tolist(), visible=True),
+                    mode='lines+markers', name='H-wave',
+                    marker=dict(color='green', size=7), line=dict(color='green'),
+                    hovertemplate='Amplitude: %{x:.3f} mA<br>H-wave: %{y:.1f} µV<extra></extra>'))
+                fig.update_layout(
+                    title=f'HRS2 Recruitment Curve - {header.subject_id}{_lbl_sfx}',
+                    xaxis_title='Stimulation Amplitude (mA)',
+                    yaxis_title='Size (µV) [MRA − BG]')
 
-            # raw (mA) recruitment curve
-            fig, ax = plt.subplots(figsize=(_figsize['w'] * 10/15, _figsize['h']))
-            ax.errorbar(_sa, _d['m_means'], yerr=_d['m_stds'],
-                        fmt='o-', color='blue',  label='M-wave mean ± STD', capsize=3)
-            ax.errorbar(_sa, _d['h_means'], yerr=_d['h_stds'],
-                        fmt='o-', color='green', label='H-wave mean ± STD', capsize=3)
-            ax.set_xticks(_sa)
-            ax.set_xticklabels([f'{a:.3f}' for a in _sa], rotation=45, ha='right', fontsize=9)
-            ax.set_xlabel('Stimulation Amplitude (mA)', fontsize=18)
-            ax.set_ylabel('Size (µV) [MRA − BG]', fontsize=18)
-            ax.set_title(f'HRS2 Recruitment Curve - {header.subject_id}{_lbl_sfx}', fontsize=15)
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            _apply_tiered_ticks(ax)
-            plt.tight_layout()
-            plt.show()
+            fig.update_layout(
+                template='plotly_white', height=520, width=880,
+                hovermode='closest',
+                legend=dict(x=0.02, y=0.98, xanchor='left', yanchor='top'),
+                margin=dict(t=60, r=30))
+            fig.update_xaxes(showgrid=True, gridcolor='rgba(0,0,0,0.08)',
+                             rangeslider_visible=(_rc_view['val'] == 'raw'))
+            fig.update_yaxes(showgrid=True, gridcolor='rgba(0,0,0,0.08)')
+            fig.show()
 
             _h_norm_k    = (_d['h_means'] / M_max_k) * 100
             _idx_Hmax_rw = int(np.argmax(_h_norm_k))
@@ -3822,8 +4088,19 @@ def plot_hrs2_analysis(trials, header,
             print(f"Current at H_max = {float(_sa[_idx_Hmax_rw]):.3f} mA "
                   f"({float(_sa[_idx_Hmax_rw] / current_at_50_k):.3f}x normalized)")
 
+    def _on_rc_view_change(change):
+        _rc_view['val'] = change['new']
+        _draw_rc_curves(_active_pol['val'])
+
+    _rc_view_tog = ToggleButtons(
+        options=[('Raw (mA)', 'raw'), ('Normalized (% Mmax)', 'norm')],
+        value='raw', description='View:', button_style='info',
+        tooltips=['Stimulation amplitude in mA (default)',
+                  'Current normalized to 50% Mmax'])
+    _rc_view_tog.observe(_on_rc_view_change, names='value')
+
     _pol_change_hooks.append(_draw_rc_curves)
-    display(_rc_out)
+    display(_rc_view_tog, _rc_out)
     _draw_rc_curves(_active_pol['val'])
 
     # ── linked background EMG: updates on amplitude selection or polarity change ──
@@ -12299,6 +12576,271 @@ def make_ft_viewer(all_recordings: dict,
         _ft_wave_out,
         _ft_mra_out,
         _ft_peak_out,
+    ])
+
+
+def make_ft_sync_viewer(all_recordings: dict,
+                        post_plot_ms: float = 20.0):
+    """Interactive sync-alignment diagnostic viewer for Frequency Test pulse trains.
+
+    Same recording / trial / amp / freq navigation as :func:`make_ft_viewer`, but
+    renders :func:`plot_ft_sync_alignment` instead of the waveform overlay.
+
+    Use this to investigate horizontal shifting in low-frequency pulse trains by
+    comparing nominal (clock-based) onset timing against the ADC sync channel
+    and digital event markers.
+    """
+    import copy as _copy
+    from ipywidgets import (Dropdown, Button, Checkbox, FloatText,
+                            Output, HBox, VBox, Label)
+
+    _ft_recs = [rl for rl in all_recordings
+                if all_recordings[rl].get('ft_trials') or all_recordings[rl].get('ft_files')]
+    if not _ft_recs:
+        return Label("No Frequency Test data loaded (.hrft not found in any recording directory).")
+
+    # ── State ──────────────────────────────────────────────────────────────────
+    _st = {
+        'idx':            0,
+        'updating':       False,
+        'freq_filter':    None,
+        'rec_list':       list(_ft_recs),
+        'amp_filter':     None,
+        'filtered':       [],
+        'pre_ms':          2.0,
+        'post_ms':   float(post_plot_ms),
+        'adc_thresh':      4.5,
+        'search_pct':     0.30,
+        'fig_w':          13.0,
+    }
+
+    # ── Widgets ────────────────────────────────────────────────────────────────
+    _rec_d      = Dropdown(options=_ft_recs, value=_ft_recs[0],
+                           description='Recording:', layout={'width': '620px'})
+    _prev_btn   = Button(description='Prev',  button_style='')
+    _next_btn   = Button(description='Next',  button_style='primary')
+    _trial_drop = Dropdown(options=[('Trial 1', 0)], value=0,
+                           description='Trial:', layout={'width': '145px'})
+    _amp_drop   = Dropdown(options=[('All', None)], value=None,
+                           description='Amp:',   layout={'width': '180px'})
+    _freq_drop  = Dropdown(options=[('All Hz', None)], value=None,
+                           description='Freq:',  layout={'width': '160px'})
+
+    _thresh_txt  = FloatText(value=4.5,  description='ADC thresh (V):',
+                             step=0.1,  layout={'width': '200px'})
+    _search_txt  = FloatText(value=0.30, description='Search ±%:',
+                             step=0.05, layout={'width': '180px'})
+    _prems_txt   = FloatText(value=2.0,  description='Pre ms:',
+                             step=0.5,  layout={'width': '148px'})
+    _postms_txt  = FloatText(value=float(post_plot_ms), description='Post ms:',
+                             step=1.0,  layout={'width': '158px'})
+    _figw_txt    = FloatText(value=13.0, description='Fig W:',
+                             step=0.5,  layout={'width': '145px'})
+
+    _out = Output()
+
+    # ── Helpers (mirror make_ft_viewer) ────────────────────────────────────────
+    def _get_ctx():
+        rl      = _rec_d.value
+        rec     = all_recordings[rl]
+        ft_t    = rec.get('ft_trials', []) or []
+        ft_h    = rec.get('ft_header')
+        hz_list = rec.get('ft_trial_hz', [])
+        hz_map  = {id(t): hz for t, hz in zip(ft_t, hz_list)}
+        sr      = rec.get('sample_rate') or getattr(ft_h, 'sample_rate', None)
+        return ft_t, ft_h, sr, hz_map
+
+    def _corrected_header(trial, ft_h, sr):
+        n_p = len(getattr(trial, 'pulse_h_wave_mra', []))
+        if n_p <= 1:
+            return ft_h
+        header_period_us = getattr(ft_h, 'event_period_us', 0) or 0
+        sr_use = sr or 10000.0
+        if header_period_us > 0:
+            period_samp = header_period_us * sr_use / 1e6
+            onset = max(0, getattr(trial, 'onset_sample_index', 0))
+            if onset + (n_p - 1) * period_samp <= len(trial.trial_data) * 1.05:
+                return ft_h
+        tot   = len(getattr(trial, 'trial_data', []))
+        onset = max(0, getattr(trial, 'onset_sample_index', 0))
+        if tot <= onset:
+            return ft_h
+        period_samp    = (tot - onset) / n_p
+        hz_raw         = sr_use / period_samp if period_samp > 0 else 0.0
+        hz_snapped     = ft_snap_hz(hz_raw)
+        period_snapped = sr_use / hz_snapped if hz_snapped > 0 else period_samp
+        corrected_us   = max(1, int(period_snapped / sr_use * 1e6))
+        ft_h_copy = _copy.copy(ft_h)
+        ft_h_copy.event_period_us = corrected_us
+        return ft_h_copy
+
+    def _compute_freqs(rl):
+        hz_list = all_recordings[rl].get('ft_trial_hz', [])
+        if hz_list:
+            return set(hz_list)
+        ft_h = all_recordings[rl].get('ft_header')
+        if ft_h and getattr(ft_h, 'event_period_us', 0):
+            return {ft_snap_hz(1e6 / ft_h.event_period_us)}
+        return set()
+
+    def _rebuild_rec_list():
+        ff = _st['freq_filter']
+        if ff is None:
+            _st['rec_list'] = list(_ft_recs)
+        else:
+            matched = [rl for rl in _ft_recs if ff in _compute_freqs(rl)]
+            _st['rec_list'] = matched if matched else list(_ft_recs)
+
+    def _rebuild_filtered():
+        ft_t, ft_h, sr, hz_map = _get_ctx()
+        af, ff = _st['amp_filter'], _st['freq_filter']
+        filt = []
+        for t in ft_t:
+            if af is not None:
+                if abs(getattr(t, 'stimulation_amplitude_ma', 0.0) - af) >= 0.0015:
+                    continue
+            if ff is not None:
+                if hz_map.get(id(t), compute_ft_trial_hz(t, ft_h, sr)) != ff:
+                    continue
+            filt.append(t)
+        _st['filtered'] = filt if filt else list(ft_t)
+
+    # ── Render ─────────────────────────────────────────────────────────────────
+    def _render():
+        if not _st['filtered']:
+            return
+        ft_t, ft_h, sr, hz_map = _get_ctx()
+        if ft_h is None:
+            return
+        idx   = max(0, min(_st['idx'], len(_st['filtered']) - 1))
+        trial = _st['filtered'][idx]
+        n_tot = len(_st['filtered'])
+        hz    = hz_map.get(id(trial), compute_ft_trial_hz(trial, ft_h, sr))
+        ft_h_use = _corrected_header(trial, ft_h, sr)
+        with _out:
+            _out.clear_output(wait=True)
+            print(f'Sync Alignment  |  {hz} Hz  |  Trial {idx + 1} of {n_tot}  [{_rec_d.value}]')
+            plot_ft_sync_alignment(
+                trial, ft_h_use,
+                pre_pulse_ms=_st['pre_ms'],
+                post_pulse_ms=_st['post_ms'],
+                sample_rate=sr,
+                adc_threshold=_st['adc_thresh'],
+                search_window_pct=_st['search_pct'],
+                fig_w=_st['fig_w'],
+            )
+
+    # ── Nav helpers ────────────────────────────────────────────────────────────
+    def _update_trial_drop():
+        n = max(1, len(_st['filtered']))
+        _st['idx'] = min(_st['idx'], n - 1)
+        _st['updating'] = True
+        _trial_drop.options = [(f'Trial {i + 1}', i) for i in range(n)]
+        _trial_drop.value   = _st['idx']
+        _st['updating'] = False
+
+    def _update_amp_drop():
+        ft_t, _, _, _ = _get_ctx()
+        amps = sorted({float(getattr(t, 'stimulation_amplitude_ma', 0.0)) for t in ft_t})
+        _st['updating'] = True
+        _amp_drop.options = [('All', None)] + [(f'{a:.3f} mA', a) for a in amps]
+        _amp_drop.value   = _st['amp_filter']
+        _st['updating'] = False
+
+    def _update_freq_drop():
+        freqs = sorted({hz for rl in _ft_recs for hz in _compute_freqs(rl)})
+        _st['updating'] = True
+        _freq_drop.options = [('All Hz', None)] + [(f'{f} Hz', f) for f in freqs]
+        _freq_drop.value   = _st['freq_filter']
+        _st['updating'] = False
+
+    def _update_rec_drop():
+        opts = _st['rec_list'] if _st['rec_list'] else list(_ft_recs)
+        _st['updating'] = True
+        _rec_d.options = opts
+        if _rec_d.value not in opts:
+            _rec_d.value = opts[0]
+        _st['updating'] = False
+
+    def _init_controls():
+        _st['idx'] = 0
+        _rebuild_filtered()
+        _update_trial_drop()
+        _update_amp_drop()
+
+    # ── Observers ──────────────────────────────────────────────────────────────
+    def _on_freq(c):
+        if _st['updating']: return
+        _st['freq_filter'] = c['new']
+        _st['amp_filter']  = None
+        _st['idx']         = 0
+        _rebuild_rec_list()
+        _update_rec_drop()
+        _init_controls()
+        _render()
+
+    def _on_rec(c):
+        if _st['updating']: return
+        _st['amp_filter'] = None
+        _init_controls()
+        _render()
+
+    def _on_prev(b):
+        if _st['idx'] > 0:
+            _st['idx'] -= 1
+            _st['updating'] = True
+            _trial_drop.value = _st['idx']
+            _st['updating'] = False
+            _render()
+
+    def _on_next(b):
+        if _st['idx'] < len(_st['filtered']) - 1:
+            _st['idx'] += 1
+            _st['updating'] = True
+            _trial_drop.value = _st['idx']
+            _st['updating'] = False
+            _render()
+
+    def _on_trial(c):
+        if _st['updating']: return
+        _st['idx'] = c['new']
+        _render()
+
+    def _on_amp(c):
+        if _st['updating']: return
+        _st['amp_filter'] = c['new']
+        _st['idx'] = 0
+        _rebuild_filtered()
+        _update_trial_drop()
+        _render()
+
+    def _on_thresh(c):  _st['adc_thresh']  = c['new']; _render()
+    def _on_search(c):  _st['search_pct']  = c['new']; _render()
+    def _on_prems(c):   _st['pre_ms']      = c['new']; _render()
+    def _on_postms(c):  _st['post_ms']     = c['new']; _render()
+    def _on_figw(c):    _st['fig_w']       = c['new']; _render()
+
+    _freq_drop.observe(_on_freq,   names='value')
+    _rec_d.observe(_on_rec,        names='value')
+    _prev_btn.on_click(_on_prev)
+    _next_btn.on_click(_on_next)
+    _trial_drop.observe(_on_trial, names='value')
+    _amp_drop.observe(_on_amp,     names='value')
+    _thresh_txt.observe(_on_thresh,  names='value')
+    _search_txt.observe(_on_search,  names='value')
+    _prems_txt.observe(_on_prems,    names='value')
+    _postms_txt.observe(_on_postms,  names='value')
+    _figw_txt.observe(_on_figw,      names='value')
+
+    _update_freq_drop()
+    _init_controls()
+    _render()
+
+    return VBox([
+        _rec_d,
+        HBox([_prev_btn, _next_btn, _trial_drop, _amp_drop, _freq_drop]),
+        HBox([_thresh_txt, _search_txt, _prems_txt, _postms_txt, _figw_txt]),
+        _out,
     ])
 
 
