@@ -9,6 +9,7 @@ trial initiation simulation engine used by both:
 
 import os
 import re
+import json
 import time
 import struct
 import glob as globmod
@@ -134,6 +135,9 @@ class EmgCharHeader:
     sample_rate: float = 5000.0
     # Set when an EMG_TRIALS_PER_HOUR block is present in the file; otherwise None.
     trials_per_hour_data: object = None
+    # App-side stimulation/window settings loaded from the "<filepath>.settings.json"
+    # sidecar, when present. Empty dict for files with no sidecar. See _load_settings_json.
+    settings: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -188,6 +192,9 @@ class MhRecHeader:
     # Defaults to 5000.0 for files with no trials.
     sample_rate: float = 5000.0
     bin_duration_ms: int = BIN_DURATION_MS
+    # App-side stimulation/window settings loaded from the "<filepath>.settings.json"
+    # sidecar, when present. Empty dict for files with no sidecar. See _load_settings_json.
+    settings: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -268,6 +275,15 @@ class FrequencyTestTrial(MhRecTrial):
     n_pulses_trial:        int = 0
     event_period_us_trial: int = 0
     pulse_width_us_trial:  int = 0
+    # --- file_version >= 4 ---
+    # Ground-truth per-pulse onset sample index (length n_pulses), corrected by
+    # the app against the actual Stim ADC artifact. Empty for older files —
+    # see get_ft_pulse_onsets() for the fallback correction used in that case.
+    pulse_onset_sample_indices: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int32))
+    # --- file_version >= 5 ---
+    # The real acquisition sample rate in effect for this trial. 0.0 for older
+    # files — see get_ft_sample_rate() for the fallback resolution used there.
+    sample_rate: float = 0.0
 
 
 @dataclass
@@ -387,18 +403,38 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0,
         t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
         if file_version >= 10:
-            # fv=10 may append extra fields after the M-wave block.
-            # Peek at the next 4 bytes: if they form a known block_id the
-            # writer omitted the extra fields; otherwise skip them (25 bytes:
-            # 6×int32 + 1×uint8 observed in BASELINE files from 2026-08-25+).
-            _peek4 = fid.read(4)
-            if len(_peek4) == 4:
-                _next_bid = struct.unpack('<i', _peek4)[0]
-                if _next_bid in (BLOCK_EMG_DATA, BLOCK_MH_TRIAL,
-                                 BLOCK_CONTROL_MODE_TRIAL):
-                    fid.seek(-4, 1)   # no extra fields; put the 4 bytes back
-                else:
-                    fid.read(21)      # skip remaining 21 bytes (total 25 skipped)
+            # fv=10 appends a trailer after the M-wave block whose exact
+            # field layout isn't known (observed as a consistent 43 bytes in
+            # recordings from 2026-09-14, vs. 25 bytes reverse-engineered
+            # from an earlier 2026-08-25 batch — it isn't a fixed constant
+            # across app versions). Rather than assume a byte count, we
+            # resynchronise by scanning forward for the next EMG_DATA block,
+            # confirmed by the same ascending-timestamp signature used
+            # elsewhere in this reader. We deliberately do NOT also treat a
+            # bare trial block_id as a resync candidate here: unlike the
+            # 3-timestamp EMG signature, a single plausible-looking Unix-ms
+            # value is weak enough that it can spuriously match inside the
+            # trailer's own opaque bytes (seen in practice), landing at the
+            # wrong offset. Falls back to "no extra fields" (pre-fv10
+            # layout) if no EMG block is found within the scan window —
+            # which should be rare, since a Control Mode session continuously
+            # emits EMG blocks between trials during background monitoring.
+            _MWAVE_TAIL_UNIX_MS_LO = 5e11
+            _MWAVE_TAIL_UNIX_MS_HI = 3e12
+            _tail_pos  = fid.tell()
+            _tail_peek = fid.read(256)
+            _resync_off = None
+            for _off in range(0, max(0, len(_tail_peek) - 28)):
+                if struct.unpack('<i', _tail_peek[_off:_off + 4])[0] != BLOCK_EMG_DATA:
+                    continue
+                _t0, _t1, _t2 = struct.unpack('<QQQ', _tail_peek[_off + 4:_off + 28])
+                if (_MWAVE_TAIL_UNIX_MS_LO < _t0 < _MWAVE_TAIL_UNIX_MS_HI and
+                        _MWAVE_TAIL_UNIX_MS_LO < _t1 < _MWAVE_TAIL_UNIX_MS_HI and
+                        _MWAVE_TAIL_UNIX_MS_LO < _t2 < _MWAVE_TAIL_UNIX_MS_HI and
+                        _t1 >= _t0 and _t2 >= _t1 and (_t2 - _t0) < 3_600_000):
+                    _resync_off = _off
+                    break
+            fid.seek(_tail_pos + (_resync_off or 0))
     return t
 
 
@@ -528,16 +564,23 @@ def _read_up_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> UpCondVns
 
 
 def _read_frequency_test_trial_block(fid: BinaryIO, file_version: int) -> FrequencyTestTrial:
-    """Read one Frequency Test trial block (V3 .hrsft, block_id=8)."""
-    # FT format at fv >= 1 always includes the full set of timing fields that
-    # _read_mh_trial_block_full gates at fv >= 2 for conditioning stages.
+    """Read one Frequency Test trial block (V3 .hrsft, block_id=8).
+
+    Version history
+    ---------------
+    fv 1 : base MhRecTrial fields via _read_mh_trial_block_full (treated as fv 2).
+    fv 2 : + per-trial n_pulses, event_period_us, pulse_width_us.
+    fv 3 : + digital_event_sample_offsets / digital_event_channels / digital_event_states
+             arrays (mirrors the .hrs2 file_version-9 digital event fields).
+    fv 4 : + pulse_onset_sample_indices — ground-truth per-pulse onset, already
+             corrected by the app against the Stim ADC artifact.
+    fv 5 : + sample_rate — the real per-trial acquisition sample rate.
+    """
     base = _read_mh_trial_block_full(fid, max(file_version, 2))
     t = FrequencyTestTrial.__new__(FrequencyTestTrial)
     t.__dict__.update(base.__dict__)
     t.pulse_h_wave_mra = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
     t.pulse_m_wave_mra = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
-    # Per-trial pulse parameters added in file_version 2 (H-Reflex App V2 recordings).
-    # Match this version gate to the file_version you bump to in the H-Reflex App.
     if file_version >= 2:
         t.n_pulses_trial        = hrs_read_val(fid, 'int32')
         t.event_period_us_trial = hrs_read_val(fid, 'int32')
@@ -546,6 +589,18 @@ def _read_frequency_test_trial_block(fid: BinaryIO, file_version: int) -> Freque
         t.n_pulses_trial        = 0
         t.event_period_us_trial = 0
         t.pulse_width_us_trial  = 0
+    if file_version >= 3:
+        t.digital_event_sample_offsets = np.array(hrs_read_array(fid, 'int32'), dtype=np.int32)
+        t.digital_event_channels       = np.array(hrs_read_array(fid, 'int32'), dtype=np.int32)
+        t.digital_event_states         = np.array(hrs_read_array(fid, 'int8'),  dtype=np.int8)
+    if file_version >= 4:
+        t.pulse_onset_sample_indices = np.array(hrs_read_array(fid, 'int32'), dtype=np.int32)
+    else:
+        t.pulse_onset_sample_indices = np.array([], dtype=np.int32)
+    if file_version >= 5:
+        t.sample_rate = hrs_read_val(fid, 'float32')
+    else:
+        t.sample_rate = 0.0
     return t
 
 
@@ -576,6 +631,46 @@ def _read_dcp_trial_block(fid: BinaryIO, file_version: int = 8) -> DcpTrial:
         t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
     return t
+
+
+def _load_settings_json(filepath: str) -> dict:
+    """Load the app-settings sidecar for a binary recording file, if present.
+
+    Newer H-Reflex App recordings write "<filepath>.settings.json" next to
+    each binary data file (e.g. "foo.hrs1" -> "foo.hrs1.settings.json"),
+    capturing the stimulation/window parameters active for that stage run
+    (sweep range, M/H-wave windows, thresholds, polarity, pulse train
+    parameters, etc.). Returns {} when the sidecar is absent (older
+    recordings) or unparseable.
+    """
+    _settings_path = filepath + '.settings.json'
+    if not os.path.isfile(_settings_path):
+        return {}
+    try:
+        with open(_settings_path, 'r', encoding='utf-8') as _f:
+            return json.load(_f)
+    except (json.JSONDecodeError, OSError) as _err:
+        print(f"Warning: could not parse settings sidecar {_settings_path!r}: {_err}")
+        return {}
+
+
+_KHZ_FILENAME_RE = re.compile(r'(\d+(?:\.\d+)?)\s*KHZ', re.IGNORECASE)
+
+
+def _parse_sample_rate_from_filename(filepath: str) -> float:
+    """Best-effort acquisition sample rate (Hz) parsed from a recording filename.
+
+    Matches the "..._<PULSEWIDTH>US_<RATE>KHZ_<DATE>..." naming convention used
+    by recordings named through the app's filename automation. Returns 0.0 if
+    no such token is found.
+    """
+    m = _KHZ_FILENAME_RE.search(os.path.basename(filepath))
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1)) * 1000.0
+    except ValueError:
+        return 0.0
 
 
 def read_hrs1(filepath: str):
@@ -644,6 +739,7 @@ def read_hrs1(filepath: str):
                 # Last block was truncated (file closed mid-write); discard it.
                 break
 
+    header.settings = _load_settings_json(filepath)
     return header, trials, emg_blocks
 
 
@@ -761,6 +857,7 @@ def read_hrs2(filepath: str):
 
     if trials:
         header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
+    header.settings = _load_settings_json(filepath)
     return header, trials, emg_blocks
 
 
@@ -839,6 +936,7 @@ def read_hrs3(filepath: str):
 
     if trials:
         header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
+    header.settings = _load_settings_json(filepath)
     return header, trials, emg_blocks
 
 
@@ -934,6 +1032,7 @@ def read_hrs4(filepath: str):
         filepath, header, BLOCK_UP_COND_PELLET_TRIAL, _read_up_cond_pellet_trial_block)
     if trials:
         header.sample_rate = 10000.0
+    header.settings = _load_settings_json(filepath)
     return header, trials, emg_blocks
 
 
@@ -947,6 +1046,7 @@ def read_hrs5(filepath: str):
         filepath, header, BLOCK_DOWN_COND_VNS_TRIAL, _read_down_cond_vns_trial_block)
     if trials:
         header.sample_rate = 10000.0
+    header.settings = _load_settings_json(filepath)
     return header, trials, emg_blocks
 
 
@@ -960,6 +1060,7 @@ def read_hrs6(filepath: str):
         filepath, header, BLOCK_UP_COND_VNS_TRIAL, _read_up_cond_vns_trial_block)
     if trials:
         header.sample_rate = 10000.0
+    header.settings = _load_settings_json(filepath)
     return header, trials, emg_blocks
 
 
@@ -1027,7 +1128,15 @@ def read_hrs_ft(filepath: str):
                 break
 
     if trials:
-        header.sample_rate = 10000.0   # FT uses same 10 kHz ADC as all V3 stages
+        # Prefer the per-trial ground-truth sample rate (file_version >= 5);
+        # fall back to the filename's "..._<RATE>KHZ_..." token, then to the
+        # historical assumption that all V3 stages use a 10 kHz ADC.
+        _trial_srs = [t.sample_rate for t in trials if getattr(t, 'sample_rate', 0.0) > 0]
+        if _trial_srs:
+            header.sample_rate = float(np.median(_trial_srs))
+        else:
+            header.sample_rate = _parse_sample_rate_from_filename(filepath) or 10000.0
+    header.settings = _load_settings_json(filepath)
     return header, trials, emg_blocks
 
 
@@ -2061,33 +2170,38 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
                                 h_start_ms=6.0, h_end_ms=10.0,
                                 sample_rate=None,
                                 zoom_pulse=None,
-                                style='gradient',
                                 show_legend=True,
                                 legend_style='colorbar',
                                 y_min=None, y_max=None,
                                 fig_w=11.0, fig_h=5.0,
                                 simplified=False,
                                 compare_pulse=2,
-                                show_sync=False):
+                                show_sync=False,
+                                show_stim_adc=False):
     """All pulse waveforms from a single FT trial overlaid on one plot.
 
     zoom_pulse    : int (0-based) or None.  None = all equal; int = highlight that
                     pulse bold, fade all others.  Ignored in simplified mode.
-    style         : 'gradient' (coolwarm blue→red), 'bold_ends' (gradient, first+last
-                    thick), 'distinct' (tab20 qualitative colours).  Ignored in simplified.
-    legend_style  : 'colorbar' (gradient bar, gradient/bold_ends only) or 'labeled'.
+    Colours are always coolwarm (blue=pulse 1 → red=last), with pulse 1 and the
+    last pulse drawn a little bolder/darker than the rest so the ends of the
+    train stand out. Ignored in simplified mode.
+    legend_style  : 'colorbar' (gradient bar) or 'labeled'.
     simplified    : If True, show three traces — pulse 1 (blue), pulse compare_pulse
                     (orange), and the mean of the last-half pulses (purple), with the
                     individual last-half traces in a lighter background shade.
     compare_pulse : 0-based index of the second named trace in simplified mode (default 2).
     show_sync     : If True, add a subplot below showing the ADC sync channel (trial.sync_data)
                     windowed around each displayed pulse.
+    show_stim_adc : If True, add a subplot below showing the Stim ADC channel
+                    (trial.stim_adc_data — the stimulator's own pulse output)
+                    windowed around each displayed pulse. Combines with show_sync
+                    (each gets its own row).
     """
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
     import matplotlib.lines as mlines
 
-    sr       = sample_rate or getattr(header, 'sample_rate', SAMPLE_RATE)
+    sr       = get_ft_sample_rate(trial, header, sample_rate)
     n_pulses = getattr(header, 'n_pulses_per_train', 0)
     if n_pulses == 0:
         n_pulses = len(getattr(trial, 'pulse_h_wave_mra', []))
@@ -2100,15 +2214,22 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
         print("event_period_us not set — cannot reconstruct pulse timing.")
         return
 
-    pulse_period_samples = round(period_us / 1e6 * sr)
-    onset = getattr(trial, 'onset_sample_index', -1)
-    if onset < 0:
-        bin_ms = getattr(header, 'bin_duration_ms', BIN_DURATION_MS) or BIN_DURATION_MS
-        onset  = round(bin_ms * sr / 1000)
+    # Per-pulse onset, corrected for clock drift when possible — see
+    # get_ft_pulse_onsets() for the file_version-gated resolution order.
+    pulse_onsets = get_ft_pulse_onsets(trial, header, sample_rate=sr)
 
     emg       = np.array(trial.trial_data, dtype=float)
     sync_arr  = np.array(getattr(trial, 'sync_data', []), dtype=float)
-    has_sync  = show_sync and len(sync_arr) == len(emg)
+    stim_arr  = np.array(getattr(trial, 'stim_adc_data', []), dtype=float)
+
+    # Extra channel rows below the main EMG plot — 0, 1, or 2 of them, each
+    # (label, full-length array, y-axis label).
+    extra_channels = []
+    if show_sync and len(sync_arr) == len(emg):
+        extra_channels.append(('ADC Sync', sync_arr, 'Sync (V)'))
+    if show_stim_adc and len(stim_arr) == len(emg):
+        extra_channels.append(('Stim ADC', stim_arr, 'Stim ADC (V)'))
+    n_extra = len(extra_channels)
 
     pre_samp  = round(pre_pulse_ms  * sr / 1000)
     post_samp = round(post_pulse_ms * sr / 1000)
@@ -2123,31 +2244,36 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
 
     def _extract(arr, k):
         """Extract a window around pulse k from arr; returns None if out of bounds."""
-        onset_k = onset + k * pulse_period_samples
+        if k >= len(pulse_onsets):
+            return None
+        onset_k = int(pulse_onsets[k])
         s, e = onset_k - pre_samp, onset_k + post_samp
         if s < 0 or e > len(arr):
             return None
         return arr[s:e]
 
     # ── Figure layout ─────────────────────────────────────────────────────────
-    use_cbar = (not simplified) and show_legend and legend_style == 'colorbar' and style != 'distinct'
-    fig_h_use = fig_h * (1.45 if has_sync else 1.0)
+    use_cbar = (not simplified) and show_legend and legend_style == 'colorbar'
+    fig_h_use = fig_h * (1.0 + 0.45 * n_extra)
 
-    if has_sync:
+    if n_extra > 0:
+        height_ratios = [3] + [1] * n_extra
         if use_cbar:
             fig = plt.figure(figsize=(fig_w, fig_h_use))
-            gs  = fig.add_gridspec(2, 2, width_ratios=[10, 0.4],
-                                   height_ratios=[3, 1], wspace=0.06, hspace=0.38)
-            ax      = fig.add_subplot(gs[0, 0])
-            cax     = fig.add_subplot(gs[0, 1])
-            sync_ax = fig.add_subplot(gs[1, 0])
+            gs  = fig.add_gridspec(1 + n_extra, 2, width_ratios=[10, 0.4],
+                                   height_ratios=height_ratios, wspace=0.06, hspace=0.38)
+            ax         = fig.add_subplot(gs[0, 0])
+            cax        = fig.add_subplot(gs[0, 1])
+            extra_axes = [fig.add_subplot(gs[i + 1, 0]) for i in range(n_extra)]
         else:
-            fig, (ax, sync_ax) = plt.subplots(
-                2, 1, figsize=(fig_w, fig_h_use),
-                gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.38})
+            fig, axes = plt.subplots(
+                1 + n_extra, 1, figsize=(fig_w, fig_h_use),
+                gridspec_kw={'height_ratios': height_ratios, 'hspace': 0.38})
+            ax         = axes[0]
+            extra_axes = list(axes[1:])
             cax = None
     else:
-        sync_ax = None
+        extra_axes = []
         if use_cbar:
             fig, (ax, cax) = plt.subplots(
                 1, 2, figsize=(fig_w, fig_h),
@@ -2176,6 +2302,29 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
             transform=trans, ha='center', va='top', fontsize=8,
             color='darkgreen', fontweight='bold')
 
+    # ── M/H size (µV), averaged across every pulse in the train ────────────────
+    _pre_mask = t_ms < 0
+    _m_mask   = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+    _h_mask   = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
+    _all_segs = [s for s in (_extract(emg, k) for k in range(n_pulses)) if s is not None]
+    if _all_segs:
+        _stack    = np.abs(np.array([s[:win_len] for s in _all_segs]))
+        _bg_size  = float(np.mean(_stack[:, _pre_mask])) if _pre_mask.any() else 0.0
+        _m_size   = float(np.mean(_stack[:, _m_mask])) - _bg_size if _m_mask.any() else float('nan')
+        _h_size   = float(np.mean(_stack[:, _h_mask])) - _bg_size if _h_mask.any() else float('nan')
+        if not np.isnan(_m_size):
+            ax.text((m_start_ms + m_end_ms) / 2, 0.95,
+                    f'M Size: {_m_size:.1f} µV\n(avg, n={len(_all_segs)})',
+                    transform=trans, color='blue', fontsize=7.5, ha='center', va='top',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='blue', alpha=0.85),
+                    zorder=8)
+        if not np.isnan(_h_size):
+            ax.text((h_start_ms + h_end_ms) / 2, 0.95,
+                    f'H Size: {_h_size:.1f} µV\n(avg, n={len(_all_segs)})',
+                    transform=trans, color='darkgreen', fontsize=7.5, ha='center', va='top',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
+                    zorder=8)
+
     # ─────────────────────────────────────────────────────────────────────────
     # SIMPLIFIED VIEW
     # ─────────────────────────────────────────────────────────────────────────
@@ -2190,16 +2339,16 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
         CLHi = '#b39ddb'   # last-half individuals — light purple
 
         # Extract and plot last-half individuals (background)
-        lh_segs      = [_extract(emg, k) for k in lh_ids]
-        lh_segs      = [s for s in lh_segs if s is not None]
-        lh_sync_segs = [_extract(sync_arr, k) for k in lh_ids] if has_sync else []
-        lh_sync_segs = [s for s in lh_sync_segs if s is not None]
+        lh_segs = [_extract(emg, k) for k in lh_ids]
+        lh_segs = [s for s in lh_segs if s is not None]
+        extra_lh_segs = [[s for s in (_extract(arr_full, k) for k in lh_ids) if s is not None]
+                          for (_, arr_full, _) in extra_channels]
 
         for seg in lh_segs:
             ax.plot(t_ms[:len(seg)], seg, color=CLHi, lw=0.9, alpha=0.22, zorder=2)
-        if sync_ax is not None:
-            for seg in lh_sync_segs:
-                sync_ax.plot(t_ms[:len(seg)], seg, color=CLHi, lw=0.9, alpha=0.22, zorder=2)
+        for eax, segs in zip(extra_axes, extra_lh_segs):
+            for seg in segs:
+                eax.plot(t_ms[:len(seg)], seg, color=CLHi, lw=0.9, alpha=0.22, zorder=2)
 
         # Last-half average
         if lh_segs:
@@ -2207,30 +2356,31 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
             avg_seg  = np.mean(np.array([s[:min_len] for s in lh_segs]), axis=0)
             ax.plot(t_ms[:len(avg_seg)], avg_seg, color=CLH, lw=2.5, alpha=1.0, zorder=5,
                     label=f'Last-half avg  (pulses {half_idx + 1}–{n_pulses})')
-            if sync_ax is not None and lh_sync_segs:
-                min_sl = min(len(s) for s in lh_sync_segs)
-                avg_s  = np.mean(np.array([s[:min_sl] for s in lh_sync_segs]), axis=0)
-                sync_ax.plot(t_ms[:len(avg_s)], avg_s, color=CLH, lw=2.5, alpha=1.0, zorder=5)
+            for eax, segs in zip(extra_axes, extra_lh_segs):
+                if segs:
+                    min_sl = min(len(s) for s in segs)
+                    avg_s  = np.mean(np.array([s[:min_sl] for s in segs]), axis=0)
+                    eax.plot(t_ms[:len(avg_s)], avg_s, color=CLH, lw=2.5, alpha=1.0, zorder=5)
 
         # Pulse N (compare)
         segN = _extract(emg, comp_idx)
         if segN is not None:
             ax.plot(t_ms[:len(segN)], segN, color=CN, lw=2.5, alpha=1.0, zorder=6,
                     label=f'Pulse {comp_idx + 1}')
-        if sync_ax is not None:
-            snN = _extract(sync_arr, comp_idx)
-            if snN is not None:
-                sync_ax.plot(t_ms[:len(snN)], snN, color=CN, lw=2.5, alpha=1.0, zorder=6)
+        for eax, (_, arr_full, _) in zip(extra_axes, extra_channels):
+            eN = _extract(arr_full, comp_idx)
+            if eN is not None:
+                eax.plot(t_ms[:len(eN)], eN, color=CN, lw=2.5, alpha=1.0, zorder=6)
 
         # Pulse 1 (on top)
         seg0 = _extract(emg, 0)
         if seg0 is not None:
             ax.plot(t_ms[:len(seg0)], seg0, color=C1, lw=2.5, alpha=1.0, zorder=7,
                     label='Pulse 1')
-        if sync_ax is not None:
-            sn0 = _extract(sync_arr, 0)
-            if sn0 is not None:
-                sync_ax.plot(t_ms[:len(sn0)], sn0, color=C1, lw=2.5, alpha=1.0, zorder=7)
+        for eax, (_, arr_full, _) in zip(extra_axes, extra_channels):
+            e0 = _extract(arr_full, 0)
+            if e0 is not None:
+                eax.plot(t_ms[:len(e0)], e0, color=C1, lw=2.5, alpha=1.0, zorder=7)
 
         if show_legend:
             ax.legend(loc='upper right', fontsize=8, framealpha=0.75)
@@ -2243,21 +2393,15 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
     # FULL VIEW (all pulses)
     # ─────────────────────────────────────────────────────────────────────────
     else:
-        # Colours by style
-        if style == 'distinct':
-            _cm    = plt.cm.tab20 if n_pulses <= 20 else plt.cm.hsv
-            colors = [_cm(i / max(n_pulses - 1, 1)) for i in range(n_pulses)]
-        else:
-            colors = list(cm.coolwarm(np.linspace(0, 1, max(n_pulses, 2))))
+        # Colours: coolwarm gradient, blue (pulse 1) → red (last pulse).
+        colors = list(cm.coolwarm(np.linspace(0, 1, max(n_pulses, 2))))
 
-        # Per-pulse linewidth and alpha
+        # Per-pulse linewidth and alpha — first and last pulse always drawn a
+        # little bolder/darker than the rest so the ends of the train stand out.
         if zoom_pulse is None:
-            if style == 'bold_ends':
-                lw_arr = [1.2] * n_pulses;  a_arr = [0.65] * n_pulses
-                if n_pulses >= 1: lw_arr[0]  = 3.0;  a_arr[0]  = 1.0
-                if n_pulses >= 2: lw_arr[-1] = 3.0;  a_arr[-1] = 1.0
-            else:
-                lw_arr = [2.0] * n_pulses;  a_arr = [0.92] * n_pulses
+            lw_arr = [1.2] * n_pulses;  a_arr = [0.65] * n_pulses
+            if n_pulses >= 1: lw_arr[0]  = 3.0;  a_arr[0]  = 1.0
+            if n_pulses >= 2: lw_arr[-1] = 3.0;  a_arr[-1] = 1.0
         else:
             lw_arr = [0.8] * n_pulses;  a_arr = [0.15] * n_pulses
             if 0 <= zoom_pulse < n_pulses:
@@ -2270,11 +2414,11 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
                 continue
             ax.plot(t_ms[:len(seg)], seg, color=colors[k],
                     lw=lw_arr[k], alpha=a_arr[k], zorder=n_pulses - k + 3)
-            if sync_ax is not None:
-                sseg = _extract(sync_arr, k)
-                if sseg is not None:
-                    sync_ax.plot(t_ms[:len(sseg)], sseg, color=colors[k],
-                                 lw=lw_arr[k], alpha=a_arr[k], zorder=n_pulses - k + 3)
+            for eax, (_, arr_full, _) in zip(extra_axes, extra_channels):
+                eseg = _extract(arr_full, k)
+                if eseg is not None:
+                    eax.plot(t_ms[:len(eseg)], eseg, color=colors[k],
+                             lw=lw_arr[k], alpha=a_arr[k], zorder=n_pulses - k + 3)
 
         zoom_label = ''
         if zoom_pulse is not None and 0 <= zoom_pulse < n_pulses:
@@ -2314,16 +2458,16 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
 
-    # ── Sync subplot formatting ────────────────────────────────────────────────
-    if sync_ax is not None:
-        _shade(sync_ax)
-        sync_ax.set_xlabel('Time relative to pulse onset (ms)', fontsize=9)
-        sync_ax.set_ylabel('Sync (V)', fontsize=9)
-        sync_ax.set_xlim(-pre_pulse_ms, post_pulse_ms)
-        sync_ax.tick_params(labelsize=8)
-        sync_ax.spines['top'].set_visible(False)
-        sync_ax.spines['right'].set_visible(False)
-        sync_ax.set_title('Sync / Stim channel', fontsize=9)
+    # ── Extra channel subplot formatting ───────────────────────────────────────
+    for eax, (label, _, ylabel) in zip(extra_axes, extra_channels):
+        _shade(eax)
+        eax.set_xlabel('Time relative to pulse onset (ms)', fontsize=9)
+        eax.set_ylabel(ylabel, fontsize=9)
+        eax.set_xlim(-pre_pulse_ms, post_pulse_ms)
+        eax.tick_params(labelsize=8)
+        eax.spines['top'].set_visible(False)
+        eax.spines['right'].set_visible(False)
+        eax.set_title(label, fontsize=9)
 
     plt.tight_layout()
     plt.show()
@@ -2340,7 +2484,7 @@ def plot_ft_peak_curve(trial, header, sample_rate=None,
     """
     import matplotlib.pyplot as plt
 
-    sr       = sample_rate or getattr(header, 'sample_rate', SAMPLE_RATE)
+    sr       = get_ft_sample_rate(trial, header, sample_rate)
     n_pulses = getattr(header, 'n_pulses_per_train', 0)
     if n_pulses == 0:
         n_pulses = len(getattr(trial, 'pulse_h_wave_mra', []))
@@ -2353,16 +2497,18 @@ def plot_ft_peak_curve(trial, header, sample_rate=None,
         print("event_period_us not set.")
         return
 
-    pulse_period_samples = round(period_us / 1e6 * sr)
-    onset = getattr(trial, 'onset_sample_index', -1)
-    if onset < 0:
-        bin_ms = getattr(header, 'bin_duration_ms', BIN_DURATION_MS) or BIN_DURATION_MS
-        onset  = round(bin_ms * sr / 1000)
+    # Per-pulse onset, corrected for clock drift when possible — see
+    # get_ft_pulse_onsets() for the file_version-gated resolution order.
+    pulse_onsets = get_ft_pulse_onsets(trial, header, sample_rate=sr)
 
     emg_abs = np.abs(np.array(trial.trial_data, dtype=float))
     h_peaks, m_peaks = [], []
     for k in range(n_pulses):
-        onset_k = onset + k * pulse_period_samples
+        if k >= len(pulse_onsets):
+            h_peaks.append(0.0)
+            m_peaks.append(0.0)
+            continue
+        onset_k = int(pulse_onsets[k])
         h_s = onset_k + round(h_start_ms * sr / 1000)
         h_e = onset_k + round(h_end_ms   * sr / 1000)
         m_s = onset_k + round(m_start_ms * sr / 1000)
@@ -4871,6 +5017,14 @@ def analyze_global_background(trials, emg_blocks, header,
     trial_max_th = np.array(trial_max_th, dtype=np.float64)
 
     valid_bg = trial_bg_gm[~np.isnan(trial_bg_gm)]
+    if len(valid_bg) == 0:
+        raise ValueError(
+            "analyze_global_background: no trial had a valid pre-stim background "
+            f"reconstruction ({n_bg_failed}/{len(trial_bg_gm)} failed). This usually means "
+            "the recording is too short/sparse for the requested monitoring_window_ms, or "
+            "first_post_trigger_frame_sample_id/onset_sample_index aren't populated for "
+            "this file_version."
+        )
     gm_q1, gm_med, gm_q3 = (float(x) for x in np.percentile(valid_bg, [25, 50, 75]))
 
     print(f"  Trials : {len(trial_bg_gm)}  (failed reconstruction: {n_bg_failed})")
@@ -11876,6 +12030,88 @@ Override by passing ``ft_snap_hz=`` to :func:`load_all_recordings`.
 """
 
 
+def get_ft_sample_rate(trial, header, sample_rate=None) -> float:
+    """Resolve the true acquisition sample rate (Hz) for one FT trial.
+
+    Priority: an explicit *sample_rate* override > ``trial.sample_rate``
+    (file_version >= 5 — per-trial ground truth) > ``header.sample_rate``
+    (already best-effort resolved by :func:`read_hrs_ft`, including the
+    filename-``KHZ`` fallback for older files) > :data:`SAMPLE_RATE`.
+    """
+    if sample_rate:
+        return float(sample_rate)
+    trial_sr = getattr(trial, 'sample_rate', 0.0)
+    if trial_sr and trial_sr > 0:
+        return float(trial_sr)
+    header_sr = getattr(header, 'sample_rate', 0.0)
+    if header_sr and header_sr > 0:
+        return float(header_sr)
+    return SAMPLE_RATE
+
+
+def get_ft_pulse_onsets(trial, header, sample_rate=None) -> np.ndarray:
+    """Return the onset sample index of every pulse in an FT trial's train.
+
+    Resolution order (fixes the clock-drift seen in some Frequency Test
+    recordings when pulse position was assumed to be exactly uniform):
+
+    1. ``trial.pulse_onset_sample_indices`` (file_version >= 4) — ground truth,
+       already corrected by the app against the Stim ADC artifact.
+    2. Stim-ADC threshold-crossing correction — mirrors the app's own
+       detection (``STIM_ONSET_THRESHOLD``, searching ±25% of the nominal
+       inter-pulse period) — used when ``trial.stim_adc_data`` is present and
+       not all-zero.
+    3. Naive uniform spacing (``onset0 + k * period_samples``) — the old
+       assumption, used only as a last resort when Stim ADC isn't available
+       for that trial, since there is then no ground-truth signal to correct
+       against.
+
+    Returns an empty array if the pulse count or inter-pulse period can't be
+    determined at all.
+    """
+    n_pulses = getattr(header, 'n_pulses_per_train', 0) or len(getattr(trial, 'pulse_h_wave_mra', []))
+    if n_pulses <= 0:
+        return np.array([], dtype=np.int64)
+
+    # 1. Ground truth (file_version >= 4)
+    onsets = np.asarray(getattr(trial, 'pulse_onset_sample_indices', []), dtype=np.int64)
+    if len(onsets) == n_pulses:
+        return onsets
+
+    sr = get_ft_sample_rate(trial, header, sample_rate)
+
+    period_us = getattr(trial, 'event_period_us_trial', 0) or getattr(header, 'event_period_us', 0)
+    if period_us <= 0:
+        return np.array([], dtype=np.int64)
+    period_samp = round(period_us / 1e6 * sr)
+
+    onset0 = getattr(trial, 'onset_sample_index', -1)
+    if onset0 is None or onset0 < 0:
+        bin_ms = getattr(header, 'bin_duration_ms', BIN_DURATION_MS) or BIN_DURATION_MS
+        onset0 = round(bin_ms * sr / 1000)
+
+    n_trial  = len(getattr(trial, 'trial_data', []))
+    stim_adc = np.asarray(getattr(trial, 'stim_adc_data', []), dtype=float)
+    has_stim_adc = len(stim_adc) == n_trial and n_trial > 0 and np.any(stim_adc != 0.0)
+
+    # 2. Stim-ADC threshold correction, falling back to 3. (naive) per pulse
+    #    when the corrected onset can't be found (e.g. no ADC signal, or the
+    #    search window falls outside the recorded data).
+    radius = max(1, round(0.25 * period_samp))
+    result = np.empty(n_pulses, dtype=np.int64)
+    for k in range(n_pulses):
+        expected_k = onset0 + k * period_samp
+        detected_k = expected_k
+        if has_stim_adc and 0 <= expected_k < n_trial:
+            lo, hi = max(0, expected_k - radius), min(n_trial, expected_k + radius)
+            window = stim_adc[lo:hi]
+            above = np.where(window >= STIM_ONSET_THRESHOLD)[0]
+            if len(above) > 0:
+                detected_k = lo + int(above[0])
+        result[k] = detected_k
+    return result
+
+
 def ft_snap_hz(hz: float, snap_list=None) -> float:
     """Snap *hz* to the nearest entry in *snap_list* (default :data:`FT_SNAP_HZ`).
 
@@ -12095,8 +12331,55 @@ def load_all_recordings(recording_dirs, ft_snap_hz_list=None, verbose: bool = Tr
         }
         if verbose:
             print(f'   App V{_rav}  |  Stages: {list(_r_sm.keys())}  |  SR: {_r_detect_sr} Hz')
+            _n_settings = sum(1 for (_t, _h, _e, _l) in _r_sm.values() if getattr(_h, 'settings', None))
+            if _n_settings:
+                print(f'   Settings sidecars: {_n_settings}/{len(_r_sm)} stage(s)')
 
     return all_recordings
+
+
+def build_settings_dataframe(all_recordings: dict):
+    """Flatten every stage's app-settings sidecar into one per-(recording, stage) row.
+
+    Each row identifies the recording/stage plus general header metadata
+    (subject, session start, app/file version, sample rate, trial count),
+    followed by every key found in that stage's "*.settings.json" sidecar
+    (see :func:`_load_settings_json`), with the leading underscore the app
+    writes on each key name stripped for readability. Stages with no sidecar
+    still get a row — their settings columns are simply NaN — so this can be
+    pickled alongside ``xr_df`` / ``xr_summary`` as a record of exactly what
+    stimulation parameters produced that data.
+
+    Parameters
+    ----------
+    all_recordings:
+        Dict returned by :func:`load_all_recordings`.
+
+    Returns
+    -------
+    pandas.DataFrame
+    """
+    import pandas as pd
+
+    rows = []
+    for _rec_lbl, _rec in all_recordings.items():
+        for _sk, (_trials, _hdr, _emg_bl, _slbl) in _rec.get('stage_map', {}).items():
+            _row = {
+                'recording':       _rec_lbl,
+                'stage':           _slbl,
+                'stage_key':       _sk,
+                'subject_id':      getattr(_hdr, 'subject_id', ''),
+                'session_start':   getattr(_hdr, 'session_start_time', None),
+                'app_version':     getattr(_hdr, 'app_version', ''),
+                'file_version':    getattr(_hdr, 'file_version', None),
+                'sample_rate_hz':  getattr(_hdr, 'sample_rate', None),
+                'n_trials':        len(_trials) if _trials else 0,
+            }
+            for _k, _v in (getattr(_hdr, 'settings', None) or {}).items():
+                _row[_k.lstrip('_')] = _v
+            rows.append(_row)
+
+    return pd.DataFrame(rows)
 
 
 def make_ft_viewer(all_recordings: dict,
@@ -12141,7 +12424,7 @@ def make_ft_viewer(all_recordings: dict,
         'rec_list':      list(_ft_recs),
         'amp_filter':    None,
         'filtered':      [],
-        'style':         'gradient',
+        'pol_filter':    None,   # 0 = normal, 1 = reversed, None = single-polarity session
         'show_legend':   True,
         'legend_style':  'colorbar',
         'y_auto':        True,
@@ -12154,6 +12437,7 @@ def make_ft_viewer(all_recordings: dict,
         'simplified':    False,
         'compare_pulse': 2,      # 0-based; default = 3rd pulse
         'show_sync':     False,
+        'show_stim_adc': False,
     }
 
     # ── Widgets ────────────────────────────────────────────────────────────────
@@ -12169,10 +12453,11 @@ def make_ft_viewer(all_recordings: dict,
                               description='Amp:', layout={'width': '180px'})
     _ft_freq_drop  = Dropdown(options=[('All Hz', None)], value=None,
                               description='Freq:', layout={'width': '160px'})
-    _ft_style_tb = ToggleButtons(
-        options=[('Gradient', 'gradient'), ('Bold Ends', 'bold_ends'), ('Distinct', 'distinct')],
-        value='gradient', description='Style:', style={'button_width': '110px'}
+    _ft_pol_tog = ToggleButtons(
+        options=[('Normal (0)', 0), ('Reversed (1)', 1)],
+        value=0, description='Polarity:', button_style='info',
     )
+    _ft_pol_row = HBox([_ft_pol_tog])
     _ft_legend_chk   = Checkbox(value=True, description='Show Legend', indent=False)
     _ft_legend_style = ToggleButtons(
         options=[('Colorbar', 'colorbar'), ('Labeled', 'labeled')],
@@ -12201,18 +12486,29 @@ def make_ft_viewer(all_recordings: dict,
         disabled=True,
     )
     _ft_show_sync_chk   = Checkbox(value=False, description='Show Sync', indent=False)
+    _ft_show_stim_adc_chk = Checkbox(value=False, description='Show Stim ADC', indent=False)
     _ft_wave_out = Output()
     _ft_mra_out  = Output()
     _ft_peak_out = Output()
 
     # ── Context helpers ────────────────────────────────────────────────────────
+    def _ft_available_polarities():
+        rl   = _ft_rec_d.value
+        ft_t = all_recordings[rl].get('ft_trials', []) or []
+        return sorted({int(getattr(t, 'stim_polarity_reversed', 0)) for t in ft_t})
+
     def _ft_get_ctx():
         rl      = _ft_rec_d.value
         rec     = all_recordings[rl]
         ft_t    = rec.get('ft_trials', []) or []
         ft_h    = rec.get('ft_header')
+        pf      = _ft_st['pol_filter']
+        if pf is not None:
+            ft_t_pol = [t for t in ft_t if int(getattr(t, 'stim_polarity_reversed', 0)) == pf]
+            if ft_t_pol:
+                ft_t = ft_t_pol
         hz_list = rec.get('ft_trial_hz', [])
-        hz_map  = {id(t): hz for t, hz in zip(ft_t, hz_list)}
+        hz_map  = {id(t): hz for t, hz in zip(rec.get('ft_trials', []) or [], hz_list)}
         sr      = rec.get('sample_rate') or getattr(ft_h, 'sample_rate', None)
         return ft_t, ft_h, sr, hz_map
 
@@ -12280,6 +12576,19 @@ def make_ft_viewer(all_recordings: dict,
             filt.append(t)
         _ft_st['filtered'] = filt if filt else list(ft_t)
 
+    def _ft_update_pol_tog():
+        pols = _ft_available_polarities()
+        dual = len(pols) > 1
+        _ft_pol_row.layout.display = '' if dual else 'none'
+        if pols:
+            if _ft_st['pol_filter'] not in pols:
+                _ft_st['pol_filter'] = pols[0]
+            _ft_st['updating'] = True
+            _ft_pol_tog.value = _ft_st['pol_filter']
+            _ft_st['updating'] = False
+        else:
+            _ft_st['pol_filter'] = None
+
     # ── Render ─────────────────────────────────────────────────────────────────
     def _ft_render_wave():
         if not _ft_st['filtered']:
@@ -12308,7 +12617,6 @@ def make_ft_viewer(all_recordings: dict,
                 h_start_ms=h_start_ms, h_end_ms=h_end_ms,
                 sample_rate=sr,
                 zoom_pulse=_ft_st['zoom_pulse'],
-                style=_ft_st['style'],
                 show_legend=_ft_st['show_legend'],
                 legend_style=_ft_st['legend_style'],
                 y_min=None if _ft_st['y_auto'] else _ft_st['y_min'],
@@ -12318,6 +12626,7 @@ def make_ft_viewer(all_recordings: dict,
                 simplified=_ft_st['simplified'],
                 compare_pulse=_ft_st['compare_pulse'],
                 show_sync=_ft_st['show_sync'],
+                show_stim_adc=_ft_st['show_stim_adc'],
             )
 
     def _ft_render_curves():
@@ -12394,6 +12703,7 @@ def make_ft_viewer(all_recordings: dict,
     def _ft_init_controls():
         _ft_st['idx']        = 0
         _ft_st['zoom_pulse'] = None
+        _ft_update_pol_tog()
         _ft_rebuild_filtered()
         _ft_update_trial_drop()
         _ft_update_amp_drop()
@@ -12450,13 +12760,16 @@ def make_ft_viewer(all_recordings: dict,
         _ft_update_trial_drop()
         _ft_render_all()
 
-    def _ft_on_style(c):
-        _ft_st['style'] = c['new']
-        if c['new'] == 'distinct' and _ft_st['legend_style'] == 'colorbar':
-            _ft_st['legend_style'] = 'labeled'
-            _ft_st['updating'] = True
-            _ft_legend_style.value = 'labeled'
-            _ft_st['updating'] = False
+    def _ft_on_pol(c):
+        if _ft_st['updating']:
+            return
+        _ft_st['pol_filter'] = c['new']
+        _ft_st['amp_filter'] = None
+        _ft_init_controls()
+        _ft_render_all()
+
+    def _ft_on_show_stim_adc(c):
+        _ft_st['show_stim_adc'] = c['new']
         _ft_render_wave()
 
     def _ft_on_legend_chk(c):
@@ -12521,8 +12834,7 @@ def make_ft_viewer(all_recordings: dict,
         if _ft_st['updating']:
             return
         _ft_st['simplified'] = c['new']
-        # Disable style/zoom controls that don't apply in simplified mode
-        _ft_style_tb.disabled      = c['new']
+        # Disable zoom controls that don't apply in simplified mode
         _ft_legend_style.disabled  = c['new']
         _ft_pulse_drop.disabled    = c['new']
         _ft_back_btn.disabled      = c['new'] or True
@@ -12541,11 +12853,11 @@ def make_ft_viewer(all_recordings: dict,
 
     _ft_freq_drop.observe(_ft_on_freq,              names='value')
     _ft_rec_d.observe(_ft_on_rec,                   names='value')
+    _ft_pol_tog.observe(_ft_on_pol,                 names='value')
     _ft_prev_btn.on_click(_ft_on_prev)
     _ft_next_btn.on_click(_ft_on_next)
     _ft_trial_drop.observe(_ft_on_trial,            names='value')
     _ft_amp_drop.observe(_ft_on_amp,                names='value')
-    _ft_style_tb.observe(_ft_on_style,              names='value')
     _ft_legend_chk.observe(_ft_on_legend_chk,       names='value')
     _ft_legend_style.observe(_ft_on_legend_style,   names='value')
     _ft_pulse_drop.observe(_ft_on_pulse,            names='value')
@@ -12560,6 +12872,7 @@ def make_ft_viewer(all_recordings: dict,
     _ft_simplified_chk.observe(_ft_on_simplified,  names='value')
     _ft_compare_txt.observe(_ft_on_compare,         names='value')
     _ft_show_sync_chk.observe(_ft_on_show_sync,     names='value')
+    _ft_show_stim_adc_chk.observe(_ft_on_show_stim_adc, names='value')
 
     _ft_update_freq_drop()
     _ft_init_controls()
@@ -12567,12 +12880,13 @@ def make_ft_viewer(all_recordings: dict,
 
     return VBox([
         _ft_rec_d,
+        _ft_pol_row,
         HBox([_ft_prev_btn, _ft_next_btn, _ft_trial_drop, _ft_amp_drop, _ft_freq_drop]),
-        HBox([_ft_style_tb, _ft_legend_chk, _ft_legend_style]),
+        HBox([_ft_legend_chk, _ft_legend_style]),
         HBox([_ft_pulse_drop, _ft_back_btn]),
         HBox([_ft_yauto_chk, _ft_ymin_txt, _ft_ymax_txt,
               _ft_figw_txt, _ft_figh_txt, _ft_prems_txt, _ft_postms_txt]),
-        HBox([_ft_simplified_chk, _ft_compare_txt, _ft_show_sync_chk]),
+        HBox([_ft_simplified_chk, _ft_compare_txt, _ft_show_sync_chk, _ft_show_stim_adc_chk]),
         _ft_wave_out,
         _ft_mra_out,
         _ft_peak_out,
@@ -12840,6 +13154,651 @@ def make_ft_sync_viewer(all_recordings: dict,
         _rec_d,
         HBox([_prev_btn, _next_btn, _trial_drop, _amp_drop, _freq_drop]),
         HBox([_thresh_txt, _search_txt, _prems_txt, _postms_txt, _figw_txt]),
+        _out,
+    ])
+
+
+def plot_ft_trial_average(trials, header,
+                          window_start=0,
+                          n_trials=None,
+                          pre_pulse_ms=2.0, post_pulse_ms=20.0,
+                          m_start_ms=2.0, m_end_ms=4.5,
+                          h_start_ms=5.0, h_end_ms=9.0,
+                          sample_rate=None,
+                          show_individual=True,
+                          show_stim_adc=False,
+                          fig_w=11.0, fig_h=5.0,
+                          y_min=None, y_max=None,
+                          title_suffix=''):
+    """Cross-trial pulse-position averaging for Frequency Test data.
+
+    For each pulse position k in [0, n_pulses), compute the mean EMG waveform
+    across all N selected trials at that position.  The result has the same
+    structure as a single trial's pulse train, but each pulse trace is an average
+    across trials rather than a single observation.
+
+    - Bold coloured traces (coolwarm, blue=pulse 1 → red=last): cross-trial mean
+      at each pulse position.
+    - Faint same-coloured traces (show_individual=True): each individual trial's
+      contribution at that pulse position — lets you see trial-to-trial variability.
+
+    Parameters
+    ----------
+    trials : list[FrequencyTestTrial]
+        Pre-filtered trials (same frequency, same amplitude).
+    header : MhRecHeader
+        FT header — used for fallback ``event_period_us`` and ``n_pulses_per_train``.
+    window_start : int
+        Index of the first trial in the averaging window.
+    n_trials : int or None
+        Number of trials to include.  ``None`` = all from *window_start*.
+    pre_pulse_ms, post_pulse_ms : float
+        Waveform window around each pulse onset (ms).
+    m_start_ms, m_end_ms, h_start_ms, h_end_ms : float
+        M/H wave window markers (ms relative to pulse onset).
+    sample_rate : float or None
+        Overrides header sample rate when given.
+    show_individual : bool
+        When True, draw each trial's raw waveform faintly behind each average.
+    show_stim_adc : bool
+        When True, add a subplot below showing the same cross-trial averaging
+        applied to ``trial.stim_adc_data`` (the stimulator's own pulse output)
+        instead of EMG.
+    fig_w, fig_h : float
+        Figure size (inches).
+    y_min, y_max : float or None
+        Manual y-axis limits.  ``None`` = auto-scale.
+    title_suffix : str
+        Appended to the figure title.
+    """
+    import matplotlib.pyplot as plt
+
+    # ── Window selection ──────────────────────────────────────────────────────
+    end = len(trials) if n_trials is None else min(window_start + n_trials, len(trials))
+    sel = trials[window_start:end]
+    if not sel:
+        print("plot_ft_trial_average: no trials in window.")
+        return
+
+    sr = get_ft_sample_rate(sel[0], header, sample_rate)
+
+    # ── Per-trial extraction params ───────────────────────────────────────────
+    header_period_us = getattr(header, 'event_period_us', 0) or 0
+    header_n_pulses  = getattr(header, 'n_pulses_per_train', 0) or 0
+    hz_label = f'{round(1e6 / header_period_us, 3)} Hz' if header_period_us > 0 else '? Hz'
+
+    def _trial_params(trial):
+        """Return (pulse_onsets, n_pulses) for one trial.
+
+        pulse_onsets is corrected for clock drift when possible — see
+        get_ft_pulse_onsets() for the file_version-gated resolution order.
+        """
+        onsets = get_ft_pulse_onsets(trial, header, sample_rate=sr)
+        n_p = getattr(trial, 'n_pulses_trial', 0) or 0
+        if n_p == 0:
+            n_p = len(getattr(trial, 'pulse_h_wave_mra', [])) or header_n_pulses
+        return onsets, n_p
+
+    # ── Window / sample dims ──────────────────────────────────────────────────
+    pre_samp  = round(pre_pulse_ms  * sr / 1000)
+    post_samp = round(post_pulse_ms * sr / 1000)
+    win_len   = pre_samp + post_samp
+    t_ms      = np.linspace(-pre_pulse_ms, post_pulse_ms, win_len)
+
+    # Min valid pulse count across the window
+    params = [_trial_params(t) for t in sel]
+    valid_n_pulses = [n for _, n in params if n > 0]
+    if not valid_n_pulses:
+        print("plot_ft_trial_average: could not determine pulse count.")
+        return
+    n_pulses = min(valid_n_pulses)
+
+    # ── Extract all pulse windows → (n_trials, n_pulses, win_len) ─────────────
+    arr = np.full((len(sel), n_pulses, win_len), np.nan)
+    stim_arr = np.full((len(sel), n_pulses, win_len), np.nan) if show_stim_adc else None
+    for ti, (trial, (onsets, _)) in enumerate(zip(sel, params)):
+        if len(onsets) == 0:
+            continue
+        emg  = np.array(trial.trial_data, dtype=float)
+        stim = np.array(getattr(trial, 'stim_adc_data', []), dtype=float) if show_stim_adc else None
+        for k in range(min(n_pulses, len(onsets))):
+            s = int(onsets[k]) - pre_samp
+            e = s + win_len
+            if s >= 0 and e <= len(emg):
+                arr[ti, k, :] = emg[s:e]
+            if stim is not None and s >= 0 and e <= len(stim):
+                stim_arr[ti, k, :] = stim[s:e]
+
+    # Cross-trial mean per pulse position
+    with np.errstate(all='ignore'):
+        pulse_means = np.nanmean(arr, axis=0)  # (n_pulses, win_len)
+        stim_pulse_means = np.nanmean(stim_arr, axis=0) if show_stim_adc else None
+
+    # Check at least one pulse position has valid data
+    if np.all(np.isnan(pulse_means)):
+        print("plot_ft_trial_average: no valid pulse windows found.")
+        return
+
+    has_stim_adc = (show_stim_adc and stim_pulse_means is not None
+                     and not np.all(np.isnan(stim_pulse_means)))
+
+    # ── Colours ───────────────────────────────────────────────────────────────
+    cmap   = plt.cm.coolwarm
+    p_norm = max(n_pulses - 1, 1)
+    colors = [cmap(k / p_norm) for k in range(n_pulses)]
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    fig_h_use = fig_h * (1.45 if has_stim_adc else 1.0)
+    if has_stim_adc:
+        fig, (ax, stim_ax) = plt.subplots(
+            2, 1, figsize=(fig_w, fig_h_use),
+            gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.38})
+    else:
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        stim_ax = None
+
+    # M/H shading (shared helper — applied to both the main and Stim ADC axes)
+    def _shade(a):
+        a.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.09, zorder=1)
+        a.axvline(m_start_ms, color='blue',  ls='--', lw=0.9, alpha=0.7, zorder=2)
+        a.axvline(m_end_ms,   color='blue',  ls='--', lw=0.9, alpha=0.7, zorder=2)
+        a.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.09, zorder=1)
+        a.axvline(h_start_ms, color='green', ls='--', lw=0.9, alpha=0.7, zorder=2)
+        a.axvline(h_end_ms,   color='green', ls='--', lw=0.9, alpha=0.7, zorder=2)
+        a.axvline(0, color='#aaa', lw=0.8, ls=':', zorder=1)
+
+    _shade(ax)
+
+    trans = ax.get_xaxis_transform()
+    ax.text((m_start_ms + m_end_ms) / 2, -0.01, 'M-wave',
+            transform=trans, ha='center', va='top', fontsize=8,
+            color='blue', fontweight='bold')
+    ax.text((h_start_ms + h_end_ms) / 2, -0.01, 'H-wave',
+            transform=trans, ha='center', va='top', fontsize=8,
+            color='darkgreen', fontweight='bold')
+
+    # ── M/H size (µV), averaged across every displayed pulse position ─────────
+    _pre_mask  = t_ms < 0
+    _m_mask    = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+    _h_mask    = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
+    _valid_k   = ~np.all(np.isnan(pulse_means), axis=1)
+    if _valid_k.any():
+        _abs_means = np.abs(pulse_means[_valid_k])
+        with np.errstate(all='ignore'):
+            _bg_size = float(np.nanmean(_abs_means[:, _pre_mask])) if _pre_mask.any() else 0.0
+            _m_size  = float(np.nanmean(_abs_means[:, _m_mask])) - _bg_size if _m_mask.any() else float('nan')
+            _h_size  = float(np.nanmean(_abs_means[:, _h_mask])) - _bg_size if _h_mask.any() else float('nan')
+        _n_valid = int(_valid_k.sum())
+        if not np.isnan(_m_size):
+            ax.text((m_start_ms + m_end_ms) / 2, 0.95,
+                    f'M Size: {_m_size:.1f} µV\n(avg, n={_n_valid} pulses)',
+                    transform=trans, color='blue', fontsize=7.5, ha='center', va='top',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='blue', alpha=0.85),
+                    zorder=8)
+        if not np.isnan(_h_size):
+            ax.text((h_start_ms + h_end_ms) / 2, 0.95,
+                    f'H Size: {_h_size:.1f} µV\n(avg, n={_n_valid} pulses)',
+                    transform=trans, color='darkgreen', fontsize=7.5, ha='center', va='top',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
+                    zorder=8)
+
+    # Per-pulse z-order — pulse 1 drawn in front, later pulses pushed toward the
+    # back, so pulse 1 stays visible on top of the rest of the train regardless
+    # of plotting order.
+    ind_zorder = [2 + (n_pulses - k) for k in range(n_pulses)]
+    avg_zorder = [(n_pulses + 4) + (n_pulses - k) for k in range(n_pulses)]
+
+    # Individual trial contributions per pulse position (faint)
+    if show_individual:
+        for ti in range(len(sel)):
+            for k in range(n_pulses):
+                if not np.all(np.isnan(arr[ti, k])):
+                    ax.plot(t_ms, arr[ti, k],
+                            color=colors[k], alpha=0.18, lw=0.75, zorder=ind_zorder[k])
+                if stim_ax is not None and not np.all(np.isnan(stim_arr[ti, k])):
+                    stim_ax.plot(t_ms, stim_arr[ti, k],
+                                 color=colors[k], alpha=0.18, lw=0.75, zorder=ind_zorder[k])
+
+    # Cross-trial averages per pulse position (bold, coloured)
+    for k in range(n_pulses):
+        if not np.all(np.isnan(pulse_means[k])):
+            ax.plot(t_ms, pulse_means[k],
+                    color=colors[k], lw=2.2, alpha=0.95, zorder=avg_zorder[k])
+        if stim_ax is not None and not np.all(np.isnan(stim_pulse_means[k])):
+            stim_ax.plot(t_ms, stim_pulse_means[k],
+                         color=colors[k], lw=2.2, alpha=0.95, zorder=avg_zorder[k])
+
+    # Colorbar — pulse position
+    if n_pulses > 1:
+        sm = plt.cm.ScalarMappable(cmap='coolwarm',
+                                   norm=plt.Normalize(vmin=1, vmax=n_pulses))
+        sm.set_array([])
+        cb = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.018, aspect=30)
+        cb.set_label('Pulse #', fontsize=9)
+        cb.set_ticks([1, n_pulses])
+        cb.set_ticklabels(['1', str(n_pulses)])
+
+    n_used = len(sel)
+    ax.set_xlabel('Time from pulse onset (ms)', fontsize=11)
+    ax.set_ylabel('EMG (µV)', fontsize=11)
+    if y_min is not None and y_max is not None:
+        ax.set_ylim(y_min, y_max)
+    ax.grid(axis='y', alpha=0.25, ls='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    if stim_ax is not None:
+        _shade(stim_ax)
+        stim_ax.set_xlabel('Time from pulse onset (ms)', fontsize=9)
+        stim_ax.set_ylabel('Stim ADC (V)', fontsize=9)
+        stim_ax.tick_params(labelsize=8)
+        stim_ax.spines['top'].set_visible(False)
+        stim_ax.spines['right'].set_visible(False)
+        stim_ax.set_title('Stim ADC', fontsize=9)
+
+    title = (f'Trial Average  ·  {hz_label}  ·  {n_pulses} pulses/train  ·  '
+             f'Trials {window_start + 1}–{window_start + n_used}  (n={n_used})')
+    if title_suffix:
+        title += f'  ·  {title_suffix}'
+    ax.set_title(title, fontsize=11)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def make_ft_avg_viewer(all_recordings: dict,
+                       post_plot_ms: float = 15.0,
+                       m_start_ms: float = 2.0,
+                       m_end_ms:   float = 4.5,
+                       h_start_ms: float = 5.0,
+                       h_end_ms:   float = 9.0):
+    """Interactive trial-averaging viewer for Frequency Test pulse trains.
+
+    Mirrors Open Ephys's LFP-viewer trial-averaging mode: each incoming trial
+    updates a running average.  Individual trial-averages are shown as faint
+    coolwarm traces; the grand average across all accumulated trials is drawn
+    bold in black.
+
+    Controls
+    --------
+    Recording / Freq / Amp dropdowns
+        Same filtering as :func:`make_ft_viewer`.
+    N trials
+        Size of the averaging window (how many trials to include).
+    ◀ / ▶ buttons
+        Slide the window backwards/forwards by one trial.
+    ◀◀ / ▶▶ buttons
+        Jump the window to the start / end of the filtered list.
+    Reset
+        Return the window to trial 1.
+    Pre / Post ms, Fig W / H, Y-axis controls
+        Same as :func:`make_ft_viewer`.
+    """
+    import copy as _copy
+    from ipywidgets import (Dropdown, ToggleButtons, Button, Checkbox, FloatText, IntText,
+                            Output, HBox, VBox, Label)
+
+    _ft_recs = [rl for rl in all_recordings
+                if all_recordings[rl].get('ft_trials') or all_recordings[rl].get('ft_files')]
+    if not _ft_recs:
+        return Label("No Frequency Test data loaded (.hrft not found in any recording directory).")
+
+    # ── State ──────────────────────────────────────────────────────────────────
+    _st = {
+        'updating':       False,
+        'freq_filter':    None,
+        'rec_list':       list(_ft_recs),
+        'amp_filter':     None,
+        'pol_filter':     None,   # 0 = normal, 1 = reversed, None = single-polarity session
+        'filtered':       [],
+        'window_start':   0,
+        'n_trials':       5,
+        'show_individual': True,
+        'show_stim_adc':  False,
+        'pre_ms':         2.0,
+        'post_ms':        float(post_plot_ms),
+        'y_auto':         True,
+        'y_min':         -500.0,
+        'y_max':          500.0,
+        'fig_w':          11.0,
+        'fig_h':           5.0,
+    }
+
+    # ── Widgets ────────────────────────────────────────────────────────────────
+    _rec_d     = Dropdown(options=_ft_recs, value=_ft_recs[0],
+                          description='Recording:', layout={'width': '620px'})
+    _pol_tog = ToggleButtons(
+        options=[('Normal (0)', 0), ('Reversed (1)', 1)],
+        value=0, description='Polarity:', button_style='info',
+    )
+    _pol_row = HBox([_pol_tog])
+    _freq_drop = Dropdown(options=[('All Hz', None)], value=None,
+                          description='Freq:', layout={'width': '160px'})
+    _amp_drop  = Dropdown(options=[('All', None)], value=None,
+                          description='Amp:', layout={'width': '180px'})
+
+    _rewind_btn = Button(description='◀◀', button_style='',     layout={'width': '50px'})
+    _prev_btn   = Button(description='◀',  button_style='',     layout={'width': '46px'})
+    _next_btn   = Button(description='▶',  button_style='primary', layout={'width': '46px'})
+    _fwd_btn    = Button(description='▶▶', button_style='primary', layout={'width': '50px'})
+    _reset_btn  = Button(description='Reset', button_style='warning', layout={'width': '80px'})
+    _window_lbl = Label(value='Trials 1–5 of ?')
+
+    _n_txt     = IntText(value=5,   description='N trials:',
+                         layout={'width': '145px'})
+    _prems_txt = FloatText(value=2.0,               description='Pre ms:',
+                           step=0.5, layout={'width': '148px'})
+    _postms_txt= FloatText(value=float(post_plot_ms), description='Post ms:',
+                           step=1.0, layout={'width': '158px'})
+    _figw_txt  = FloatText(value=11.0, description='Fig W:', step=0.5,
+                           layout={'width': '145px'})
+    _figh_txt  = FloatText(value=5.0,  description='Fig H:', step=0.5,
+                           layout={'width': '145px'})
+    _yauto_chk   = Checkbox(value=True,  description='Auto Y',          indent=False)
+    _show_ind_chk = Checkbox(value=True, description='Show individual', indent=False)
+    _show_stim_adc_chk = Checkbox(value=False, description='Show Stim ADC', indent=False)
+    _ymin_txt  = FloatText(value=-500.0, description='Y min:', step=50,
+                           layout={'width': '165px'}, disabled=True)
+    _ymax_txt  = FloatText(value=500.0,  description='Y max:', step=50,
+                           layout={'width': '165px'}, disabled=True)
+
+    _out = Output()
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+    def _available_polarities():
+        rl   = _rec_d.value
+        ft_t = all_recordings[rl].get('ft_trials', []) or []
+        return sorted({int(getattr(t, 'stim_polarity_reversed', 0)) for t in ft_t})
+
+    def _get_ctx():
+        rl      = _rec_d.value
+        rec     = all_recordings[rl]
+        ft_t    = rec.get('ft_trials', []) or []
+        ft_h    = rec.get('ft_header')
+        pf      = _st['pol_filter']
+        if pf is not None:
+            ft_t_pol = [t for t in ft_t if int(getattr(t, 'stim_polarity_reversed', 0)) == pf]
+            if ft_t_pol:
+                ft_t = ft_t_pol
+        hz_list = rec.get('ft_trial_hz', [])
+        hz_map  = {id(t): hz for t, hz in zip(rec.get('ft_trials', []) or [], hz_list)}
+        sr      = rec.get('sample_rate') or getattr(ft_h, 'sample_rate', None)
+        return ft_t, ft_h, sr, hz_map
+
+    def _corrected_header(trial, ft_h, sr):
+        n_p = len(getattr(trial, 'pulse_h_wave_mra', []))
+        if n_p <= 1:
+            return ft_h
+        header_period_us = getattr(ft_h, 'event_period_us', 0) or 0
+        sr_use = sr or 10000.0
+        if header_period_us > 0:
+            period_samp = header_period_us * sr_use / 1e6
+            onset = max(0, getattr(trial, 'onset_sample_index', 0))
+            if onset + (n_p - 1) * period_samp <= len(trial.trial_data) * 1.05:
+                return ft_h
+        tot   = len(getattr(trial, 'trial_data', []))
+        onset = max(0, getattr(trial, 'onset_sample_index', 0))
+        if tot <= onset:
+            return ft_h
+        period_samp    = (tot - onset) / n_p
+        hz_raw         = sr_use / period_samp if period_samp > 0 else 0.0
+        hz_snapped     = ft_snap_hz(hz_raw)
+        period_snapped = sr_use / hz_snapped if hz_snapped > 0 else period_samp
+        corrected_us   = max(1, int(period_snapped / sr_use * 1e6))
+        ft_h_copy = _copy.copy(ft_h)
+        ft_h_copy.event_period_us = corrected_us
+        return ft_h_copy
+
+    def _compute_freqs(rl):
+        hz_list = all_recordings[rl].get('ft_trial_hz', [])
+        if hz_list:
+            return set(hz_list)
+        ft_h = all_recordings[rl].get('ft_header')
+        if ft_h and getattr(ft_h, 'event_period_us', 0):
+            return {ft_snap_hz(1e6 / ft_h.event_period_us)}
+        return set()
+
+    def _rebuild_rec_list():
+        ff = _st['freq_filter']
+        if ff is None:
+            _st['rec_list'] = list(_ft_recs)
+        else:
+            matched = [rl for rl in _ft_recs if ff in _compute_freqs(rl)]
+            _st['rec_list'] = matched if matched else list(_ft_recs)
+
+    def _rebuild_filtered():
+        ft_t, ft_h, sr, hz_map = _get_ctx()
+        af, ff = _st['amp_filter'], _st['freq_filter']
+        filt = []
+        for t in ft_t:
+            if af is not None:
+                if abs(getattr(t, 'stimulation_amplitude_ma', 0.0) - af) >= 0.0015:
+                    continue
+            if ff is not None:
+                if hz_map.get(id(t), compute_ft_trial_hz(t, ft_h, sr)) != ff:
+                    continue
+            filt.append(t)
+        _st['filtered'] = filt if filt else list(ft_t)
+
+    def _clamp_window():
+        n = len(_st['filtered'])
+        _st['window_start'] = max(0, min(_st['window_start'], max(0, n - 1)))
+
+    def _update_label():
+        n   = len(_st['filtered'])
+        ws  = _st['window_start']
+        nt  = _st['n_trials']
+        end = min(ws + nt, n)
+        _window_lbl.value = f'Trials {ws + 1}–{end} of {n}'
+        _rewind_btn.disabled = (ws == 0)
+        _prev_btn.disabled   = (ws == 0)
+        _next_btn.disabled   = (ws + nt >= n)
+        _fwd_btn.disabled    = (ws + nt >= n)
+
+    # ── Render ─────────────────────────────────────────────────────────────────
+    def _render():
+        if not _st['filtered']:
+            return
+        _, ft_h, sr, _ = _get_ctx()
+        if ft_h is None:
+            return
+        # Pick the first trial in the window to build a corrected header
+        ws   = _st['window_start']
+        nt   = _st['n_trials']
+        sel  = _st['filtered'][ws:ws + nt]
+        if not sel:
+            return
+        ft_h_use = _corrected_header(sel[0], ft_h, sr)
+        hz_raw   = getattr(ft_h_use, 'event_period_us', 0)
+        hz       = round(1e6 / hz_raw, 3) if hz_raw else '?'
+        rec_lbl  = _rec_d.value
+        amp_info = (f'{_st["amp_filter"]:.3f} mA'
+                    if _st['amp_filter'] is not None else 'All amps')
+        _update_label()
+        with _out:
+            _out.clear_output(wait=True)
+            print(f'Trial Average  |  {hz} Hz  |  {amp_info}  '
+                  f'|  Trials {ws + 1}–{min(ws + nt, len(_st["filtered"]))} '
+                  f'of {len(_st["filtered"])}  [{rec_lbl}]')
+            plot_ft_trial_average(
+                _st['filtered'], ft_h_use,
+                window_start=ws,
+                n_trials=nt,
+                pre_pulse_ms=_st['pre_ms'],
+                post_pulse_ms=_st['post_ms'],
+                m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+                h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+                sample_rate=sr,
+                show_individual=_st['show_individual'],
+                fig_w=_st['fig_w'],
+                fig_h=_st['fig_h'],
+                y_min=None if _st['y_auto'] else _st['y_min'],
+                y_max=None if _st['y_auto'] else _st['y_max'],
+                show_stim_adc=_st['show_stim_adc'],
+                title_suffix=rec_lbl,
+            )
+
+    # ── Nav helpers ────────────────────────────────────────────────────────────
+    def _update_amp_drop():
+        ft_t, _, _, _ = _get_ctx()
+        amps = sorted({float(getattr(t, 'stimulation_amplitude_ma', 0.0)) for t in ft_t})
+        _st['updating'] = True
+        _amp_drop.options = [('All', None)] + [(f'{a:.3f} mA', a) for a in amps]
+        _amp_drop.value   = _st['amp_filter']
+        _st['updating'] = False
+
+    def _update_freq_drop():
+        freqs = sorted({hz for rl in _ft_recs for hz in _compute_freqs(rl)})
+        _st['updating'] = True
+        _freq_drop.options = [('All Hz', None)] + [(f'{f} Hz', f) for f in freqs]
+        _freq_drop.value   = _st['freq_filter']
+        _st['updating'] = False
+
+    def _update_rec_drop():
+        opts = _st['rec_list'] if _st['rec_list'] else list(_ft_recs)
+        _st['updating'] = True
+        _rec_d.options = opts
+        if _rec_d.value not in opts:
+            _rec_d.value = opts[0]
+        _st['updating'] = False
+
+    def _update_pol_tog():
+        pols = _available_polarities()
+        dual = len(pols) > 1
+        _pol_row.layout.display = '' if dual else 'none'
+        if pols:
+            if _st['pol_filter'] not in pols:
+                _st['pol_filter'] = pols[0]
+            _st['updating'] = True
+            _pol_tog.value = _st['pol_filter']
+            _st['updating'] = False
+        else:
+            _st['pol_filter'] = None
+
+    def _init_controls():
+        _st['window_start'] = 0
+        _update_pol_tog()
+        _rebuild_filtered()
+        _update_amp_drop()
+
+    # ── Observers ──────────────────────────────────────────────────────────────
+    def _on_freq(c):
+        if _st['updating']: return
+        _st['freq_filter'] = c['new']
+        _st['amp_filter']  = None
+        _rebuild_rec_list()
+        _update_rec_drop()
+        _init_controls()
+        _render()
+
+    def _on_rec(c):
+        if _st['updating']: return
+        _st['amp_filter'] = None
+        _init_controls()
+        _render()
+
+    def _on_pol(c):
+        if _st['updating']: return
+        _st['pol_filter'] = c['new']
+        _st['amp_filter'] = None
+        _init_controls()
+        _render()
+
+    def _on_show_stim_adc(c):
+        _st['show_stim_adc'] = c['new']
+        _render()
+
+    def _on_amp(c):
+        if _st['updating']: return
+        _st['amp_filter'] = c['new']
+        _st['window_start'] = 0
+        _rebuild_filtered()
+        _render()
+
+    def _on_n(c):
+        _st['n_trials'] = max(1, c['new'])
+        _clamp_window()
+        _render()
+
+    def _on_prev(b):
+        if _st['window_start'] > 0:
+            _st['window_start'] -= 1
+            _render()
+
+    def _on_next(b):
+        n = len(_st['filtered'])
+        if _st['window_start'] + _st['n_trials'] < n:
+            _st['window_start'] += 1
+            _render()
+
+    def _on_rewind(b):
+        _st['window_start'] = 0
+        _render()
+
+    def _on_fwd(b):
+        n = len(_st['filtered'])
+        _st['window_start'] = max(0, n - _st['n_trials'])
+        _render()
+
+    def _on_reset(b):
+        _st['window_start'] = 0
+        _render()
+
+    def _on_prems(c):   _st['pre_ms']  = c['new']; _render()
+    def _on_postms(c):  _st['post_ms'] = c['new']; _render()
+    def _on_figw(c):    _st['fig_w']   = c['new']; _render()
+    def _on_figh(c):    _st['fig_h']   = c['new']; _render()
+
+    def _on_yauto(c):
+        _st['y_auto'] = c['new']
+        _ymin_txt.disabled = c['new']
+        _ymax_txt.disabled = c['new']
+        _render()
+
+    def _on_ymin(c):
+        _st['y_min'] = c['new']
+        if not _st['y_auto']: _render()
+
+    def _on_ymax(c):
+        _st['y_max'] = c['new']
+        if not _st['y_auto']: _render()
+
+    def _on_show_ind(c):
+        _st['show_individual'] = c['new']
+        _render()
+
+    _freq_drop.observe(_on_freq,     names='value')
+    _rec_d.observe(_on_rec,          names='value')
+    _pol_tog.observe(_on_pol,        names='value')
+    _amp_drop.observe(_on_amp,       names='value')
+    _n_txt.observe(_on_n,            names='value')
+    _rewind_btn.on_click(_on_rewind)
+    _prev_btn.on_click(_on_prev)
+    _next_btn.on_click(_on_next)
+    _fwd_btn.on_click(_on_fwd)
+    _reset_btn.on_click(_on_reset)
+    _prems_txt.observe(_on_prems,    names='value')
+    _postms_txt.observe(_on_postms,  names='value')
+    _figw_txt.observe(_on_figw,      names='value')
+    _figh_txt.observe(_on_figh,      names='value')
+    _yauto_chk.observe(_on_yauto,    names='value')
+    _ymin_txt.observe(_on_ymin,      names='value')
+    _ymax_txt.observe(_on_ymax,      names='value')
+    _show_ind_chk.observe(_on_show_ind, names='value')
+    _show_stim_adc_chk.observe(_on_show_stim_adc, names='value')
+
+    _update_freq_drop()
+    _init_controls()
+    _render()
+
+    return VBox([
+        _rec_d,
+        _pol_row,
+        HBox([_freq_drop, _amp_drop]),
+        HBox([_rewind_btn, _prev_btn, _next_btn, _fwd_btn,
+              _reset_btn, _n_txt, _window_lbl]),
+        HBox([_prems_txt, _postms_txt, _figw_txt, _figh_txt]),
+        HBox([_yauto_chk, _ymin_txt, _ymax_txt, _show_ind_chk, _show_stim_adc_chk]),
         _out,
     ])
 
