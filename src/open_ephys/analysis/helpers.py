@@ -12,6 +12,7 @@ import re
 import json
 import time
 import struct
+import warnings
 import glob as globmod
 import numpy as np
 from collections import defaultdict
@@ -29,6 +30,30 @@ from scipy.signal import butter, lfilter
 PROTOCOL_ONLINE = "Online Filtering"
 PROTOCOL_OFFLINE = "Offline Filtering"
 PROTOCOL_OPTIONS = [PROTOCOL_ONLINE, PROTOCOL_OFFLINE]
+
+# header.filtering_protocol values (distinct from PROTOCOL_ONLINE/OFFLINE above,
+# which are a long-form label used only by EMG_Trial_Initiation_Simulator.ipynb
+# for OE record-node selection). These are the literal strings the app writes
+# into the "filtering_protocol" header field added by the 2026-09-18 format
+# update: "ONLINE" = app trusted Open Ephys' own filtering/differencing and
+# used its output as-is; "OFFLINE" = app applied its own bandpass filter to
+# the incoming raw signal; "" = file predates this field, protocol unknown.
+FILTERING_PROTOCOL_ONLINE  = "ONLINE"
+FILTERING_PROTOCOL_OFFLINE = "OFFLINE"
+FILTERING_PROTOCOL_UNKNOWN = ""
+
+# trial.condition values (Frequency Test, file_version >= 6): which of 3
+# randomly-alternating conditions fired for that trial.
+FT_CONDITION_SINGLE_PULSE = 1
+FT_CONDITION_FREQ_A       = 2
+FT_CONDITION_FREQ_B       = 3
+
+# Sentinel "Hz" value used by compute_ft_trial_hz()/the FT viewers to flag a
+# Single Pulse trial as its own selectable group in the Freq dropdown, instead
+# of it being bucketed (misleadingly) under whatever Hz the header's
+# event_period_us happens to reflect. Negative so it never collides with a
+# real Hz value and sorts first.
+FT_HZ_SINGLE_PULSE = -1.0
 
 BIN_DURATION_MS = 50
 SAMPLE_RATE_HINT = 5000
@@ -114,6 +139,58 @@ def hrs_read_array(fid: BinaryIO, dtype: str):
     return list(struct.unpack(f'{n}{fmt}', raw))
 
 
+def _read_booth_snapshot(fid: BinaryIO) -> dict:
+    """Read a BoothSnapshot struct from the file.
+
+    Layout (all little-endian):
+      str       booth_name
+      int32     ch_emg_data_1
+      int32     ch_emg_data_2
+      uint8     n_analog_roles
+      for each: str role_name, int32 channel_index
+      uint8     n_digital_in_roles
+      for each: str role_name, int32 channel_index
+      uint8     n_digital_out_roles
+      for each: str role_name, int32 channel_index
+    """
+    bs = {}
+    bs['booth_name']      = hrs_read_string(fid)
+    bs['ch_emg_data_1']   = hrs_read_val(fid, 'int32')
+    bs['ch_emg_data_2']   = hrs_read_val(fid, 'int32')
+    n_analog = struct.unpack('B', fid.read(1))[0]
+    bs['analog_roles']    = [(hrs_read_string(fid), hrs_read_val(fid, 'int32')) for _ in range(n_analog)]
+    n_din = struct.unpack('B', fid.read(1))[0]
+    bs['digital_in_roles'] = [(hrs_read_string(fid), hrs_read_val(fid, 'int32')) for _ in range(n_din)]
+    n_dout = struct.unpack('B', fid.read(1))[0]
+    bs['digital_out_roles'] = [(hrs_read_string(fid), hrs_read_val(fid, 'int32')) for _ in range(n_dout)]
+    return bs
+
+
+def _read_filter_config(fid: BinaryIO) -> dict:
+    """Read a FilterConfig struct from the file.
+
+    Layout (all little-endian):
+      str       live_stream_method
+      str       trial_window_method
+      str       filter_design
+      str       btype
+      int32     order
+      float32   cutoff_low_hz
+      float32   cutoff_high_hz
+      float32   trial_window_pad_ms
+    """
+    fc = {}
+    fc['live_stream_method']   = hrs_read_string(fid)
+    fc['trial_window_method']  = hrs_read_string(fid)
+    fc['filter_design']        = hrs_read_string(fid)
+    fc['btype']                = hrs_read_string(fid)
+    fc['order']                = hrs_read_val(fid, 'int32')
+    fc['cutoff_low_hz']        = hrs_read_val(fid, 'float32')
+    fc['cutoff_high_hz']       = hrs_read_val(fid, 'float32')
+    fc['trial_window_pad_ms']  = hrs_read_val(fid, 'float32')
+    return fc
+
+
 # ====================================================================
 # HRS DATA CLASSES
 # ====================================================================
@@ -195,6 +272,24 @@ class MhRecHeader:
     # App-side stimulation/window settings loaded from the "<filepath>.settings.json"
     # sidecar, when present. Empty dict for files with no sidecar. See _load_settings_json.
     settings: dict = field(default_factory=dict)
+    # "ONLINE" / "OFFLINE" / "" (unknown/legacy) — see FILTERING_PROTOCOL_* constants.
+    # Format-version support (verified against real recordings unless noted):
+    #   .hrs2 Control Mode:       file_version >= 11  (confirmed against a real file)
+    #   .hrs1 MH Recruitment:     file_version >= 10  (NOT yet verified — no real
+    #                             file has reached fv 10 for this stage type yet;
+    #                             placed immediately after the sweep_* fields by
+    #                             the same "newest field appended last" pattern
+    #                             confirmed correct for Control Mode)
+    #   .hrs3/.hrs4/.hrs5/.hrs6:  NOT implemented — a real .hrs4 file at
+    #                             file_version 4 does not contain this field where
+    #                             the "same bump as .hrs5 (fv>=4)" claim would
+    #                             place it, so the threshold is unverified and
+    #                             (deliberately) not guessed here.
+    filtering_protocol: str = FILTERING_PROTOCOL_UNKNOWN
+    # booth_snapshot: .hrs1 >= fv11, .hrs2 >= fv12, .hrft >= fv8
+    booth_snapshot: object = None
+    # filter_config: .hrs1 >= fv12, .hrs2 >= fv14, .hrft >= fv9
+    filter_config: object = None
 
 
 @dataclass
@@ -242,6 +337,8 @@ class MhRecTrial:
     m_wave_adjust_step_ma:    float = float('nan')
     m_wave_min_intensity_ma:  float = float('nan')
     m_wave_max_intensity_ma:  float = float('nan')
+    # --- .hrs2 BLOCK_CONTROL_MODE_TRIAL file_version >= 13 ---
+    m_wave_reversed_direction: int = 0  # 0 = normal, 1 = reversed
 
 
 @dataclass
@@ -284,6 +381,10 @@ class FrequencyTestTrial(MhRecTrial):
     # The real acquisition sample rate in effect for this trial. 0.0 for older
     # files — see get_ft_sample_rate() for the fallback resolution used there.
     sample_rate: float = 0.0
+    # --- file_version >= 6 (confirmed against a real fv=7 file) ---
+    # Which of 3 randomly-alternating conditions fired — see FT_CONDITION_*
+    # constants (1=single pulse, 2=Freq A train, 3=Freq B train). 0 = old file.
+    condition: int = 0
 
 
 @dataclass
@@ -434,6 +535,13 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0,
                         _t1 >= _t0 and _t2 >= _t1 and (_t2 - _t0) < 3_600_000):
                     _resync_off = _off
                     break
+            # fv >= 13 appends m_wave_reversed_direction (1 byte, int8) after
+            # the M-wave tail, immediately before the next EMG block.
+            # _resync_off points to BLOCK_EMG_DATA; the byte just before it is
+            # m_wave_reversed_direction (when the scan found the EMG block at
+            # offset > 0, meaning there was at least one byte before it).
+            if file_version >= 13 and _resync_off is not None and _resync_off >= 1:
+                t.m_wave_reversed_direction = struct.unpack('b', bytes([_tail_peek[_resync_off - 1]]))[0]
             fid.seek(_tail_pos + (_resync_off or 0))
     return t
 
@@ -575,6 +683,8 @@ def _read_frequency_test_trial_block(fid: BinaryIO, file_version: int) -> Freque
     fv 4 : + pulse_onset_sample_indices — ground-truth per-pulse onset, already
              corrected by the app against the Stim ADC artifact.
     fv 5 : + sample_rate — the real per-trial acquisition sample rate.
+    fv 6 : + condition — which of 3 randomly-alternating conditions fired
+             (see FT_CONDITION_* constants). Confirmed against a real fv=7 file.
     """
     base = _read_mh_trial_block_full(fid, max(file_version, 2))
     t = FrequencyTestTrial.__new__(FrequencyTestTrial)
@@ -601,6 +711,10 @@ def _read_frequency_test_trial_block(fid: BinaryIO, file_version: int) -> Freque
         t.sample_rate = hrs_read_val(fid, 'float32')
     else:
         t.sample_rate = 0.0
+    if file_version >= 6:
+        t.condition = hrs_read_val(fid, 'int32')
+    else:
+        t.condition = 0
     return t
 
 
@@ -777,11 +891,26 @@ def read_hrs2(filepath: str):
         header.stage_type        = hrs_read_val(fid, 'int32')
         if header.file_version >= 8:
             header.app_version = hrs_read_string(fid)
-        if header.file_version >= 9 and 'MH Recruitment' in header.stage_description:
+        _is_mh_recruitment = 'MH Recruitment' in header.stage_description
+        if header.file_version >= 9 and _is_mh_recruitment:
             header.sweep_min_amplitude = hrs_read_val(fid, 'float32')
             header.sweep_max_amplitude = hrs_read_val(fid, 'float32')
             header.sweep_step_size     = hrs_read_val(fid, 'float32')
             header.sweep_sequential    = bool(hrs_read_val(fid, 'int8'))
+        # filtering_protocol: .hrs1 MH Recruitment >= fv10, .hrs2 Control Mode >= fv11
+        # (confirmed against a real fv=11 Control Mode file; the fv=10 MH Recruitment
+        # threshold/position is inferred by the same pattern, not yet seen in real data).
+        _fp_threshold = 10 if _is_mh_recruitment else 11
+        if header.file_version >= _fp_threshold:
+            header.filtering_protocol = hrs_read_string(fid)
+        # booth_snapshot: .hrs1 MH Recruitment >= fv11, .hrs2 Control Mode >= fv12
+        _bs_threshold = 11 if _is_mh_recruitment else 12
+        if header.file_version >= _bs_threshold:
+            header.booth_snapshot = _read_booth_snapshot(fid)
+        # filter_config: .hrs1 MH Recruitment >= fv12, .hrs2 Control Mode >= fv14
+        _fc_threshold = 12 if _is_mh_recruitment else 14
+        if header.file_version >= _fc_threshold:
+            header.filter_config = _read_filter_config(fid)
 
         while True:
             chunk = fid.read(4)
@@ -1084,6 +1213,15 @@ def read_hrs_ft(filepath: str):
             header.n_pulses_per_train = hrs_read_val(fid, 'int32')
             header.event_period_us    = hrs_read_val(fid, 'int32')
             header.pulse_width_us     = hrs_read_val(fid, 'int32')
+        # filtering_protocol (confirmed against a real fv=7 file).
+        if header.file_version >= 7:
+            header.filtering_protocol = hrs_read_string(fid)
+        # booth_snapshot: .hrft >= fv8
+        if header.file_version >= 8:
+            header.booth_snapshot = _read_booth_snapshot(fid)
+        # filter_config: .hrft >= fv9
+        if header.file_version >= 9:
+            header.filter_config = _read_filter_config(fid)
 
         _UNIX_MS_LO = 5e11
         _UNIX_MS_HI = 3e12
@@ -1486,6 +1624,1255 @@ def get_trial_context_window(trial: 'MhRecTrial',
     t_s = (np.arange(len(emg_cat)) - onset_in_window) / sample_rate
 
     return t_s, emg_cat, onset_in_window, adc_cat
+
+
+def get_trial_raw_channels_window(trial: 'MhRecTrial',
+                                  emg_blocks: list,
+                                  pre_ms: float = 5.0,
+                                  post_ms: float = 25.0,
+                                  sample_rate: float = SAMPLE_RATE_HINT,
+                                  onset_offset_ms: float = 0.0):
+    """Stitch the two raw EMG electrode channels from the continuous ``emg_blocks``
+    record around one trial's stim onset — for offline re-differencing/filtering.
+
+    KNOWN LIMITATION: ``trial.trigger_wall_time_ms`` (used here as the onset
+    anchor) and ``trial.onset_sample_index`` (used by :func:`get_trial_window`
+    for the app's own stored ``trial_data``) are not the same instant — a real
+    fv=11 recording showed the two resulting windows best cross-correlate at a
+    consistent ~+5-6 ms lag (``onset_offset_ms``, i.e. the wall-clock trigger
+    lands ~5-6 ms *before* the app's own detected-onset sample), likely the
+    processing latency between "trigger recognised" and "onset detected within
+    trial_data". Pass ``onset_offset_ms`` (added to the wall-clock anchor
+    before locating it in ``emg_blocks``) to correct for this once you've
+    confirmed the right value for your own recordings/threshold settings —
+    it was not hardcoded here since it may not be a fixed constant.
+
+    Locates the trial's onset by wall-clock time (``trial.trigger_wall_time_ms``
+    matched against each block's ``ts_background_emitted`` — both are genuine
+    Unix-ms timestamps), **not** by comparing ``ts_open_ephys_sent`` against
+    ``first_post_trigger_frame_sample_id``/``digital_onset_sample_num`` the way
+    :func:`get_trial_context_window`/``_trial_onset_oe`` do. That comparison
+    mixes units: verified against a real recording, ``ts_open_ephys_sent`` /
+    ``ts_python_received`` / ``ts_background_emitted`` are Unix-ms timestamps
+    (consistent with the ``_UNIX_MS_LO``/``_UNIX_MS_HI`` sanity range used
+    elsewhere in this file to recognise EMG_DATA blocks), while
+    ``first_post_trigger_frame_sample_id`` / ``digital_onset_sample_num`` /
+    ``onset_sample_index`` are genuine OE sample counts — directly subtracting
+    one from the other silently produces a garbage position. (This is also the
+    root cause of the "0 valid trials" background-reconstruction bug flagged
+    in [[project_posthoc_architecture_migration]]; not fixed here, since fixing
+    every call site that makes this same mistake is a separate task.)
+
+    Once the anchor block is found, walks outward through the block list
+    (sorted by timestamp) accumulating each block's own raw-sample count to
+    build a locally contiguous sample axis — the same block-boundary-gap
+    approximation ``analyze_global_background`` already makes for its
+    continuous-signal stitch.
+
+    Returns the two individual *raw* channels (whichever ``raw_channels``
+    entries are not ADC-named — typically labelled e.g. ``CH7``/``CH8``)
+    instead of the app's already-differenced/filtered ``.filtered`` signal.
+
+    This is only genuinely *pre-differencing, pre-filtering* data when the
+    recording's Open Ephys signal chain actually streamed raw, undifferenced
+    channels to this app — i.e. when ``header.filtering_protocol ==
+    FILTERING_PROTOCOL_OFFLINE``. For "ONLINE" (or legacy/unknown) recordings
+    the two channels returned here may already have been filtered and/or
+    differenced upstream by Open Ephys before ever reaching this app, in which
+    case there is no way to recover genuinely raw data from the file — see
+    :func:`get_trial_window_offline` and the filtering_protocol discussion.
+
+    Returns
+    -------
+    (t_ms, ch_a, ch_b, ch_names) or ``None`` if the trial has no usable
+    ``trigger_wall_time_ms``, no block is close enough in time, or fewer than
+    two non-ADC raw channels are present.
+    """
+    if not emg_blocks:
+        return None
+    anchor_ms = int(getattr(trial, 'trigger_wall_time_ms', 0) or 0)
+    if anchor_ms <= 0:
+        return None
+    anchor_ms += int(round(onset_offset_ms))
+
+    sorted_blks = sorted(emg_blocks, key=lambda b: int(b.ts_background_emitted))
+
+    # Identify the two non-ADC raw channel indices (assumed stable across a
+    # session) from the first block that actually has >= 2 of them.
+    ch_a_idx = ch_b_idx = None
+    ch_names = None
+    for blk in sorted_blks:
+        _non_adc = [ci for ci, cn in enumerate(blk.channel_names)
+                    if 'ADC' not in cn.upper() and ci < len(blk.raw_channels)]
+        if len(_non_adc) >= 2:
+            ch_a_idx, ch_b_idx = _non_adc[0], _non_adc[1]
+            ch_names = (blk.channel_names[ch_a_idx], blk.channel_names[ch_b_idx])
+            break
+    if ch_a_idx is None:
+        return None
+
+    # Anchor block: the last block whose timestamp is <= anchor_ms (fall back
+    # to the first block if the trial trigger predates all of them).
+    anchor_bi = 0
+    for bi, blk in enumerate(sorted_blks):
+        if int(blk.ts_background_emitted) <= anchor_ms:
+            anchor_bi = bi
+        else:
+            break
+    anchor_blk = sorted_blks[anchor_bi]
+    if ch_a_idx >= len(anchor_blk.raw_channels):
+        return None
+    offset_ms = anchor_ms - int(anchor_blk.ts_background_emitted)
+    anchor_samp_in_blk = int(round(offset_ms * sample_rate / 1000.0))
+
+    pre_samp  = int(round(pre_ms  * sample_rate / 1000.0))
+    post_samp = int(round(post_ms * sample_rate / 1000.0))
+
+    # Build a locally contiguous sample axis by walking outward from the
+    # anchor block through consecutive blocks in timestamp order, treating
+    # each block's own raw-sample count as its extent (block-boundary gaps,
+    # if any, aren't accounted for — same approximation used elsewhere).
+    segs_a, segs_b = [], []
+    onset_in_window = None
+    cursor = 0
+    for bi in range(anchor_bi, len(sorted_blks)):
+        blk = sorted_blks[bi]
+        if ch_a_idx >= len(blk.raw_channels) or ch_b_idx >= len(blk.raw_channels):
+            break
+        blk_len = len(blk.raw_channels[ch_a_idx])
+        lo = anchor_samp_in_blk if bi == anchor_bi else 0
+        if onset_in_window is None:
+            onset_in_window = cursor + (anchor_samp_in_blk - lo)
+        segs_a.append(blk.raw_channels[ch_a_idx][lo:])
+        segs_b.append(blk.raw_channels[ch_b_idx][lo:])
+        cursor += blk_len - lo
+        if cursor >= anchor_samp_in_blk - lo + post_samp:
+            break
+    for bi in range(anchor_bi - 1, -1, -1):
+        if onset_in_window is not None and onset_in_window >= pre_samp:
+            break
+        blk = sorted_blks[bi]
+        if ch_a_idx >= len(blk.raw_channels) or ch_b_idx >= len(blk.raw_channels):
+            break
+        segs_a.insert(0, blk.raw_channels[ch_a_idx])
+        segs_b.insert(0, blk.raw_channels[ch_b_idx])
+        onset_in_window = (onset_in_window or 0) + len(blk.raw_channels[ch_a_idx])
+
+    if not segs_a or onset_in_window is None:
+        return None
+
+    ch_a_full = np.concatenate(segs_a)
+    ch_b_full = np.concatenate(segs_b)
+    i0 = max(0, onset_in_window - pre_samp)
+    i1 = min(len(ch_a_full), onset_in_window + post_samp)
+    if i0 >= i1:
+        return None
+
+    ch_a = ch_a_full[i0:i1]
+    ch_b = ch_b_full[i0:i1]
+    t_ms = (np.arange(len(ch_a)) - (onset_in_window - i0)) * 1000.0 / sample_rate
+
+    return t_ms, ch_a, ch_b, ch_names
+
+
+def find_digin_onset_in_emg_blocks(trial, emg_blocks, sample_rate,
+                                    search_pre_ms=80.0, search_post_ms=40.0,
+                                    dig_channel_pattern='DIG',
+                                    threshold=0.5):
+    """Find the DIGIN rising edge in emg_blocks near the trial's trigger time.
+
+    The default method (``get_trial_window``) uses ``trial.onset_sample_index``
+    directly — that IS the DIGIN rising-edge sample within ``trial_data`` (when
+    ``onset_detected == 2``).  To align offline-reprocessed raw-channel
+    waveforms with the app-stored signal we need to locate that same physical
+    DIGIN edge in the continuous ``emg_blocks`` stream.
+
+    This function is independent of ``trigger_wall_time_ms`` precision: it uses
+    ``trigger_wall_time_ms`` only to find roughly which block the trial falls in
+    (block-level accuracy is fine even with 10–20 ms OS jitter), then scans the
+    DIGIN channel within a generous search window to find the actual rising edge.
+
+    Parameters
+    ----------
+    search_pre_ms : float
+        How far before ``trigger_wall_time_ms`` to start searching (ms). 80 ms
+        is enough to catch the edge even if the OS jitter pushes it far back.
+    search_post_ms : float
+        How far after ``trigger_wall_time_ms`` to search (ms).
+    dig_channel_pattern : str
+        Case-insensitive substring matched against ``blk.channel_names`` to
+        identify the DIGIN channel (default ``'DIG'``).
+    threshold : float
+        Rising-edge threshold.  For boolean (0/1) storage: 0.5.  For 3.3 V TTL
+        stored as voltage: use 1.65.  For 5 V TTL: use 2.5.
+
+    Returns
+    -------
+    ``(onset_offset_ms, channel_name)`` where *onset_offset_ms* is the precise
+    offset (ms) from ``trigger_wall_time_ms`` to the DIGIN rising edge (positive
+    = edge is after the trigger timestamp).  Returns ``(None, None)`` if the
+    DIGIN channel is not found in emg_blocks, or ``(None, channel_name)`` if the
+    channel was found but no rising edge was detected in the search window.
+    """
+    ctx = get_trial_raw_extra_channel(
+        trial, emg_blocks, dig_channel_pattern,
+        pre_ms=search_pre_ms, post_ms=search_post_ms,
+        sample_rate=sample_rate, onset_offset_ms=0.0,
+    )
+    if ctx is None:
+        return None, None
+    t_ms, dig_data, ch_name = ctx
+    dig_arr = np.asarray(dig_data, dtype=float)
+    below = dig_arr < threshold
+    above = dig_arr >= threshold
+    edges = np.where(below[:-1] & above[1:])[0]
+    if len(edges) == 0:
+        return None, ch_name
+    edge_idx = int(edges[0]) + 1  # first sample that crosses above threshold
+    return float(t_ms[edge_idx]), ch_name
+
+
+def get_trial_raw_extra_channel(trial, emg_blocks, channel_name_pattern,
+                                 pre_ms=5.0, post_ms=25.0,
+                                 sample_rate=SAMPLE_RATE_HINT, onset_offset_ms=0.0):
+    """Extract one channel from emg_blocks by name pattern around the trial onset.
+
+    Same anchor logic as :func:`get_trial_raw_channels_window` but searches for
+    a channel whose name contains ``channel_name_pattern`` (case-insensitive)
+    instead of returning the first two non-ADC EMG channels.  Useful for
+    extracting DIGIN/sync channels alongside the EMG electrodes.
+
+    Returns
+    -------
+    ``(t_ms, data, channel_name)`` or ``None`` if no matching channel is found,
+    the anchor cannot be resolved, or the trial has no ``trigger_wall_time_ms``.
+    """
+    if not emg_blocks:
+        return None
+    anchor_ms = int(getattr(trial, 'trigger_wall_time_ms', 0) or 0)
+    if anchor_ms <= 0:
+        return None
+    anchor_ms += int(round(onset_offset_ms))
+
+    sorted_blks = sorted(emg_blocks, key=lambda b: int(b.ts_background_emitted))
+
+    ch_idx = ch_name = None
+    for blk in sorted_blks:
+        for ci, cn in enumerate(blk.channel_names):
+            if channel_name_pattern.upper() in cn.upper() and ci < len(blk.raw_channels):
+                ch_idx, ch_name = ci, cn
+                break
+        if ch_idx is not None:
+            break
+    if ch_idx is None:
+        return None
+
+    anchor_bi = 0
+    for bi, blk in enumerate(sorted_blks):
+        if int(blk.ts_background_emitted) <= anchor_ms:
+            anchor_bi = bi
+        else:
+            break
+    anchor_blk = sorted_blks[anchor_bi]
+    if ch_idx >= len(anchor_blk.raw_channels):
+        return None
+    offset_ms = anchor_ms - int(anchor_blk.ts_background_emitted)
+    anchor_samp_in_blk = int(round(offset_ms * sample_rate / 1000.0))
+
+    pre_samp  = int(round(pre_ms  * sample_rate / 1000.0))
+    post_samp = int(round(post_ms * sample_rate / 1000.0))
+
+    segs = []
+    onset_in_window = None
+    cursor = 0
+    for bi in range(anchor_bi, len(sorted_blks)):
+        blk = sorted_blks[bi]
+        if ch_idx >= len(blk.raw_channels):
+            break
+        blk_len = len(blk.raw_channels[ch_idx])
+        lo = anchor_samp_in_blk if bi == anchor_bi else 0
+        if onset_in_window is None:
+            onset_in_window = cursor + (anchor_samp_in_blk - lo)
+        segs.append(blk.raw_channels[ch_idx][lo:])
+        cursor += blk_len - lo
+        if cursor >= anchor_samp_in_blk - lo + post_samp:
+            break
+    for bi in range(anchor_bi - 1, -1, -1):
+        if onset_in_window is not None and onset_in_window >= pre_samp:
+            break
+        blk = sorted_blks[bi]
+        if ch_idx >= len(blk.raw_channels):
+            break
+        segs.insert(0, blk.raw_channels[ch_idx])
+        onset_in_window = (onset_in_window or 0) + len(blk.raw_channels[ch_idx])
+
+    if not segs or onset_in_window is None:
+        return None
+
+    ch_full = np.concatenate([np.asarray(s, dtype=float) for s in segs])
+    i0 = max(0, onset_in_window - pre_samp)
+    i1 = min(len(ch_full), onset_in_window + post_samp)
+    if i0 >= i1:
+        return None
+
+    data = ch_full[i0:i1]
+    t_ms = (np.arange(len(data)) - (onset_in_window - i0)) * 1000.0 / sample_rate
+    return t_ms, data, ch_name
+
+
+def get_trial_raw_channels_window_oe(trial, emg_blocks, pre_ms, post_ms,
+                                      sample_rate, warmup_ms=300.0, bin_samples=None):
+    """Like get_trial_raw_channels_window but uses OE sample numbers for alignment.
+
+    Uses ``trial.digital_onset_sample_num`` (the absolute Open Ephys sample number
+    of the DIGIN rising edge stored by the app) to find the trial onset in OE
+    sample space, then maps it to ``emg_blocks`` via ``blk.ts_open_ephys_sent``
+    (the OE sample number of each block's first sample).  No wall-clock timestamps
+    are involved, so ``trigger_wall_time_ms`` OS jitter does not affect the result.
+
+    ``warmup_ms`` extra data is prepended before the ``pre_ms`` window so that
+    causal IIR filters applied to the result have adequate history before the region
+    of interest.  The returned t_ms / ch_a / ch_b span
+    ``(warmup_ms + pre_ms + post_ms)`` milliseconds with t_ms anchored at 0 =
+    onset; callers that apply a causal filter should slice away the first
+    ``int(warmup_ms * sample_rate / 1000)`` samples after filtering.
+
+    Falls back to ``first_post_trigger_frame_sample_id + (onset_sample_index −
+    bin_samples)`` when ``digital_onset_sample_num`` is not available.
+
+    Returns ``(t_ms, ch_a, ch_b, ch_names)`` or ``None``.
+    """
+    if not emg_blocks:
+        return None
+    if bin_samples is None:
+        bin_samples = int(BIN_DURATION_MS * sample_rate / 1000)
+
+    # Resolve onset as absolute OE sample number
+    onset_oe = None
+    _dig_oe = getattr(trial, 'digital_onset_sample_num', -1)
+    if _dig_oe is not None and int(_dig_oe) >= 0:
+        onset_oe = int(_dig_oe)
+    else:
+        first_id = getattr(trial, 'first_post_trigger_frame_sample_id', 0)
+        _osi = getattr(trial, 'onset_sample_index', -1)
+        if first_id and int(first_id) > 0 and _osi is not None and int(_osi) >= 0:
+            onset_oe = int(first_id) + (int(_osi) - bin_samples)
+
+    if onset_oe is None or onset_oe < 0:
+        return None
+
+    sorted_blks = sorted(emg_blocks, key=lambda b: int(b.ts_open_ephys_sent))
+
+    ch_a_idx = ch_b_idx = None
+    ch_names = None
+    for blk in sorted_blks:
+        _non_adc = [ci for ci, cn in enumerate(blk.channel_names)
+                    if 'ADC' not in cn.upper() and ci < len(blk.raw_channels)]
+        if len(_non_adc) >= 2:
+            ch_a_idx, ch_b_idx = _non_adc[0], _non_adc[1]
+            ch_names = (blk.channel_names[ch_a_idx], blk.channel_names[ch_b_idx])
+            break
+    if ch_a_idx is None:
+        return None
+
+    warmup_samp = int(round(warmup_ms * sample_rate / 1000.0))
+    pre_samp    = int(round(pre_ms   * sample_rate / 1000.0))
+    post_samp   = int(round(post_ms  * sample_rate / 1000.0))
+    target_start_oe = onset_oe - warmup_samp - pre_samp
+    target_end_oe   = onset_oe + post_samp
+
+    segs_a, segs_b = [], []
+    collected_oe_start = None
+
+    for blk in sorted_blks:
+        blk_oe_start = int(blk.ts_open_ephys_sent)
+        if ch_a_idx >= len(blk.raw_channels) or ch_b_idx >= len(blk.raw_channels):
+            continue
+        blk_len = len(blk.raw_channels[ch_a_idx])
+        blk_oe_end = blk_oe_start + blk_len - 1
+
+        if blk_oe_end < target_start_oe:
+            continue
+        if blk_oe_start > target_end_oe:
+            break
+
+        clip_lo = max(0, target_start_oe - blk_oe_start)
+        clip_hi = min(blk_len, target_end_oe - blk_oe_start + 1)
+        if clip_lo >= clip_hi:
+            continue
+
+        if collected_oe_start is None:
+            collected_oe_start = blk_oe_start + clip_lo
+
+        segs_a.append(np.asarray(blk.raw_channels[ch_a_idx][clip_lo:clip_hi], dtype=float))
+        segs_b.append(np.asarray(blk.raw_channels[ch_b_idx][clip_lo:clip_hi], dtype=float))
+
+    if not segs_a or collected_oe_start is None:
+        return None
+
+    ch_a_full = np.concatenate(segs_a)
+    ch_b_full = np.concatenate(segs_b)
+    onset_in_full = onset_oe - collected_oe_start
+    t_ms = (np.arange(len(ch_a_full)) - onset_in_full) * 1000.0 / sample_rate
+
+    return t_ms, ch_a_full, ch_b_full, ch_names
+
+
+def build_session_emg_filter_cache(emg_blocks, sample_rate,
+                                   lowcut=100.0, highcut=1000.0, filter_order=2,
+                                   method='sosfilt'):
+    """Build the session-long continuously-filtered EMG signal.
+
+    ``method='sosfilt'`` (default) replicates the app exactly: the app applies
+    ``scipy.signal.sosfilt`` with ``sosfilt_zi`` initial conditions ONCE per
+    session — one continuous causal filter run with carried-forward filter
+    state, NOT per-trial restarts. This function replicates that by:
+
+      1. Sorting ``emg_blocks`` by ``ts_background_emitted`` (wall-clock order,
+         consistent with ``reconstruct_raw_peristimulus.py``).
+      2. Concatenating ``ch_b − ch_a`` across all blocks.
+      3. Running ``sosfilt(sos, diff, zi=sosfilt_zi(sos))`` ONCE over the full session.
+
+    ``method='filtfilt'`` instead runs ``scipy.signal.sosfiltfilt`` (zero-phase,
+    forward-backward) once over the same full-session concatenated differential
+    signal. This is **not** a reproduction of the app's own (causal) filtering —
+    it trades that exactness for zero phase distortion/lag, for investigating
+    whether that changes the M/H waveforms. Still built once over the whole
+    session (not per-trial) so trial-boundary edge effects are avoided the same
+    way as the ``sosfilt`` path.
+
+    Trial onset alignment is handled by :func:`locate_trial_onset_xcorr`, which
+    cross-correlates the session-filtered signal against ``trial.trial_data`` — the
+    approach used and verified to 0.0000% error by ``reconstruct_raw_peristimulus.py``
+    (verification applies to the ``sosfilt`` path, which is byte-for-byte comparable
+    to the app's own stored signal; ``filtfilt`` is only alignable via the same
+    cross-correlation search, not byte-for-byte comparable since it's a different
+    filter).
+    OE-sample arithmetic (``digital_onset_sample_num`` → ``block_map``) is retained
+    as a fallback when ``trial.trial_data`` is not available.
+
+    Returns
+    -------
+    dict with keys:
+        ``'raw_diff'``            — ``np.ndarray (N,)`` session-long raw differential.
+        ``'filtered'``            — ``np.ndarray (N,)`` session-long filtered signal.
+        ``'block_wall_ms_arr'``   — ``np.ndarray (K,)`` wall-clock ms of each block's
+                                   first sample (for xcorr search bounds).
+        ``'block_sample_starts'`` — ``np.ndarray (K+1,)`` cumulative sample boundaries;
+                                   ``block_sample_starts[i]`` = index of block i's first
+                                   sample in ``raw_diff`` / ``filtered``.
+        ``'block_map'``           — list of ``(oe_start, arr_start, length)`` for the
+                                   OE-sample fallback path.
+        ``'sample_rate'``         — float.
+        ``'ch_names'``            — ``(ch_a_name, ch_b_name)``.
+        ``'method'``               — ``'sosfilt'`` or ``'filtfilt'``, whichever was used.
+
+    Returns ``None`` if no usable blocks are found.
+    """
+    from scipy.signal import butter, sosfilt, sosfilt_zi, sosfiltfilt
+
+    if method not in ('sosfilt', 'filtfilt'):
+        raise ValueError(f"build_session_emg_filter_cache: unknown method {method!r} "
+                         f"(expected 'sosfilt' or 'filtfilt')")
+
+    if not emg_blocks:
+        return None
+
+    # Sort chronologically by wall-clock timestamp (matches reconstruct_raw_peristimulus.py)
+    sorted_blks = sorted(emg_blocks, key=lambda b: int(b.ts_background_emitted))
+
+    ch_a_idx = ch_b_idx = None
+    ch_names = ('?', '?')
+    for blk in sorted_blks:
+        _non_adc = [ci for ci, cn in enumerate(blk.channel_names)
+                    if 'ADC' not in cn.upper() and ci < len(blk.raw_channels)]
+        if len(_non_adc) >= 2:
+            ch_a_idx, ch_b_idx = _non_adc[0], _non_adc[1]
+            ch_names = (blk.channel_names[ch_a_idx], blk.channel_names[ch_b_idx])
+            break
+    if ch_a_idx is None:
+        return None
+
+    segs_a, segs_b = [], []
+    block_wall_ms_list, block_len_list, block_map = [], [], []
+    arr_idx = 0
+    for blk in sorted_blks:
+        if ch_a_idx >= len(blk.raw_channels) or ch_b_idx >= len(blk.raw_channels):
+            continue
+        wall_ms  = int(blk.ts_background_emitted)
+        oe_start = int(blk.ts_open_ephys_sent)
+        seg_a = np.asarray(blk.raw_channels[ch_a_idx], dtype=float)
+        seg_b = np.asarray(blk.raw_channels[ch_b_idx], dtype=float)
+        # Trim to shorter channel in case the app wrote unequal-length buffers.
+        length = min(len(seg_a), len(seg_b))
+        seg_a = seg_a[:length]
+        seg_b = seg_b[:length]
+        segs_a.append(seg_a)
+        segs_b.append(seg_b)
+        block_wall_ms_list.append(wall_ms)
+        block_len_list.append(length)
+        block_map.append((oe_start, arr_idx, length))
+        arr_idx += length
+
+    if not segs_a:
+        return None
+
+    raw_a = np.concatenate(segs_a)
+    raw_b = np.concatenate(segs_b)
+    raw_diff = raw_b - raw_a
+
+    nyq = sample_rate / 2.0
+    hi_clamped = min(highcut, 0.9999 * nyq)
+    sos = butter(filter_order, [lowcut, hi_clamped],
+                 btype='bandpass', output='sos', fs=sample_rate)
+    if method == 'filtfilt':
+        filtered = sosfiltfilt(sos, raw_diff)
+    else:
+        zi = sosfilt_zi(sos)
+        filtered, _ = sosfilt(sos, raw_diff, zi=zi)
+
+    block_wall_ms_arr   = np.array(block_wall_ms_list, dtype=np.float64)
+    block_sample_starts = np.concatenate(([0], np.cumsum(block_len_list))).astype(np.int64)
+
+    return {
+        'raw_diff':            raw_diff,
+        'filtered':            filtered,
+        'method':              method,
+        'block_wall_ms_arr':   block_wall_ms_arr,
+        'block_sample_starts': block_sample_starts,
+        'block_map':           block_map,
+        'sample_rate':         sample_rate,
+        'ch_names':            ch_names,
+    }
+
+
+def locate_trial_onset_xcorr(trial, session_cache,
+                              search_margin_ms=8000.0, probe_len=2000):
+    """Find the trial onset in the session signal via cross-correlation.
+
+    This is the approach used and verified to 0.0000% error by
+    ``reconstruct_raw_peristimulus.py`` (see that module for a full explanation):
+
+      1. Narrow the search to session blocks within *search_margin_ms* of
+         ``trial.trigger_wall_time_ms``.
+      2. Slice ``session_cache['filtered'][lo:hi]`` for the search window.
+      3. Cross-correlate against ``trial.trial_data[:probe_len]`` — which the app
+         already computed correctly, making it a known-good fingerprint.
+      4. ``best = argmax(corr)`` → exact alignment.
+      5. Return ``lo + best + trial.onset_sample_index``.
+
+    The 100 Hz high-pass filter's startup transient (~10 ms time constant) settles
+    well within *search_margin_ms* (8 s default), so the correlation is unaffected
+    by the search window's differing filter history vs the app's continuous run.
+
+    Parameters
+    ----------
+    session_cache : dict
+        Built by :func:`build_session_emg_filter_cache`.
+    search_margin_ms : float
+        Half-width (ms) of the wall-clock search window around
+        ``trial.trigger_wall_time_ms``.
+    probe_len : int
+        Samples of ``trial.trial_data`` used as the correlation fingerprint
+        (default 2000 = 200 ms at 10 kHz).
+
+    Returns
+    -------
+    int or ``None``
+        Onset sample index in the concatenated session array, or ``None`` if
+        ``trial_data`` is absent/too short, no search window overlaps, or
+        ``trigger_wall_time_ms`` is missing.
+    """
+    from scipy.signal import correlate as _xcorr
+
+    if session_cache is None:
+        return None
+
+    td = getattr(trial, 'trial_data', None)
+    if td is None or len(td) < 8:
+        return None
+    osi = getattr(trial, 'onset_sample_index', -1)
+    if osi is None or int(osi) < 0:
+        return None
+    osi = int(osi)
+
+    wall_ms = float(getattr(trial, 'trigger_wall_time_ms', 0) or 0)
+    if wall_ms <= 0:
+        return None
+
+    bwall = session_cache['block_wall_ms_arr']
+    bsamp = session_cache['block_sample_starts']
+    filtered = session_cache['filtered']
+
+    lo_bi = int(np.searchsorted(bwall, wall_ms - search_margin_ms, side='left'))
+    hi_bi = int(np.searchsorted(bwall, wall_ms + search_margin_ms, side='right'))
+    lo_bi = max(0, min(lo_bi, len(bsamp) - 2))
+    hi_bi = max(lo_bi + 1, min(hi_bi, len(bsamp) - 1))
+    lo = int(bsamp[lo_bi])
+    hi = int(bsamp[hi_bi])
+
+    filtered_window = filtered[lo:hi]
+    probe = np.asarray(td, dtype=np.float64)[:min(len(td), probe_len)]
+    if len(filtered_window) < len(probe):
+        return None
+
+    corr = _xcorr(filtered_window, probe, mode='valid')
+    best = int(np.argmax(corr))
+    return lo + best + osi
+
+
+def get_trial_window_from_session_cache(trial, session_cache, pre_ms, post_ms,
+                                        use_raw=False, bin_samples=None,
+                                        use_xcorr=True):
+    """Extract a peri-stimulus window from a prebuilt session filter cache.
+
+    Primary alignment: :func:`locate_trial_onset_xcorr` — cross-correlation against
+    ``trial.trial_data``, the approach verified to 0.0000% error by
+    ``reconstruct_raw_peristimulus.py``.  Falls back to OE-sample arithmetic via
+    ``digital_onset_sample_num`` when ``trial.trial_data`` is absent or too short.
+
+    Parameters
+    ----------
+    use_raw : bool
+        If ``True``, return from ``session_cache['raw_diff']``; otherwise from
+        ``session_cache['filtered']``.
+    bin_samples : int or None
+        Fallback bin count used only in the OE-sample fallback path.
+    use_xcorr : bool
+        Set ``False`` to skip cross-correlation and go straight to the OE-sample
+        fallback (useful for testing).
+
+    Returns
+    -------
+    ``(t_ms, signal)`` or ``None`` if the onset cannot be located.
+    """
+    if session_cache is None:
+        return None
+
+    sr = session_cache['sample_rate']
+    signal = session_cache['raw_diff'] if use_raw else session_cache['filtered']
+
+    onset_arr = None
+
+    # Primary: cross-correlation against trial.trial_data (verified 0% error).
+    if use_xcorr:
+        onset_arr = locate_trial_onset_xcorr(trial, session_cache)
+
+    # Fallback: OE-sample arithmetic via digital_onset_sample_num → block_map.
+    if onset_arr is None:
+        if bin_samples is None:
+            bin_samples = int(BIN_DURATION_MS * sr / 1000)
+        block_map = session_cache.get('block_map', [])
+        onset_oe = None
+        _dig_oe = getattr(trial, 'digital_onset_sample_num', -1)
+        if _dig_oe is not None and int(_dig_oe) >= 0:
+            onset_oe = int(_dig_oe)
+        else:
+            first_id = getattr(trial, 'first_post_trigger_frame_sample_id', 0)
+            _osi = getattr(trial, 'onset_sample_index', -1)
+            if (first_id and int(first_id) > 0
+                    and _osi is not None and int(_osi) >= 0):
+                onset_oe = int(first_id) + (int(_osi) - bin_samples)
+        if onset_oe is not None and onset_oe >= 0:
+            for oe_start, arr_start, length in block_map:
+                if oe_start <= onset_oe < oe_start + length:
+                    onset_arr = arr_start + (onset_oe - oe_start)
+                    break
+
+    if onset_arr is None:
+        return None
+
+    pre_samp  = int(round(pre_ms  * sr / 1000))
+    post_samp = int(round(post_ms * sr / 1000))
+    i0 = max(0, onset_arr - pre_samp)
+    i1 = min(len(signal), onset_arr + post_samp)
+    if i0 >= i1:
+        return None
+
+    sig_slice = signal[i0:i1]
+    t_ms = (np.arange(len(sig_slice)) - (onset_arr - i0)) * 1000.0 / sr
+    return t_ms, sig_slice
+
+
+def _reconstruct_offline_trial_data(trials, emg_blocks, sample_rate,
+                                    verbose=True, label=''):
+    """Replace ``trial.trial_data`` in-place with zero-phase (filtfilt) data.
+
+    For recordings tagged ``FILTERING_PROTOCOL_OFFLINE``, the app stored a
+    causal-filtered (sosfilt) version in ``trial.trial_data``.  This function
+    goes back to the two raw EMG channels in ``emg_blocks``, concatenates them
+    into a session-long stream, applies differential subtraction and a
+    zero-phase Butterworth bandpass (100–1000 Hz, order 2, sosfiltfilt over the
+    full session — no per-trial edge effects), then slices each trial's window
+    using cross-correlation alignment against the original ``trial.trial_data``
+    fingerprint (verified 0.0000% error by ``reconstruct_raw_peristimulus.py``).
+
+    Mutates ``trial.trial_data`` **in-place** on every trial that can be aligned,
+    so the same objects referenced by ``rec['ft_trials']``, ``rec['stage_map']``,
+    and ``ft_trial_hz`` id-maps all see the updated signal with no bookkeeping.
+    Trials whose onset cannot be located via xcorr are left unchanged.
+
+    Returns the same ``trials`` list.
+    """
+    from scipy.signal import butter, sosfiltfilt
+
+    if not emg_blocks or not trials:
+        return trials
+
+    # Step 1: sosfilt cache — used ONLY for xcorr alignment, because trial.trial_data
+    # was written by the app's continuous sosfilt, so xcorr works perfectly here.
+    sc = build_session_emg_filter_cache(emg_blocks, sample_rate, method='sosfilt')
+    if sc is None:
+        if verbose:
+            print(f'   [OFFLINE] {label}: no usable EMG blocks — keeping stored data')
+        return trials
+
+    # Step 2: filtfilt over the same raw_diff (zero-phase, session-continuous).
+    nyq = sample_rate / 2.0
+    sos_ff = butter(2, [100.0, min(1000.0, 0.9999 * nyq)],
+                    btype='bandpass', output='sos', fs=sample_rate)
+    ff_full = sosfiltfilt(sos_ff, sc['raw_diff'])
+
+    # Step 3: for each trial, locate onset via xcorr then slice from ff_full.
+    n_ok = n_fail = 0
+    for t in trials:
+        try:
+            onset_arr = locate_trial_onset_xcorr(t, sc)
+            if onset_arr is None:
+                raise ValueError('xcorr onset not found')
+            td = np.asarray(getattr(t, 'trial_data', None) or [], dtype=np.float32)
+            if len(td) == 0:
+                raise ValueError('empty trial_data')
+            osi = int(getattr(t, 'onset_sample_index', 0) or 0)
+            pre_samp  = osi
+            post_samp = len(td) - osi
+            i0 = onset_arr - pre_samp
+            i1 = onset_arr + post_samp
+            i0c = max(0, i0)
+            i1c = min(len(ff_full), i1)
+            ff_slice = ff_full[i0c:i1c]
+            # Build output array same length as original; pad with zeros at edges.
+            new_td = np.zeros(len(td), dtype=np.float32)
+            dest_start = i0c - i0
+            new_td[dest_start:dest_start + len(ff_slice)] = ff_slice
+            t.trial_data = new_td  # mutate in-place — id(t) unchanged
+            n_ok += 1
+        except Exception:
+            n_fail += 1
+
+    if verbose:
+        msg = f'   [OFFLINE] {label}: {n_ok}/{len(trials)} trials rebuilt (raw→diff→filtfilt)'
+        if n_fail:
+            msg += f'  ({n_fail} kept stored — xcorr miss)'
+        print(msg)
+    return trials
+
+
+def apply_emg_filter(signal: np.ndarray, sample_rate: float,
+                     mode: str = 'bandpass',
+                     lowcut: float = 100.0, highcut: float = 1000.0, order: int = 2,
+                     method: str = 'lfilter',
+                     notch: bool = False, notch_freq: float = 60.0, notch_q: float = 30.0):
+    """General-purpose, freely-toggleable EMG filtering pipeline for offline
+    filtering investigation (see :func:`make_filtering_viewer`).
+
+    Parameters
+    ----------
+    mode : 'bandpass' or 'raw'
+        'raw' returns ``signal`` unchanged (no band-pass stage at all) — for
+        comparing filtered vs. genuinely unfiltered differential EMG.
+    method : 'lfilter' or 'filtfilt'
+        'lfilter' is the causal (forward-only) filter this codebase has
+        historically used (see :func:`bandpass_filter_emg`,
+        :func:`differential_bandpass_filter`). 'filtfilt' is zero-phase
+        (forward-backward) — no phase lag/distortion, but non-causal (looks
+        into the "future" of the window).
+    notch : bool
+        When True, applies an additional IIR notch filter (``notch_freq``,
+        quality factor ``notch_q``) after the band-pass stage (or directly to
+        ``signal`` when ``mode == 'raw'``), using the same ``method``.
+
+    ``highcut`` is silently clamped to just under the Nyquist frequency
+    (``sample_rate / 2``) when it would meet or exceed it — e.g. a "3-5000 Hz"
+    band on a 10 kHz recording lands exactly on Nyquist, which
+    ``scipy.signal.butter`` rejects outright with ``ValueError: Digital
+    filter critical frequencies must be 0 < Wn < 1``. A warning is emitted
+    when this clamping happens so it isn't silently invisible.
+
+    Returns the filtered signal, same length as ``signal``.
+    """
+    from scipy.signal import butter, sosfilt, sosfiltfilt, iirnotch, lfilter, filtfilt
+    out = np.asarray(signal, dtype=float)
+    nyq = sample_rate / 2.0
+    if mode == 'bandpass':
+        high_eff = highcut
+        if high_eff >= nyq:
+            high_eff = nyq * 0.999
+            warnings.warn(
+                f"apply_emg_filter: highcut={highcut} Hz >= Nyquist ({nyq} Hz) for "
+                f"sample_rate={sample_rate} Hz; clamped to {high_eff:.2f} Hz.",
+                stacklevel=2,
+            )
+        # SOS form avoids the catastrophic coefficient underflow that the ba form
+        # produces for extreme normalized frequencies (e.g. 3 Hz at 10 kHz SR → 0.0006).
+        sos = butter(order, [lowcut / nyq, high_eff / nyq], btype='bandpass', output='sos')
+        out = sosfiltfilt(sos, out) if method == 'filtfilt' else sosfilt(sos, out)
+    elif mode != 'raw':
+        raise ValueError(f"apply_emg_filter: unknown mode {mode!r} (expected 'bandpass' or 'raw')")
+    if notch:
+        b_n, a_n = iirnotch(notch_freq / nyq, notch_q)
+        out = filtfilt(b_n, a_n, out) if method == 'filtfilt' else lfilter(b_n, a_n, out)
+    return out
+
+
+def differential_bandpass_filter(ch_a: np.ndarray, ch_b: np.ndarray,
+                                 sample_rate: float,
+                                 lowcut: float = 100.0, highcut: float = 1000.0,
+                                 order: int = 2,
+                                 mode: str = 'bandpass', method: str = 'lfilter',
+                                 notch: bool = False, notch_freq: float = 60.0,
+                                 notch_q: float = 30.0):
+    """Differentially subtract two raw EMG channels, then filter via
+    :func:`apply_emg_filter`.
+
+    ``ch_b - ch_a`` matches the sign convention the app itself uses for its
+    own stored ``EmgDataBlock.diff`` (confirmed byte-for-byte against a real
+    recording: ``diff == raw_channels[1] - raw_channels[0]``), so a
+    differential computed this way from ``get_trial_raw_channels_window``'s
+    ``(ch_a, ch_b)`` is directly comparable to the app's own ``diff``/``filtered``
+    values. ``lowcut``/``highcut``/``order`` default to this codebase's existing
+    EMG bandpass convention (see :func:`bandpass_filter_emg`); ``mode``/``method``/
+    ``notch``/... default to that same historical behavior — override any of
+    them freely to experiment with different filtering.
+
+    Returns (differential_raw, differential_filtered).
+    """
+    diff_raw = np.asarray(ch_b, dtype=float) - np.asarray(ch_a, dtype=float)
+    diff_filt = apply_emg_filter(diff_raw, sample_rate, mode=mode,
+                                 lowcut=lowcut, highcut=highcut, order=order,
+                                 method=method, notch=notch,
+                                 notch_freq=notch_freq, notch_q=notch_q)
+    return diff_raw, diff_filt
+
+
+def get_trial_window_offline(trial: 'MhRecTrial',
+                             emg_blocks: list,
+                             pre_ms: float = 5.0,
+                             post_ms: float = 25.0,
+                             sample_rate: float = SAMPLE_RATE_HINT,
+                             lowcut: float = 100.0, highcut: float = 1000.0,
+                             order: int = 2,
+                             onset_offset_ms: float = 0.0,
+                             mode: str = 'bandpass', method: str = 'lfilter',
+                             notch: bool = False, notch_freq: float = 60.0,
+                             notch_q: float = 30.0):
+    """Peri-stimulus window reprocessed from raw channels: differentially
+    subtract the two raw EMG electrodes, then filter (see
+    :func:`apply_emg_filter` for ``mode``/``method``/``notch`` options) —
+    entirely independent of the app's own stored ``trial_data``/``diff``/``filtered``.
+
+    Intended for trials whose recording is tagged
+    ``header.filtering_protocol == FILTERING_PROTOCOL_OFFLINE`` (that's the
+    configuration where genuinely raw, pre-differencing channels reach this
+    app — see :func:`get_trial_raw_channels_window`). This function itself
+    does not check the tag; check it yourself, or use
+    :func:`get_trial_window_auto` to dispatch automatically.
+
+    ``onset_offset_ms`` — see :func:`get_trial_raw_channels_window`'s known
+    ~5-6 ms wall-clock-vs-detected-onset offset; pass it through once you've
+    determined the right correction for your data.
+
+    Returns (t_ms, emg_filtered, emg_raw_diff, ch_names) in the same t_ms
+    convention as :func:`get_trial_window`, or ``None`` if the raw-channel
+    window can't be located (e.g. no overlapping emg_blocks, or the recording
+    doesn't have two distinguishable raw channels).
+    """
+    ctx = get_trial_raw_channels_window(trial, emg_blocks, pre_ms, post_ms, sample_rate,
+                                        onset_offset_ms=onset_offset_ms)
+    if ctx is None:
+        return None
+    t_ms, ch_a, ch_b, ch_names = ctx
+    diff_raw, diff_filt = differential_bandpass_filter(
+        ch_a, ch_b, sample_rate, lowcut=lowcut, highcut=highcut, order=order,
+        mode=mode, method=method, notch=notch, notch_freq=notch_freq, notch_q=notch_q)
+    return t_ms, diff_filt, diff_raw, ch_names
+
+
+def get_trial_window_auto(trial: 'MhRecTrial', header, pre_ms: float, post_ms: float,
+                          emg_blocks: list = None,
+                          sample_rate: float = None,
+                          lowcut: float = 100.0, highcut: float = 1000.0, order: int = 2,
+                          onset_offset_ms: float = 0.0,
+                          **get_trial_window_kwargs):
+    """Return a peri-stimulus EMG window, auto-selecting how it's computed
+    from ``header.filtering_protocol``:
+
+    - ``FILTERING_PROTOCOL_OFFLINE`` — reprocess from the two raw EMG channels
+      via :func:`get_trial_window_offline` (differential subtraction + your
+      own band-pass filter), when ``emg_blocks`` is supplied and a raw-channel
+      window can be found for this trial.
+    - Anything else (``ONLINE``, ``""``/unknown, or the offline path
+      unavailable) — fall back to the app's own stored signal via
+      :func:`get_trial_window`.
+
+    Returns (t_ms, emg, source) where source is ``'offline_reprocessed'`` or
+    ``'stored'`` so callers/plots can label which path was used.
+
+    ``sample_rate`` should be passed explicitly (e.g. from
+    ``_all_recordings[label]['sample_rate']``) rather than relying on
+    ``header.sample_rate``: for .hrs1/.hrs2 that field is computed as
+    ``len(trial_data) / (TRIAL_RECORD_MS / 1000)``, which assumes trial_data
+    spans exactly ``TRIAL_RECORD_MS`` (100 ms) — verified wrong (~56000-57700
+    instead of the true ~10000 Hz) against real recordings, both old and new
+    format, since trial_data is actually much longer than 100 ms. Not fixed
+    here (the correct post-stim window duration isn't known); this function
+    only avoids silently trusting that value.
+    """
+    if sample_rate:
+        sr = sample_rate
+    else:
+        raise ValueError(
+            "get_trial_window_auto: sample_rate must be passed explicitly "
+            "(e.g. rec['sample_rate']) — header.sample_rate is unreliable for "
+            ".hrs1/.hrs2 files, see this function's docstring."
+        )
+    if getattr(header, 'filtering_protocol', '') == FILTERING_PROTOCOL_OFFLINE and emg_blocks:
+        ctx = get_trial_window_offline(trial, emg_blocks, pre_ms, post_ms, sr,
+                                       lowcut=lowcut, highcut=highcut, order=order,
+                                       onset_offset_ms=onset_offset_ms)
+        if ctx is not None:
+            t_ms, emg_filt, _diff_raw, _ch_names = ctx
+            return t_ms, emg_filt, 'offline_reprocessed'
+    t_ms, emg, _adc, _stim_end, _stim_adc = get_trial_window(
+        trial, pre_ms, post_ms, ms_per_sample=1000.0 / sr, **get_trial_window_kwargs)
+    return t_ms, emg, 'stored'
+
+
+def make_filtering_viewer(all_recordings, active_rec_label,
+                          pre_ms: float = 5.0, post_ms: float = 25.0,
+                          m_start_ms: float = 2.2, m_end_ms: float = 4.2,
+                          h_start_ms: float = 6.0, h_end_ms: float = 9.6):
+    """Interactive raw-channel offline-filtering investigation viewer.
+
+    For recordings tagged ``header.filtering_protocol == FILTERING_PROTOCOL_OFFLINE``
+    (genuinely raw, pre-differencing/pre-filtering EMG channels reach the app —
+    see :func:`get_trial_raw_channels_window`), lets you freely pick a
+    Recording/Stage/Trial and re-differentiate + re-filter the two raw
+    channels with any combination of: raw passthrough vs. band-pass, lfilter
+    vs. filtfilt, low/high cutoff, filter order, and an optional notch filter
+    — re-plotting live against the app's own stored ``trial_data`` signal for
+    comparison. Includes one-click presets for four standard investigations:
+    raw (unfiltered) differential, the existing 100-1000 Hz/order-2 band with
+    filtfilt instead of lfilter, a broad 3-5000 Hz low-order (3) band with no
+    notch, and that same broad band with a notch filter added back in.
+
+    For recordings *not* tagged OFFLINE the two "raw" channels returned by
+    :func:`get_trial_raw_channels_window` may already have been filtered
+    and/or differenced upstream by Open Ephys before reaching this app — the
+    viewer still works but shows a warning label, since there's no way to
+    recover genuinely unfiltered data from such a recording.
+
+    Unlike :func:`make_viewer`, this widget is self-rendering (Recording,
+    Stage, Trial and all filter controls live inside one returned widget) —
+    just ``display()`` it. Returns ``(widget, render_fn)``; call ``render_fn()``
+    once after display to populate the initial view (matches
+    :func:`make_viewer`'s contract).
+    """
+    import plotly.graph_objects as go
+    from ipywidgets import (Dropdown, VBox, HBox, Output, IntSlider, Checkbox,
+                            FloatText, IntText, ToggleButtons, Button, HTML)
+
+    _out = Output()
+
+    rec_opts = list(all_recordings.keys())
+    _rec_d = Dropdown(options=rec_opts, value=active_rec_label, description='Recording:',
+                      layout={'width': '600px'})
+
+    def _stage_opts_for(rec_label):
+        sm = all_recordings[rec_label]['stage_map']
+        result = []
+        for sk, (_t, _h, _e, lbl) in sm.items():
+            if not _t:
+                continue
+            result.append((lbl, sk))
+        return result
+
+    _init_opts = _stage_opts_for(active_rec_label)
+    _stage_d = Dropdown(options=_init_opts, description='Stage:', layout={'width': '480px'})
+    if _init_opts:
+        _stage_d.value = _init_opts[0][1]
+
+    _trial_s = IntSlider(min=0, max=0, value=0, description='Trial #:', layout={'width': '600px'})
+    _protocol_lbl = HTML(value='')
+
+    _mode_t = ToggleButtons(options=[('Raw (unfiltered)', 'raw'), ('Bandpass', 'bandpass'),
+                                     ('Session (exact)', 'session')],
+                            value='bandpass', description='Mode:')
+    _method_t = ToggleButtons(options=[('lfilter (causal)', 'lfilter'),
+                                       ('filtfilt (zero-phase)', 'filtfilt')],
+                              value='lfilter', description='Method:')
+    _low_f  = FloatText(value=100.0,  description='Low (Hz):',  layout={'width': '180px'})
+    _high_f = FloatText(value=1000.0, description='High (Hz):', layout={'width': '180px'})
+    _order_i = IntText(value=2, description='Order:', layout={'width': '150px'})
+    _notch_c = Checkbox(value=False, description='Notch filter')
+    _notch_freq_f = FloatText(value=60.0, description='Notch (Hz):', layout={'width': '180px'})
+    _notch_q_f    = FloatText(value=30.0, description='Notch Q:',    layout={'width': '150px'})
+    _offset_f  = FloatText(value=0.0, description='Onset offset (ms):', layout={'width': '200px'})
+    _overlay_c   = Checkbox(value=True,  description='Overlay app-stored signal')
+    _stim_adc_c  = Checkbox(value=False, description='Show Stim ADC')
+    _digin_c     = Checkbox(value=False, description='Show DIGIN')
+
+    def _preset(mode, method, low, high, order, notch):
+        def _cb(_b=None):
+            _mode_t.value, _method_t.value = mode, method
+            _low_f.value, _high_f.value, _order_i.value = low, high, order
+            _notch_c.value = notch
+            _render()
+        return _cb
+
+    _btn_raw          = Button(description='1. Raw (unfiltered)')
+    _btn_filtfilt      = Button(description='2. Standard band + filtfilt')
+    _btn_broad         = Button(description='3. Broad 3-5000Hz, low order, no notch')
+    _btn_broad_notch   = Button(description='4. Broad 3-5000Hz + notch')
+    _btn_exact         = Button(description='5. Exact (session-filtered, matches app)')
+    _btn_raw.on_click(_preset('raw', 'lfilter', 100.0, 1000.0, 2, False))
+    _btn_filtfilt.on_click(_preset('bandpass', 'filtfilt', 100.0, 1000.0, 2, False))
+    _btn_broad.on_click(_preset('bandpass', 'lfilter', 3.0, 5000.0, 3, False))
+    _btn_broad_notch.on_click(_preset('bandpass', 'lfilter', 3.0, 5000.0, 3, True))
+    _btn_exact.on_click(_preset('session', 'lfilter', 100.0, 1000.0, 2, False))
+
+    # Session-level filter cache — built once per stage, invalidated on stage/rec change.
+    _session_cache_holder = [None]
+
+    def _current_stage():
+        rec = all_recordings[_rec_d.value]
+        sm = rec['stage_map']
+        sk = _stage_d.value
+        if not sk or sk not in sm:
+            return None
+        return sm[sk]
+
+    def _sync_trial_range():
+        st = _current_stage()
+        if st is None:
+            _trial_s.max = 0
+            _protocol_lbl.value = ''
+            return
+        trials, header, _emg_blocks, _label = st
+        _trial_s.max = max(0, len(trials) - 1)
+        if _trial_s.value > _trial_s.max:
+            _trial_s.value = 0
+        proto = getattr(header, 'filtering_protocol', '') or '(unknown)'
+        if proto == FILTERING_PROTOCOL_OFFLINE:
+            _protocol_lbl.value = f'<b>filtering_protocol:</b> {proto}'
+        else:
+            _protocol_lbl.value = (
+                f'<b>filtering_protocol:</b> {proto} &mdash; '
+                f'<span style="color:#b8860b">WARNING: not tagged OFFLINE; the two '
+                f'"raw" channels here may already have been filtered/differenced '
+                f'upstream by Open Ephys, so this is not genuinely unfiltered data.</span>'
+            )
+
+    def _render(*_a):
+        st = _current_stage()
+        with _out:
+            _out.clear_output(wait=True)
+            if st is None:
+                print('No compatible stage selected.')
+                return
+            trials, header, emg_blocks, label = st
+            if not trials:
+                print('No trials in this stage.')
+                return
+            ti = min(_trial_s.value, len(trials) - 1)
+            trial = trials[ti]
+            sr = all_recordings[_rec_d.value]['sample_rate'] or SAMPLE_RATE_HINT
+
+            _bin_s = int(BIN_DURATION_MS * sr / 1000)
+            _rec_s = int(TRIAL_RECORD_MS  * sr / 1000)
+            _osi   = getattr(trial, 'onset_sample_index', -1)
+            if _osi is None:
+                _osi = -1
+            _dig_oe_val = getattr(trial, 'digital_onset_sample_num', -1)
+            if _dig_oe_val is None:
+                _dig_oe_val = -1
+            _WARMUP_MS   = 300.0
+            _warmup_samp = int(round(_WARMUP_MS * sr / 1000))
+
+            _is_online = (getattr(header, 'filtering_protocol', '')
+                          == FILTERING_PROTOCOL_ONLINE)
+
+            # All modes use the session cache for alignment (xcorr against trial.trial_data,
+            # verified 0% error).  ts_open_ephys_sent is NOT an OE sample number — it
+            # carries only wall-clock-ish ms — so OE-sample arithmetic via
+            # get_trial_raw_channels_window_oe would never find the right block.
+            sc = _session_cache_holder[0]
+            if sc is None:
+                print('Building session filter cache (first render for this stage)...')
+                sc = build_session_emg_filter_cache(emg_blocks, sr)
+                _session_cache_holder[0] = sc
+            if sc is None:
+                print(f'Trial {ti}: could not build session filter cache '
+                      f'(no usable emg_blocks or fewer than 2 non-ADC channels).')
+                return
+            ch_names = sc.get('ch_names', ('?', '?'))
+
+            if _mode_t.value == 'session':
+                # Use the pre-built session-long sosfilt output (exact app pipeline).
+                _win = get_trial_window_from_session_cache(trial, sc, pre_ms, post_ms)
+                if _win is None:
+                    print(f'Trial {ti}: onset not found via cross-correlation.')
+                    return
+                t_ms, diff_proc = _win
+                _raw_win = get_trial_window_from_session_cache(
+                    trial, sc, pre_ms, post_ms, use_raw=True)
+                diff_raw = _raw_win[1] if _raw_win is not None else np.zeros_like(diff_proc)
+                print(f'Trial {ti}  |  Session-filtered (exact app pipeline, 100–1000 Hz sosfilt)')
+            else:
+                # Slice raw_diff from session cache with warmup for IIR settling,
+                # then apply the requested filter.  Xcorr handles the alignment.
+                _win_raw = get_trial_window_from_session_cache(
+                    trial, sc, pre_ms + _WARMUP_MS, post_ms, use_raw=True)
+                if _win_raw is None:
+                    print(f'Trial {ti}: onset not found via cross-correlation.')
+                    return
+                t_ms_full, diff_raw_full = _win_raw
+                diff_proc_full = apply_emg_filter(
+                    diff_raw_full, sr, mode=_mode_t.value,
+                    lowcut=_low_f.value, highcut=_high_f.value, order=_order_i.value,
+                    method=_method_t.value, notch=_notch_c.value,
+                    notch_freq=_notch_freq_f.value, notch_q=_notch_q_f.value)
+                t_ms      = t_ms_full[_warmup_samp:]
+                diff_raw  = diff_raw_full[_warmup_samp:]
+                diff_proc = diff_proc_full[_warmup_samp:]
+                if _mode_t.value == 'raw' and _is_online:
+                    print(f'⚠  ONLINE recording: emg_blocks channels may already be '
+                          f'filtered/differenced by Open Ephys upstream -- '
+                          f'"Raw (unfiltered)" is NOT genuinely pre-filter data for this session.')
+                print(f'Trial {ti}  |  warmup={_WARMUP_MS:.0f} ms  '
+                      f'|  {_mode_t.value}/{_method_t.value}')
+
+            _raw_trace_name = (
+                'Raw differential (⚠ ONLINE: may already be processed by OE)'
+                if _is_online else 'Raw differential (unfiltered)')
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=t_ms, y=diff_proc, mode='lines',
+                                     name='Reprocessed (this config)',
+                                     line=dict(color='#1f77b4', width=1.5)))
+            fig.add_trace(go.Scatter(x=t_ms, y=diff_raw, mode='lines',
+                                     name=_raw_trace_name,
+                                     line=dict(color='#aaaaaa', width=1),
+                                     visible='legendonly'))
+            if _overlay_c.value:
+                stored = get_trial_window(trial, pre_ms, post_ms, ms_per_sample=1000.0 / sr,
+                                          bin_samples=_bin_s, record_samples=_rec_s)
+                st_t, st_emg = stored[0], stored[1]
+                fig.add_trace(go.Scatter(x=st_t, y=st_emg, mode='lines',
+                                         name='App-stored signal',
+                                         line=dict(color='#d62728', width=1, dash='dot')))
+
+            # ── Stim ADC overlay (trial.stim_adc_data, same onset_sample_index ref) ──
+            _show_y2 = False
+            if _stim_adc_c.value and _osi >= 0:
+                _sa_arr = np.array(getattr(trial, 'stim_adc_data', []), dtype=float)
+                if len(_sa_arr) > 0:
+                    _sa_pre  = int(round(pre_ms  * sr / 1000))
+                    _sa_post = int(round(post_ms * sr / 1000))
+                    _s0, _s1 = _osi - _sa_pre, _osi + _sa_post
+                    if 0 <= _s0 and _s1 <= len(_sa_arr):
+                        _sa_win = _sa_arr[_s0:_s1]
+                        _sa_t   = np.linspace(-pre_ms, post_ms, len(_sa_win))
+                        fig.add_trace(go.Scatter(x=_sa_t, y=_sa_win, mode='lines',
+                                                 name='Stim ADC',
+                                                 line=dict(color='#ff7f0e', width=1.2),
+                                                 yaxis='y2'))
+                        _show_y2 = True
+                    else:
+                        print(f'Stim ADC: onset window [{_s0}:{_s1}] out of range '
+                              f'(stim_adc_data length={len(_sa_arr)}).')
+                else:
+                    print('Stim ADC: trial.stim_adc_data is empty or not present.')
+
+            # ── DIGIN channel (extracted from emg_blocks; must be a continuous channel) ──
+            if _digin_c.value:
+                _dg_ctx = get_trial_raw_extra_channel(
+                    trial, emg_blocks, 'DIG',
+                    pre_ms=pre_ms, post_ms=post_ms,
+                    sample_rate=sr, onset_offset_ms=_total_offset_ms)
+                if _dg_ctx is not None:
+                    _dg_t, _dg_data, _dg_name = _dg_ctx
+                    fig.add_trace(go.Scatter(x=_dg_t, y=_dg_data, mode='lines',
+                                             name=f'DIGIN ({_dg_name})',
+                                             line=dict(color='#9467bd', width=1.2),
+                                             yaxis='y2'))
+                    _show_y2 = True
+                else:
+                    _sample_blk = sorted(emg_blocks,
+                                         key=lambda b: int(b.ts_background_emitted))[:1]
+                    _avail = ([cn for blk in _sample_blk for cn in blk.channel_names]
+                              if _sample_blk else [])
+                    print(f'DIGIN: no channel containing "DIG" found in emg_blocks. '
+                          f'Available channel names (first block): {_avail}')
+
+            fig.add_vrect(x0=m_start_ms, x1=m_end_ms, fillcolor='green', opacity=0.12,
+                         line_width=0, annotation_text='M', annotation_position='top left')
+            fig.add_vrect(x0=h_start_ms, x1=h_end_ms, fillcolor='purple', opacity=0.12,
+                         line_width=0, annotation_text='H', annotation_position='top left')
+
+            m_mask   = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+            h_mask   = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
+            pre_mask = t_ms < 0
+            bg = float(np.mean(np.abs(diff_proc[pre_mask]))) if pre_mask.any() else float('nan')
+            m_size = float(np.mean(np.abs(diff_proc[m_mask])) - bg) if m_mask.any() else float('nan')
+            h_size = float(np.mean(np.abs(diff_proc[h_mask])) - bg) if h_mask.any() else float('nan')
+
+            amp = getattr(trial, 'stimulation_amplitude_ma', None)
+            title = (f'{label} — Trial {ti} (amp={amp})  —  ch: {ch_names[0]}/{ch_names[1]}'
+                     f'<br>M={m_size:.1f}  H={h_size:.1f}  bg={bg:.1f}  '
+                     f'(mode={_mode_t.value}, method={_method_t.value})')
+            _layout = dict(title=title, xaxis_title='Time (ms)', yaxis_title='EMG (µV)',
+                           height=450, margin=dict(t=90), legend=dict(orientation='h', y=-0.2))
+            if _show_y2:
+                _layout['yaxis2'] = dict(title='Secondary (V)', overlaying='y',
+                                         side='right', showgrid=False)
+            fig.update_layout(**_layout)
+            fig.show()
+
+    def _on_rec_change(change):
+        _session_cache_holder[0] = None
+        new_opts = _stage_opts_for(_rec_d.value)
+        _stage_d.unobserve(_on_stage_change, names='value')
+        _stage_d.options = new_opts
+        _stage_d.value   = new_opts[0][1] if new_opts else None
+        _stage_d.observe(_on_stage_change, names='value')
+        _sync_trial_range()
+        _render()
+
+    def _on_stage_change(change):
+        _session_cache_holder[0] = None
+        _sync_trial_range()
+        _render()
+
+    _rec_d.observe(_on_rec_change, names='value')
+    _stage_d.observe(_on_stage_change, names='value')
+    for _w in (_trial_s, _mode_t, _method_t, _low_f, _high_f, _order_i, _notch_c,
+              _notch_freq_f, _notch_q_f, _offset_f, _overlay_c, _stim_adc_c, _digin_c):
+        _w.observe(_render, names='value')
+
+    _sync_trial_range()
+
+    controls = VBox([
+        HBox([_rec_d, _stage_d]),
+        _protocol_lbl,
+        _trial_s,
+        HBox([_btn_raw, _btn_filtfilt, _btn_broad, _btn_broad_notch, _btn_exact]),
+        HBox([_mode_t, _method_t]),
+        HBox([_low_f, _high_f, _order_i]),
+        HBox([_notch_c, _notch_freq_f, _notch_q_f]),
+        HBox([_offset_f, _overlay_c, _stim_adc_c, _digin_c]),
+    ])
+    return VBox([controls, _out]), _render
 
 
 def compute_background_bins(trial,
@@ -2153,7 +3540,7 @@ def plot_ft_depression_curve(trial, header, sample_rate=None, title_suffix=''):
     ax.set_xlabel('Pulse # in train', fontsize=11)
     ax.set_ylabel('MRA  (µV)', fontsize=11)
     ax.set_xticks(pulse_idx)
-    title = f'H/M MRA Per Pulse  ·  {hz} Hz  ·  {amp_str}'
+    title = f'H/M MRA Per Pulse  ·  {ft_hz_title(trial, hz)}  ·  {amp_str}'
     if title_suffix:
         title += f'  ·  {title_suffix}'
     ax.set_title(title, fontsize=11)
@@ -2175,7 +3562,6 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
                                 y_min=None, y_max=None,
                                 fig_w=11.0, fig_h=5.0,
                                 simplified=False,
-                                compare_pulse=2,
                                 show_sync=False,
                                 show_stim_adc=False):
     """All pulse waveforms from a single FT trial overlaid on one plot.
@@ -2186,10 +3572,10 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
     last pulse drawn a little bolder/darker than the rest so the ends of the
     train stand out. Ignored in simplified mode.
     legend_style  : 'colorbar' (gradient bar) or 'labeled'.
-    simplified    : If True, show three traces — pulse 1 (blue), pulse compare_pulse
-                    (orange), and the mean of the last-half pulses (purple), with the
-                    individual last-half traces in a lighter background shade.
-    compare_pulse : 0-based index of the second named trace in simplified mode (default 2).
+    simplified    : If True, show two traces — pulse 1 (blue) and the mean of the
+                    last-half pulses (purple), with individual last-half traces in a
+                    lighter background shade.  "Last half" is the upper ceil(n/2)
+                    pulses (e.g. pulses 3–5 for a 5-pulse train).
     show_sync     : If True, add a subplot below showing the ADC sync channel (trial.sync_data)
                     windowed around each displayed pulse.
     show_stim_adc : If True, add a subplot below showing the Stim ADC channel
@@ -2290,7 +3676,8 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
         a.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.10, zorder=1)
         a.axvline(h_start_ms, color='green', ls='--', lw=1.0, alpha=0.7, zorder=2)
         a.axvline(h_end_ms,   color='green', ls='--', lw=1.0, alpha=0.7, zorder=2)
-        a.axvline(0, color='#aaa', lw=0.8, ls=':', zorder=1)
+        a.axvline(0, color='black', lw=1.5, ls='-', zorder=2)
+        a.axhline(0, color='black', lw=1.5, ls='-', zorder=2)
 
     _shade(ax)
 
@@ -2329,12 +3716,12 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
     # SIMPLIFIED VIEW
     # ─────────────────────────────────────────────────────────────────────────
     if simplified:
-        half_idx   = max(1, n_pulses // 2)          # last-half starts here
+        import math as _math
+        half_idx   = n_pulses - _math.ceil(n_pulses / 2)  # first index of last-half
+        half_idx   = max(1, half_idx)                      # always skip pulse 1
         lh_ids     = list(range(half_idx, n_pulses))
-        comp_idx   = min(max(0, compare_pulse), n_pulses - 1)
 
-        C1   = '#2166ac'   # pulse 1   — blue
-        CN   = '#d6604d'   # pulse N   — orange-red
+        C1   = '#2166ac'   # pulse 1       — blue
         CLH  = '#6a0dad'   # last-half avg — purple
         CLHi = '#b39ddb'   # last-half individuals — light purple
 
@@ -2362,16 +3749,6 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
                     avg_s  = np.mean(np.array([s[:min_sl] for s in segs]), axis=0)
                     eax.plot(t_ms[:len(avg_s)], avg_s, color=CLH, lw=2.5, alpha=1.0, zorder=5)
 
-        # Pulse N (compare)
-        segN = _extract(emg, comp_idx)
-        if segN is not None:
-            ax.plot(t_ms[:len(segN)], segN, color=CN, lw=2.5, alpha=1.0, zorder=6,
-                    label=f'Pulse {comp_idx + 1}')
-        for eax, (_, arr_full, _) in zip(extra_axes, extra_channels):
-            eN = _extract(arr_full, comp_idx)
-            if eN is not None:
-                eax.plot(t_ms[:len(eN)], eN, color=CN, lw=2.5, alpha=1.0, zorder=6)
-
         # Pulse 1 (on top)
         seg0 = _extract(emg, 0)
         if seg0 is not None:
@@ -2386,7 +3763,7 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
             ax.legend(loc='upper right', fontsize=8, framealpha=0.75)
 
         ax.set_title(
-            f'Simplified View  ·  {hz} Hz  ·  {n_pulses} pulses  ·  {amp_str}',
+            f'Simplified View  ·  {ft_hz_title(trial, hz)}  ·  {n_pulses} pulses  ·  {amp_str}',
             fontsize=11)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -2424,7 +3801,7 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
         if zoom_pulse is not None and 0 <= zoom_pulse < n_pulses:
             zoom_label = f'  ·  Pulse {zoom_pulse + 1} highlighted'
         ax.set_title(
-            f'Pulse Waveforms  ·  {hz} Hz  ·  {n_pulses} pulses  ·  {amp_str}{zoom_label}',
+            f'Pulse Waveforms  ·  {ft_hz_title(trial, hz)}  ·  {n_pulses} pulses  ·  {amp_str}{zoom_label}',
             fontsize=11)
 
         # Legend
@@ -2534,7 +3911,7 @@ def plot_ft_peak_curve(trial, header, sample_rate=None,
     ax.set_xlabel('Pulse # in train', fontsize=11)
     ax.set_ylabel('Peak |EMG|  (µV)', fontsize=11)
     ax.set_xticks(pulse_idx)
-    title = f'H/M Peak Per Pulse  ·  {hz} Hz  ·  {amp_str}'
+    title = f'H/M Peak Per Pulse  ·  {ft_hz_title(trial, hz)}  ·  {amp_str}'
     if title_suffix:
         title += f'  ·  {title_suffix}'
     ax.set_title(title, fontsize=11)
@@ -2698,7 +4075,7 @@ def plot_ft_sync_alignment(trial, header,
                             label=f'threshold = {adc_threshold} V')
         ax_sync_nom.set_ylabel('ADC sync (V)', fontsize=10)
         ax_sync_nom.set_title(
-            f'ADC sync — windowed at NOMINAL onset  ·  {hz} Hz  ·  {n_pulses} pulses\n'
+            f'ADC sync — windowed at NOMINAL onset  ·  {ft_hz_title(trial, hz)}  ·  {n_pulses} pulses\n'
             'Drift → sync pulse shifts L/R relative to dashed line',
             fontsize=10)
         ax_sync_nom.legend(fontsize=8, loc='upper right')
@@ -2775,7 +4152,7 @@ def plot_ft_sync_alignment(trial, header,
         amp_str = '? mA'
 
     fig.suptitle(
-        f'Sync Alignment Diagnostic  ·  {hz} Hz  ·  {n_pulses} pulses  ·  {amp_str}\n'
+        f'Sync Alignment Diagnostic  ·  {ft_hz_title(trial, hz)}  ·  {n_pulses} pulses  ·  {amp_str}\n'
         f'search window = ±{search_window_pct * 100:.0f}% of period  '
         f'(±{search_half / sr * 1000:.1f} ms)  |  '
         f'ADC threshold = {adc_threshold} V',
@@ -12112,6 +13489,27 @@ def get_ft_pulse_onsets(trial, header, sample_rate=None) -> np.ndarray:
     return result
 
 
+def ft_hz_label(hz: float) -> str:
+    """Human-readable label for a Freq-dropdown Hz value, incl. the
+    :data:`FT_HZ_SINGLE_PULSE` sentinel."""
+    if hz == FT_HZ_SINGLE_PULSE:
+        return 'Single Pulse'
+    return f'{hz} Hz'
+
+
+def ft_hz_title(trial, hz) -> str:
+    """Format an already-computed Hz value for a plot title, substituting
+    'Single Pulse' when *trial* is a Single Pulse trial — the per-pulse
+    ``event_period_us``-derived ``hz`` these single-trial plot functions
+    compute is otherwise misleading for Single Pulse trials (see
+    :func:`compute_ft_trial_hz`'s docstring for why)."""
+    n_p = len(getattr(trial, 'pulse_h_wave_mra', []))
+    cond = getattr(trial, 'condition', 0)
+    if cond == FT_CONDITION_SINGLE_PULSE or (cond == 0 and n_p <= 1):
+        return 'Single Pulse'
+    return f'{hz} Hz'
+
+
 def ft_snap_hz(hz: float, snap_list=None) -> float:
     """Snap *hz* to the nearest entry in *snap_list* (default :data:`FT_SNAP_HZ`).
 
@@ -12160,7 +13558,19 @@ def ft_stim_adc_hz(trial, sr: float) -> float:
 
 
 def compute_ft_trial_hz(trial, header, sr: float, snap_list=None) -> float:
-    """Return the actual pulse-train Hz for one FT trial (3-tier resolution).
+    """Return the actual pulse-train Hz for one FT trial (3-tier resolution),
+    or :data:`FT_HZ_SINGLE_PULSE` for a Single Pulse trial.
+
+    Single Pulse trials (``trial.condition == FT_CONDITION_SINGLE_PULSE``,
+    file_version >= 6) are detected first and returned as the
+    :data:`FT_HZ_SINGLE_PULSE` sentinel rather than falling through to the Hz
+    tiers below: a single pulse has no train period, so ``event_period_us``
+    is programmed as 0 by the app and any Hz derived from the *header's*
+    ``event_period_us`` (Tier 3) would actually reflect whichever Freq A/B
+    condition happened to be configured at the time — silently mislabeling
+    Single Pulse trials as belonging to that Freq group. For file_version < 6
+    recordings (no ``condition`` field, always 0) a Single Pulse trial is
+    instead inferred from ``n_p <= 1``.
 
     Tier 1 — ``event_period_us_trial`` field (future H-Reflex App recordings).
     Tier 2 — ``stim_adc_data`` threshold crossings (:func:`ft_stim_adc_hz`).
@@ -12172,6 +13582,9 @@ def compute_ft_trial_hz(trial, header, sr: float, snap_list=None) -> float:
     n_p = len(getattr(trial, 'pulse_h_wave_mra', []))
     if n_p <= 0:
         return 0.0
+    if getattr(trial, 'condition', 0) == FT_CONDITION_SINGLE_PULSE or \
+       (getattr(trial, 'condition', 0) == 0 and n_p <= 1):
+        return FT_HZ_SINGLE_PULSE
     sr_use = sr or 10000.0
 
     period_us_trial = getattr(trial, 'event_period_us_trial', 0) or 0
@@ -12271,9 +13684,9 @@ def load_all_recordings(recording_dirs, ft_snap_hz_list=None, verbose: bool = Tr
             for _fpath in _all_hrft_paths:
                 _fh, _ft, _fe = read_hrs_ft(_fpath)
                 if _ft and getattr(_fh, 'event_period_us', 0) is not None:
-                    _r_ft_files[id(_fh)] = (_fh, _ft)
+                    _r_ft_files[id(_fh)] = (_fh, _ft, _fe)
             if _r_ft_files:
-                _r_ft_h, _r_ft_t = next(iter(_r_ft_files.values()))
+                _r_ft_h, _r_ft_t, _ = next(iter(_r_ft_files.values()))
                 _n_total = sum(len(v[1]) for v in _r_ft_files.values())
                 if verbose:
                     print(f'   .hrft: {_n_total} trials across {len(_r_ft_files)} file(s)')
@@ -12299,7 +13712,7 @@ def load_all_recordings(recording_dirs, ft_snap_hz_list=None, verbose: bool = Tr
                     for tr in (_r_ft_t or [])]
         if _r_ft_hz and verbose:
             _hz_uniq = sorted(set(_r_ft_hz))
-            print(f'   .hrft Hz values (snapped): {_hz_uniq}')
+            print(f'   .hrft Hz values (snapped): {[ft_hz_label(h) for h in _hz_uniq]}')
 
         _r_sm = {}
         if _r_h2t and (not _r_cm_t or _r_h2t is not _r_cm_t):
@@ -12315,9 +13728,20 @@ def load_all_recordings(recording_dirs, ft_snap_hz_list=None, verbose: bool = Tr
         if _r_s6_t:
             _r_sm['up_cond_vns']    = (_r_s6_t,  _r_s6_h,  _r_s6_e,  'Up Condition VNS (.hrs6)')
         if _r_ft_files:
-            _all_ft_t = [tr for (_fh, _ft) in _r_ft_files.values() for tr in _ft]
+            _all_ft_t = [tr for (_fh, _ft, _fe) in _r_ft_files.values() for tr in _ft]
+            _all_ft_e = [e  for (_fh, _ft, _fe) in _r_ft_files.values() for e  in _fe]
             if _all_ft_t:
-                _r_sm['frequency_test'] = (_all_ft_t, _r_ft_h, [], 'Frequency Test (.hrft)')
+                _r_sm['frequency_test'] = (_all_ft_t, _r_ft_h, _all_ft_e, 'Frequency Test (.hrft)')
+
+        # Auto-reconstruct trial_data for any OFFLINE protocol stage:
+        # raw EMG blocks → differential → session-continuous filtfilt (zero-phase).
+        # Mutates trial objects in-place so rec['ft_trials'] and ft_trial_hz id-maps
+        # all see the updated signal without any extra bookkeeping.
+        for _sk, (_st, _sh, _se, _sl) in _r_sm.items():
+            if getattr(_sh, 'filtering_protocol', '') == FILTERING_PROTOCOL_OFFLINE:
+                _reconstruct_offline_trial_data(
+                    _st, _se, _r_detect_sr,
+                    verbose=verbose, label=f'{_rlabel}/{_sl}')
 
         all_recordings[_rlabel] = {
             'stage_map':    _r_sm,
@@ -12407,7 +13831,7 @@ def make_ft_viewer(all_recordings: dict,
         H-wave integration window (ms relative to each pulse onset).
     """
     import copy as _copy
-    from ipywidgets import (Dropdown, ToggleButtons, Button, Checkbox, FloatText,
+    from ipywidgets import (Dropdown, ToggleButtons, Button, Checkbox, FloatText, IntText,
                             Output, HBox, VBox, Label)
 
     _ft_recs = [rl for rl in all_recordings
@@ -12435,9 +13859,14 @@ def make_ft_viewer(all_recordings: dict,
         'pre_ms':          2.0,
         'post_ms':   float(post_plot_ms),
         'simplified':    False,
-        'compare_pulse': 2,      # 0-based; default = 3rd pulse
         'show_sync':     False,
         'show_stim_adc': False,
+        # ── Trial Average mode ────────────────────────────────────────────────
+        'mode':             'per_trial',  # 'per_trial' or 'trial_avg'
+        'avg_window_start': 0,
+        'avg_n_trials':     5,
+        'show_individual':  True,
+        'avg_simplified':   False,
     }
 
     # ── Widgets ────────────────────────────────────────────────────────────────
@@ -12480,13 +13909,25 @@ def make_ft_viewer(all_recordings: dict,
     _ft_postms_txt = FloatText(value=float(post_plot_ms), description='Post ms:',
                                step=1.0, layout={'width': '158px'})
     _ft_simplified_chk  = Checkbox(value=False, description='Simplified View', indent=False)
-    _ft_compare_txt     = Dropdown(
-        options=[], value=None,
-        description='Compare pulse:', layout={'width': '210px'},
-        disabled=True,
-    )
     _ft_show_sync_chk   = Checkbox(value=False, description='Show Sync', indent=False)
     _ft_show_stim_adc_chk = Checkbox(value=False, description='Show Stim ADC', indent=False)
+    # ── Mode toggle ────────────────────────────────────────────────────────────
+    _ft_mode_tog = ToggleButtons(
+        options=[('Per Trial', 'per_trial'), ('Trial Average', 'trial_avg')],
+        value='per_trial', description='Mode:', button_style='info',
+        style={'button_width': '130px'},
+    )
+    # ── Trial Average widgets ──────────────────────────────────────────────────
+    _ft_avg_rewind_btn   = Button(description='◀◀', button_style='',       layout={'width': '50px'})
+    _ft_avg_prev_btn     = Button(description='◀',  button_style='',       layout={'width': '46px'})
+    _ft_avg_next_btn     = Button(description='▶',  button_style='primary', layout={'width': '46px'})
+    _ft_avg_fwd_btn      = Button(description='▶▶', button_style='primary', layout={'width': '50px'})
+    _ft_avg_reset_btn    = Button(description='Reset', button_style='warning', layout={'width': '80px'})
+    _ft_avg_window_lbl   = Label(value='Trials 1–5 of ?')
+    _ft_avg_n_txt        = IntText(value=5, description='N trials:', layout={'width': '145px'})
+    _ft_avg_show_ind_chk   = Checkbox(value=True,  description='Show individual', indent=False)
+    _ft_avg_simplified_chk = Checkbox(value=False, description='Simplified',      indent=False)
+    _ft_avg_out = Output()
     _ft_wave_out = Output()
     _ft_mra_out  = Output()
     _ft_peak_out = Output()
@@ -12596,40 +14037,82 @@ def make_ft_viewer(all_recordings: dict,
         ft_t, ft_h, sr, hz_map = _ft_get_ctx()
         if ft_h is None:
             return
-        idx      = max(0, min(_ft_st['idx'], len(_ft_st['filtered']) - 1))
-        trial    = _ft_st['filtered'][idx]
-        n_tot    = len(_ft_st['filtered'])
-        hz       = _ft_lookup_hz(trial, ft_h, sr, hz_map)
-        n_p      = getattr(ft_h, 'n_pulses_per_train', 0) or \
-                   max((len(getattr(t, 'pulse_h_wave_mra', [])) for t in ft_t), default=1)
-        ft_h_use = _ft_corrected_header(trial, ft_h, sr)
-        with _ft_wave_out:
-            _ft_wave_out.clear_output(wait=True)
+
+        if _ft_st['mode'] == 'trial_avg':
+            # ── Trial Average render ───────────────────────────────────────────
+            ws  = _ft_st['avg_window_start']
+            nt  = _ft_st['avg_n_trials']
+            sel = _ft_st['filtered'][ws:ws + nt]
+            if not sel:
+                return
+            ft_h_use = _ft_corrected_header(sel[0], ft_h, sr)
+            hz_raw   = getattr(ft_h_use, 'event_period_us', 0)
+            hz       = round(1e6 / hz_raw, 3) if hz_raw else '?'
             amp_info = (f'{_ft_st["amp_filter"]:.3f} mA'
                         if _ft_st['amp_filter'] is not None else 'All amps')
-            print(f'Frequency Test  |  {hz} Hz  |  {n_p} pulses/train  |  {amp_info}'
-                  f'  |  Trial {idx + 1} of {n_tot}  [{_ft_rec_d.value}]')
-            plot_ft_averaged_waveforms(
-                trial, ft_h_use,
-                pre_pulse_ms=_ft_st['pre_ms'],
-                post_pulse_ms=_ft_st['post_ms'],
-                m_start_ms=m_start_ms, m_end_ms=m_end_ms,
-                h_start_ms=h_start_ms, h_end_ms=h_end_ms,
-                sample_rate=sr,
-                zoom_pulse=_ft_st['zoom_pulse'],
-                show_legend=_ft_st['show_legend'],
-                legend_style=_ft_st['legend_style'],
-                y_min=None if _ft_st['y_auto'] else _ft_st['y_min'],
-                y_max=None if _ft_st['y_auto'] else _ft_st['y_max'],
-                fig_w=_ft_st['fig_w'],
-                fig_h=_ft_st['fig_h'],
-                simplified=_ft_st['simplified'],
-                compare_pulse=_ft_st['compare_pulse'],
-                show_sync=_ft_st['show_sync'],
-                show_stim_adc=_ft_st['show_stim_adc'],
-            )
+            _ft_avg_update_label()
+            with _ft_avg_out:
+                _ft_avg_out.clear_output(wait=True)
+                print(f'Trial Average  |  {ft_hz_title(sel[0], hz)}  |  {amp_info}  '
+                      f'|  Trials {ws + 1}–{min(ws + nt, len(_ft_st["filtered"]))} '
+                      f'of {len(_ft_st["filtered"])}  [{_ft_rec_d.value}]')
+                plot_ft_trial_average(
+                    _ft_st['filtered'], ft_h_use,
+                    window_start=ws,
+                    n_trials=nt,
+                    pre_pulse_ms=_ft_st['pre_ms'],
+                    post_pulse_ms=_ft_st['post_ms'],
+                    m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+                    h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+                    sample_rate=sr,
+                    show_individual=_ft_st['show_individual'],
+                    simplified=_ft_st['avg_simplified'],
+                    fig_w=_ft_st['fig_w'],
+                    fig_h=_ft_st['fig_h'],
+                    y_min=None if _ft_st['y_auto'] else _ft_st['y_min'],
+                    y_max=None if _ft_st['y_auto'] else _ft_st['y_max'],
+                    show_stim_adc=_ft_st['show_stim_adc'],
+                    title_suffix=_ft_rec_d.value,
+                )
+        else:
+            # ── Per Trial render ───────────────────────────────────────────────
+            idx      = max(0, min(_ft_st['idx'], len(_ft_st['filtered']) - 1))
+            trial    = _ft_st['filtered'][idx]
+            n_tot    = len(_ft_st['filtered'])
+            hz       = _ft_lookup_hz(trial, ft_h, sr, hz_map)
+            n_p      = getattr(ft_h, 'n_pulses_per_train', 0) or \
+                       max((len(getattr(t, 'pulse_h_wave_mra', [])) for t in ft_t), default=1)
+            ft_h_use = _ft_corrected_header(trial, ft_h, sr)
+            with _ft_wave_out:
+                _ft_wave_out.clear_output(wait=True)
+                amp_info = (f'{_ft_st["amp_filter"]:.3f} mA'
+                            if _ft_st['amp_filter'] is not None else 'All amps')
+                print(f'Frequency Test  |  {ft_hz_label(hz)}  |  {n_p} pulses/train  |  {amp_info}'
+                      f'  |  Trial {idx + 1} of {n_tot}  [{_ft_rec_d.value}]')
+                plot_ft_averaged_waveforms(
+                    trial, ft_h_use,
+                    pre_pulse_ms=_ft_st['pre_ms'],
+                    post_pulse_ms=_ft_st['post_ms'],
+                    m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+                    h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+                    sample_rate=sr,
+                    zoom_pulse=_ft_st['zoom_pulse'],
+                    show_legend=_ft_st['show_legend'],
+                    legend_style=_ft_st['legend_style'],
+                    y_min=None if _ft_st['y_auto'] else _ft_st['y_min'],
+                    y_max=None if _ft_st['y_auto'] else _ft_st['y_max'],
+                    fig_w=_ft_st['fig_w'],
+                    fig_h=_ft_st['fig_h'],
+                    simplified=_ft_st['simplified'],
+                    show_sync=_ft_st['show_sync'],
+                    show_stim_adc=_ft_st['show_stim_adc'],
+                )
 
     def _ft_render_curves():
+        if _ft_st['mode'] == 'trial_avg':
+            _ft_mra_out.clear_output()
+            _ft_peak_out.clear_output()
+            return
         if not _ft_st['filtered']:
             return
         ft_t, ft_h, sr, hz_map = _ft_get_ctx()
@@ -12673,7 +14156,7 @@ def make_ft_viewer(all_recordings: dict,
     def _ft_update_freq_drop():
         freqs = sorted({hz for rl in _ft_recs for hz in _ft_compute_freqs(rl)})
         _ft_st['updating'] = True
-        _ft_freq_drop.options = [('All Hz', None)] + [(f'{f} Hz', f) for f in freqs]
+        _ft_freq_drop.options = [('All Hz', None)] + [(ft_hz_label(f), f) for f in freqs]
         _ft_freq_drop.value   = _ft_st['freq_filter']
         _ft_st['updating'] = False
 
@@ -12693,16 +14176,12 @@ def make_ft_viewer(all_recordings: dict,
         _ft_st['updating'] = True
         _ft_pulse_drop.options = [('All', None)] + [(f'Pulse {k + 1}', k) for k in range(n_p)]
         _ft_pulse_drop.value   = None
-        # Compare-pulse dropdown: pulses 2..n (skip pulse 1 since it's always shown)
-        comp_opts = [(f'Pulse {k + 1}', k) for k in range(1, n_p)]
-        _ft_compare_txt.options = comp_opts
-        cur = _ft_st['compare_pulse']
-        _ft_compare_txt.value = cur if any(v == cur for _, v in comp_opts) else (comp_opts[1][1] if len(comp_opts) > 1 else comp_opts[0][1])
         _ft_st['updating'] = False
 
     def _ft_init_controls():
-        _ft_st['idx']        = 0
-        _ft_st['zoom_pulse'] = None
+        _ft_st['idx']               = 0
+        _ft_st['zoom_pulse']        = None
+        _ft_st['avg_window_start']  = 0
         _ft_update_pol_tog()
         _ft_rebuild_filtered()
         _ft_update_trial_drop()
@@ -12838,18 +14317,79 @@ def make_ft_viewer(all_recordings: dict,
         _ft_legend_style.disabled  = c['new']
         _ft_pulse_drop.disabled    = c['new']
         _ft_back_btn.disabled      = c['new'] or True
-        _ft_compare_txt.disabled   = not c['new']
-        _ft_render_wave()
-
-    def _ft_on_compare(c):
-        if _ft_st['updating']:
-            return
-        _ft_st['compare_pulse'] = c['new']
         _ft_render_wave()
 
     def _ft_on_show_sync(c):
         _ft_st['show_sync'] = c['new']
         _ft_render_wave()
+
+    # ── Trial Average helpers & observers ──────────────────────────────────────
+    def _ft_avg_clamp_window():
+        n = len(_ft_st['filtered'])
+        _ft_st['avg_window_start'] = max(0, min(_ft_st['avg_window_start'],
+                                                 max(0, n - 1)))
+
+    def _ft_avg_update_label():
+        n   = len(_ft_st['filtered'])
+        ws  = _ft_st['avg_window_start']
+        nt  = _ft_st['avg_n_trials']
+        end = min(ws + nt, n)
+        _ft_avg_window_lbl.value = f'Trials {ws + 1}–{end} of {n}'
+        _ft_avg_rewind_btn.disabled = (ws == 0)
+        _ft_avg_prev_btn.disabled   = (ws == 0)
+        _ft_avg_next_btn.disabled   = (ws + nt >= n)
+        _ft_avg_fwd_btn.disabled    = (ws + nt >= n)
+
+    def _ft_on_mode(c):
+        if _ft_st['updating']:
+            return
+        _ft_st['mode'] = c['new']
+        is_avg = (c['new'] == 'trial_avg')
+        _ft_per_trial_section.layout.display = 'none' if is_avg else ''
+        _ft_avg_section.layout.display       = '' if is_avg else 'none'
+        _ft_wave_out.clear_output()
+        _ft_avg_out.clear_output()
+        _ft_render_all()
+
+    def _ft_on_avg_rewind(b):
+        _ft_st['avg_window_start'] = 0
+        _ft_render_wave()
+
+    def _ft_on_avg_prev(b):
+        if _ft_st['avg_window_start'] > 0:
+            _ft_st['avg_window_start'] -= 1
+            _ft_render_wave()
+
+    def _ft_on_avg_next(b):
+        n = len(_ft_st['filtered'])
+        if _ft_st['avg_window_start'] + _ft_st['avg_n_trials'] < n:
+            _ft_st['avg_window_start'] += 1
+            _ft_render_wave()
+
+    def _ft_on_avg_fwd(b):
+        n = len(_ft_st['filtered'])
+        _ft_st['avg_window_start'] = max(0, n - _ft_st['avg_n_trials'])
+        _ft_render_wave()
+
+    def _ft_on_avg_reset(b):
+        _ft_st['avg_window_start'] = 0
+        _ft_render_wave()
+
+    def _ft_on_avg_n(c):
+        _ft_st['avg_n_trials'] = max(1, c['new'])
+        _ft_avg_clamp_window()
+        if _ft_st['mode'] == 'trial_avg':
+            _ft_render_wave()
+
+    def _ft_on_show_individual(c):
+        _ft_st['show_individual'] = c['new']
+        if _ft_st['mode'] == 'trial_avg':
+            _ft_render_wave()
+
+    def _ft_on_avg_simplified(c):
+        _ft_st['avg_simplified'] = c['new']
+        if _ft_st['mode'] == 'trial_avg':
+            _ft_render_wave()
 
     _ft_freq_drop.observe(_ft_on_freq,              names='value')
     _ft_rec_d.observe(_ft_on_rec,                   names='value')
@@ -12870,26 +14410,49 @@ def make_ft_viewer(all_recordings: dict,
     _ft_prems_txt.observe(_ft_on_prems,             names='value')
     _ft_postms_txt.observe(_ft_on_postms,           names='value')
     _ft_simplified_chk.observe(_ft_on_simplified,  names='value')
-    _ft_compare_txt.observe(_ft_on_compare,         names='value')
     _ft_show_sync_chk.observe(_ft_on_show_sync,     names='value')
     _ft_show_stim_adc_chk.observe(_ft_on_show_stim_adc, names='value')
+    _ft_mode_tog.observe(_ft_on_mode,               names='value')
+    _ft_avg_n_txt.observe(_ft_on_avg_n,             names='value')
+    _ft_avg_show_ind_chk.observe(_ft_on_show_individual,  names='value')
+    _ft_avg_simplified_chk.observe(_ft_on_avg_simplified, names='value')
+    _ft_avg_rewind_btn.on_click(_ft_on_avg_rewind)
+    _ft_avg_prev_btn.on_click(_ft_on_avg_prev)
+    _ft_avg_next_btn.on_click(_ft_on_avg_next)
+    _ft_avg_fwd_btn.on_click(_ft_on_avg_fwd)
+    _ft_avg_reset_btn.on_click(_ft_on_avg_reset)
 
     _ft_update_freq_drop()
     _ft_init_controls()
     _ft_render_all()
 
-    return VBox([
-        _ft_rec_d,
-        _ft_pol_row,
-        HBox([_ft_prev_btn, _ft_next_btn, _ft_trial_drop, _ft_amp_drop, _ft_freq_drop]),
+    # ── Section containers (toggled by mode) ──────────────────────────────────
+    _ft_per_trial_section = VBox([
+        HBox([_ft_prev_btn, _ft_next_btn, _ft_trial_drop]),
         HBox([_ft_legend_chk, _ft_legend_style]),
         HBox([_ft_pulse_drop, _ft_back_btn]),
-        HBox([_ft_yauto_chk, _ft_ymin_txt, _ft_ymax_txt,
-              _ft_figw_txt, _ft_figh_txt, _ft_prems_txt, _ft_postms_txt]),
-        HBox([_ft_simplified_chk, _ft_compare_txt, _ft_show_sync_chk, _ft_show_stim_adc_chk]),
+        HBox([_ft_simplified_chk, _ft_show_sync_chk]),
         _ft_wave_out,
         _ft_mra_out,
         _ft_peak_out,
+    ])
+    _ft_avg_section = VBox([
+        HBox([_ft_avg_rewind_btn, _ft_avg_prev_btn, _ft_avg_next_btn,
+              _ft_avg_fwd_btn, _ft_avg_reset_btn,
+              _ft_avg_n_txt, _ft_avg_window_lbl]),
+        HBox([_ft_avg_show_ind_chk, _ft_avg_simplified_chk]),
+        _ft_avg_out,
+    ], layout={'display': 'none'})
+
+    return VBox([
+        _ft_rec_d,
+        _ft_pol_row,
+        HBox([_ft_mode_tog, _ft_amp_drop, _ft_freq_drop]),
+        HBox([_ft_yauto_chk, _ft_ymin_txt, _ft_ymax_txt,
+              _ft_figw_txt, _ft_figh_txt, _ft_prems_txt, _ft_postms_txt]),
+        HBox([_ft_show_stim_adc_chk]),
+        _ft_per_trial_section,
+        _ft_avg_section,
     ])
 
 
@@ -13033,7 +14596,7 @@ def make_ft_sync_viewer(all_recordings: dict,
         ft_h_use = _corrected_header(trial, ft_h, sr)
         with _out:
             _out.clear_output(wait=True)
-            print(f'Sync Alignment  |  {hz} Hz  |  Trial {idx + 1} of {n_tot}  [{_rec_d.value}]')
+            print(f'Sync Alignment  |  {ft_hz_label(hz)}  |  Trial {idx + 1} of {n_tot}  [{_rec_d.value}]')
             plot_ft_sync_alignment(
                 trial, ft_h_use,
                 pre_pulse_ms=_st['pre_ms'],
@@ -13064,7 +14627,7 @@ def make_ft_sync_viewer(all_recordings: dict,
     def _update_freq_drop():
         freqs = sorted({hz for rl in _ft_recs for hz in _compute_freqs(rl)})
         _st['updating'] = True
-        _freq_drop.options = [('All Hz', None)] + [(f'{f} Hz', f) for f in freqs]
+        _freq_drop.options = [('All Hz', None)] + [(ft_hz_label(f), f) for f in freqs]
         _freq_drop.value   = _st['freq_filter']
         _st['updating'] = False
 
@@ -13167,6 +14730,7 @@ def plot_ft_trial_average(trials, header,
                           sample_rate=None,
                           show_individual=True,
                           show_stim_adc=False,
+                          simplified=False,
                           fig_w=11.0, fig_h=5.0,
                           y_min=None, y_max=None,
                           title_suffix=''):
@@ -13204,6 +14768,12 @@ def plot_ft_trial_average(trials, header,
         When True, add a subplot below showing the same cross-trial averaging
         applied to ``trial.stim_adc_data`` (the stimulator's own pulse output)
         instead of EMG.
+    simplified : bool
+        When True, show three groups instead of all per-position coolwarm traces:
+        pulse-1 cross-trial average (blue), per-position cross-trial averages for
+        the last half of the train (faint purple), and the grand mean of those
+        last-half averages (bold purple).  ``show_individual`` fades in per-trial
+        raw traces for the last-half positions as an additional background layer.
     fig_w, fig_h : float
         Figure size (inches).
     y_min, y_max : float or None
@@ -13225,7 +14795,7 @@ def plot_ft_trial_average(trials, header,
     # ── Per-trial extraction params ───────────────────────────────────────────
     header_period_us = getattr(header, 'event_period_us', 0) or 0
     header_n_pulses  = getattr(header, 'n_pulses_per_train', 0) or 0
-    hz_label = f'{round(1e6 / header_period_us, 3)} Hz' if header_period_us > 0 else '? Hz'
+    hz_label = ft_hz_title(sel[0], round(1e6 / header_period_us, 3) if header_period_us > 0 else '?')
 
     def _trial_params(trial):
         """Return (pulse_onsets, n_pulses) for one trial.
@@ -13305,7 +14875,8 @@ def plot_ft_trial_average(trials, header,
         a.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.09, zorder=1)
         a.axvline(h_start_ms, color='green', ls='--', lw=0.9, alpha=0.7, zorder=2)
         a.axvline(h_end_ms,   color='green', ls='--', lw=0.9, alpha=0.7, zorder=2)
-        a.axvline(0, color='#aaa', lw=0.8, ls=':', zorder=1)
+        a.axvline(0, color='black', lw=1.5, ls='-', zorder=2)
+        a.axhline(0, color='black', lw=1.5, ls='-', zorder=2)
 
     _shade(ax)
 
@@ -13342,41 +14913,82 @@ def plot_ft_trial_average(trials, header,
                     bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
                     zorder=8)
 
-    # Per-pulse z-order — pulse 1 drawn in front, later pulses pushed toward the
-    # back, so pulse 1 stays visible on top of the rest of the train regardless
-    # of plotting order.
-    ind_zorder = [2 + (n_pulses - k) for k in range(n_pulses)]
-    avg_zorder = [(n_pulses + 4) + (n_pulses - k) for k in range(n_pulses)]
+    if simplified:
+        # ── Simplified view ───────────────────────────────────────────────────
+        import math as _math
+        half_idx = max(1, n_pulses - _math.ceil(n_pulses / 2))
+        lh_ids   = list(range(half_idx, n_pulses))
 
-    # Individual trial contributions per pulse position (faint)
-    if show_individual:
-        for ti in range(len(sel)):
-            for k in range(n_pulses):
-                if not np.all(np.isnan(arr[ti, k])):
-                    ax.plot(t_ms, arr[ti, k],
-                            color=colors[k], alpha=0.18, lw=0.75, zorder=ind_zorder[k])
-                if stim_ax is not None and not np.all(np.isnan(stim_arr[ti, k])):
-                    stim_ax.plot(t_ms, stim_arr[ti, k],
-                                 color=colors[k], alpha=0.18, lw=0.75, zorder=ind_zorder[k])
+        C1   = '#2166ac'  # pulse 1 cross-trial avg — blue
+        CLH  = '#6a0dad'  # last-half grand avg      — purple
+        CLHi = '#b39ddb'  # last-half per-position   — light purple
 
-    # Cross-trial averages per pulse position (bold, coloured)
-    for k in range(n_pulses):
-        if not np.all(np.isnan(pulse_means[k])):
-            ax.plot(t_ms, pulse_means[k],
-                    color=colors[k], lw=2.2, alpha=0.95, zorder=avg_zorder[k])
-        if stim_ax is not None and not np.all(np.isnan(stim_pulse_means[k])):
-            stim_ax.plot(t_ms, stim_pulse_means[k],
-                         color=colors[k], lw=2.2, alpha=0.95, zorder=avg_zorder[k])
+        def _simp_plot(axis, pmeans, raw_arr):
+            # Optional: per-trial raw traces for last-half positions (deepest layer)
+            if show_individual and raw_arr is not None:
+                for ti in range(len(sel)):
+                    for k in lh_ids:
+                        if not np.all(np.isnan(raw_arr[ti, k])):
+                            axis.plot(t_ms, raw_arr[ti, k],
+                                      color=CLHi, lw=0.7, alpha=0.12, zorder=2)
+            # Per-position cross-trial averages for last-half (faint purple)
+            for k in lh_ids:
+                if not np.all(np.isnan(pmeans[k])):
+                    axis.plot(t_ms, pmeans[k], color=CLHi, lw=0.9, alpha=0.40, zorder=3)
+            # Grand mean of last-half averages (bold purple)
+            lh_segs = [pmeans[k] for k in lh_ids if not np.all(np.isnan(pmeans[k]))]
+            if lh_segs:
+                grand_avg = np.nanmean(np.array(lh_segs), axis=0)
+                axis.plot(t_ms[:len(grand_avg)], grand_avg, color=CLH, lw=2.5, alpha=1.0,
+                          zorder=5,
+                          label=f'Last-half avg  (pulses {half_idx + 1}–{n_pulses})')
+            # Pulse 1 cross-trial average (blue, topmost)
+            if not np.all(np.isnan(pmeans[0])):
+                axis.plot(t_ms, pmeans[0], color=C1, lw=2.5, alpha=1.0, zorder=7,
+                          label='Pulse 1 (avg)')
 
-    # Colorbar — pulse position
-    if n_pulses > 1:
-        sm = plt.cm.ScalarMappable(cmap='coolwarm',
-                                   norm=plt.Normalize(vmin=1, vmax=n_pulses))
-        sm.set_array([])
-        cb = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.018, aspect=30)
-        cb.set_label('Pulse #', fontsize=9)
-        cb.set_ticks([1, n_pulses])
-        cb.set_ticklabels(['1', str(n_pulses)])
+        _simp_plot(ax, pulse_means, arr)
+        if stim_ax is not None:
+            _simp_plot(stim_ax, stim_pulse_means, stim_arr)
+        ax.legend(loc='upper right', fontsize=8, framealpha=0.75)
+
+    else:
+        # ── Full view — all pulse positions, coolwarm ─────────────────────────
+        # Per-pulse z-order — pulse 1 drawn in front, later pulses pushed toward the
+        # back, so pulse 1 stays visible on top of the rest of the train regardless
+        # of plotting order.
+        ind_zorder = [2 + (n_pulses - k) for k in range(n_pulses)]
+        avg_zorder = [(n_pulses + 4) + (n_pulses - k) for k in range(n_pulses)]
+
+        # Individual trial contributions per pulse position (faint)
+        if show_individual:
+            for ti in range(len(sel)):
+                for k in range(n_pulses):
+                    if not np.all(np.isnan(arr[ti, k])):
+                        ax.plot(t_ms, arr[ti, k],
+                                color=colors[k], alpha=0.18, lw=0.75, zorder=ind_zorder[k])
+                    if stim_ax is not None and not np.all(np.isnan(stim_arr[ti, k])):
+                        stim_ax.plot(t_ms, stim_arr[ti, k],
+                                     color=colors[k], alpha=0.18, lw=0.75, zorder=ind_zorder[k])
+
+        # Cross-trial averages per pulse position (bold, coloured)
+        for k in range(n_pulses):
+            if not np.all(np.isnan(pulse_means[k])):
+                ax.plot(t_ms, pulse_means[k],
+                        color=colors[k], lw=2.2, alpha=0.95, zorder=avg_zorder[k])
+            if stim_ax is not None and not np.all(np.isnan(stim_pulse_means[k])):
+                stim_ax.plot(t_ms, stim_pulse_means[k],
+                             color=colors[k], lw=2.2, alpha=0.95, zorder=avg_zorder[k])
+
+        # Colorbar — pulse position
+        if n_pulses > 1:
+            sm = plt.cm.ScalarMappable(cmap='coolwarm',
+                                       norm=plt.Normalize(vmin=1, vmax=n_pulses))
+            sm.set_array([])
+            cb = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.018, aspect=30)
+            cb.set_label('Pulse #', fontsize=9)
+            cb.set_ticks([1, n_pulses])
+            cb.set_ticklabels(['1', str(n_pulses)])
 
     n_used = len(sel)
     ax.set_xlabel('Time from pulse onset (ms)', fontsize=11)
@@ -13396,7 +15008,8 @@ def plot_ft_trial_average(trials, header,
         stim_ax.spines['right'].set_visible(False)
         stim_ax.set_title('Stim ADC', fontsize=9)
 
-    title = (f'Trial Average  ·  {hz_label}  ·  {n_pulses} pulses/train  ·  '
+    _mode_lbl = 'Simplified Trial Average' if simplified else 'Trial Average'
+    title = (f'{_mode_lbl}  ·  {hz_label}  ·  {n_pulses} pulses/train  ·  '
              f'Trials {window_start + 1}–{window_start + n_used}  (n={n_used})')
     if title_suffix:
         title += f'  ·  {title_suffix}'
@@ -13617,7 +15230,7 @@ def make_ft_avg_viewer(all_recordings: dict,
         _update_label()
         with _out:
             _out.clear_output(wait=True)
-            print(f'Trial Average  |  {hz} Hz  |  {amp_info}  '
+            print(f'Trial Average  |  {ft_hz_title(sel[0], hz)}  |  {amp_info}  '
                   f'|  Trials {ws + 1}–{min(ws + nt, len(_st["filtered"]))} '
                   f'of {len(_st["filtered"])}  [{rec_lbl}]')
             plot_ft_trial_average(
@@ -13650,7 +15263,7 @@ def make_ft_avg_viewer(all_recordings: dict,
     def _update_freq_drop():
         freqs = sorted({hz for rl in _ft_recs for hz in _compute_freqs(rl)})
         _st['updating'] = True
-        _freq_drop.options = [('All Hz', None)] + [(f'{f} Hz', f) for f in freqs]
+        _freq_drop.options = [('All Hz', None)] + [(ft_hz_label(f), f) for f in freqs]
         _freq_drop.value   = _st['freq_filter']
         _st['updating'] = False
 
