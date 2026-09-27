@@ -2298,64 +2298,59 @@ def _reconstruct_offline_trial_data(trials, emg_blocks, sample_rate,
                                     verbose=True, label=''):
     """Replace ``trial.trial_data`` in-place with zero-phase (filtfilt) data.
 
-    For recordings tagged ``FILTERING_PROTOCOL_OFFLINE``, the app stored a
-    causal-filtered (sosfilt) version in ``trial.trial_data``.  This function
-    goes back to the two raw EMG channels in ``emg_blocks``, concatenates them
-    into a session-long stream, applies differential subtraction and a
-    zero-phase Butterworth bandpass (100–1000 Hz, order 2, sosfiltfilt over the
-    full session — no per-trial edge effects), then slices each trial's window
-    using cross-correlation alignment against the original ``trial.trial_data``
-    fingerprint (verified 0.0000% error by ``reconstruct_raw_peristimulus.py``).
+    Replicates the ``_apply_filter_config('bp_100_1000_ff')`` approach from
+    Filtering_Analysis.ipynb:
 
-    Mutates ``trial.trial_data`` **in-place** on every trial that can be aligned,
-    so the same objects referenced by ``rec['ft_trials']``, ``rec['stage_map']``,
-    and ``ft_trial_hz`` id-maps all see the updated signal with no bookkeeping.
-    Trials whose onset cannot be located via xcorr are left unchanged.
+    1. Build a sosfilt session cache for xcorr / OE-sample onset alignment.
+    2. Per trial: call ``get_trial_window_from_session_cache(use_raw=True)``
+       with 300 ms warmup prepended — the OE-sample fallback handles trials
+       where xcorr fails (e.g. ``trigger_wall_time_ms`` absent).
+    3. Apply per-trial filtfilt bandpass (100–1000 Hz, order 2).
+    4. Trim warmup.
+    5. Write back in-place so ``rec['ft_trials']`` / ``ft_trial_hz`` id-maps
+       stay consistent.
 
     Returns the same ``trials`` list.
     """
-    from scipy.signal import butter, sosfiltfilt
-
     if not emg_blocks or not trials:
         return trials
 
-    # Step 1: sosfilt cache — used ONLY for xcorr alignment, because trial.trial_data
-    # was written by the app's continuous sosfilt, so xcorr works perfectly here.
     sc = build_session_emg_filter_cache(emg_blocks, sample_rate, method='sosfilt')
     if sc is None:
         if verbose:
             print(f'   [OFFLINE] {label}: no usable EMG blocks — keeping stored data')
         return trials
 
-    # Step 2: filtfilt over the same raw_diff (zero-phase, session-continuous).
-    nyq = sample_rate / 2.0
-    sos_ff = butter(2, [100.0, min(1000.0, 0.9999 * nyq)],
-                    btype='bandpass', output='sos', fs=sample_rate)
-    ff_full = sosfiltfilt(sos_ff, sc['raw_diff'])
+    WARMUP_MS  = 300.0
+    warmup_samp = int(round(WARMUP_MS * sample_rate / 1000.0))
 
-    # Step 3: for each trial, locate onset via xcorr then slice from ff_full.
     n_ok = n_fail = 0
     for t in trials:
         try:
-            onset_arr = locate_trial_onset_xcorr(t, sc)
-            if onset_arr is None:
-                raise ValueError('xcorr onset not found')
-            td = np.asarray(getattr(t, 'trial_data', None) or [], dtype=np.float32)
-            if len(td) == 0:
+            td = getattr(t, 'trial_data', None)
+            if td is None or len(td) == 0:
                 raise ValueError('empty trial_data')
             osi = int(getattr(t, 'onset_sample_index', 0) or 0)
-            pre_samp  = osi
-            post_samp = len(td) - osi
-            i0 = onset_arr - pre_samp
-            i1 = onset_arr + post_samp
-            i0c = max(0, i0)
-            i1c = min(len(ff_full), i1)
-            ff_slice = ff_full[i0c:i1c]
-            # Build output array same length as original; pad with zeros at edges.
-            new_td = np.zeros(len(td), dtype=np.float32)
-            dest_start = i0c - i0
-            new_td[dest_start:dest_start + len(ff_slice)] = ff_slice
-            t.trial_data = new_td  # mutate in-place — id(t) unchanged
+            pre_ms  = osi / sample_rate * 1000.0
+            post_ms = (len(td) - osi) / sample_rate * 1000.0
+
+            # Slice raw_diff with warmup prepended; OE-sample fallback handles
+            # trials that lack trigger_wall_time_ms for xcorr.
+            win = get_trial_window_from_session_cache(
+                t, sc, pre_ms + WARMUP_MS, post_ms, use_raw=True)
+            if win is None:
+                raise ValueError('window not found')
+            _t_ms_full, sig_full = win
+
+            # Per-trial filtfilt, then trim warmup.
+            sig = apply_emg_filter(
+                sig_full, sample_rate, mode='bandpass',
+                lowcut=100.0, highcut=1000.0, order=2, method='filtfilt')
+            sig = sig[warmup_samp:]
+
+            t.trial_data = np.asarray(sig, dtype=np.float32)
+            # onset_sample_index stays the same (pre_ms didn't change)
+            t.onset_sample_index = osi
             n_ok += 1
         except Exception:
             n_fail += 1
@@ -2363,7 +2358,7 @@ def _reconstruct_offline_trial_data(trials, emg_blocks, sample_rate,
     if verbose:
         msg = f'   [OFFLINE] {label}: {n_ok}/{len(trials)} trials rebuilt (raw→diff→filtfilt)'
         if n_fail:
-            msg += f'  ({n_fail} kept stored — xcorr miss)'
+            msg += f'  ({n_fail} kept stored — alignment miss)'
         print(msg)
     return trials
 
