@@ -42,6 +42,13 @@ FILTERING_PROTOCOL_ONLINE  = "ONLINE"
 FILTERING_PROTOCOL_OFFLINE = "OFFLINE"
 FILTERING_PROTOCOL_UNKNOWN = ""
 
+# Pre-stim peri-stimulus background window (used everywhere M/H-wave sizes
+# are background-subtracted).  Grab the 45 ms window from -50 ms to -5 ms
+# relative to stim onset; far enough from the artifact to be clean, but close
+# enough to reflect the state the animal was in at stimulus time.
+PERI_STIM_BG_START_MS = 50.0  # ms before stim onset — start of bg window
+PERI_STIM_BG_END_MS   =  5.0  # ms before stim onset — end   of bg window
+
 # trial.condition values (Frequency Test, file_version >= 6): which of 3
 # randomly-alternating conditions fired for that trial.
 FT_CONDITION_SINGLE_PULSE = 1
@@ -337,7 +344,10 @@ class MhRecTrial:
     m_wave_adjust_step_ma:    float = float('nan')
     m_wave_min_intensity_ma:  float = float('nan')
     m_wave_max_intensity_ma:  float = float('nan')
-    # --- .hrs2 BLOCK_CONTROL_MODE_TRIAL file_version >= 13 ---
+    # M-wave stabiliser direction reversal flag — per stage version thresholds:
+    #   .hrs2 Control Mode >= fv13 (read via EMG-block resync tail scan)
+    #   .hrs4 Up Pellet >= fv7  |  .hrs3 Down Pellet >= fv14
+    #   .hrs6 Up VNS   >= fv6  |  .hrs5 Down VNS    >= fv6
     m_wave_reversed_direction: int = 0  # 0 = normal, 1 = reversed
 
 
@@ -612,6 +622,8 @@ def _read_up_cond_pellet_trial_block(fid: BinaryIO, file_version: int) -> UpCond
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
     if file_version >= 3:
         t.aux_flag = hrs_read_val(fid, 'int8')
+    if file_version >= 7:
+        t.m_wave_reversed_direction = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -640,6 +652,8 @@ def _read_down_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> DownCon
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
     if file_version >= 3:
         t.aux_flag = hrs_read_val(fid, 'int8')
+    if file_version >= 6:
+        t.m_wave_reversed_direction = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -668,6 +682,8 @@ def _read_up_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> UpCondVns
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
     if file_version >= 3:
         t.aux_flag = hrs_read_val(fid, 'int8')
+    if file_version >= 6:
+        t.m_wave_reversed_direction = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -744,6 +760,8 @@ def _read_dcp_trial_block(fid: BinaryIO, file_version: int = 8) -> DcpTrial:
         t.m_wave_adjust_step_ma   = hrs_read_val(fid, 'float32')
         t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
+    if file_version >= 14:
+        t.m_wave_reversed_direction = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -820,6 +838,10 @@ def read_hrs1(filepath: str):
                 header.sample_rate = _as_float
             else:
                 fid.seek(_pos)
+        if header.file_version >= 3:
+            header.booth_snapshot = _read_booth_snapshot(fid)
+        if header.file_version >= 4:
+            header.filter_config = _read_filter_config(fid)
 
         while True:
             chunk = fid.read(4)
@@ -1011,6 +1033,10 @@ def read_hrs3(filepath: str):
         header.stage_type         = hrs_read_val(fid, 'int32')
         if header.file_version >= 9:
             header.app_version = hrs_read_string(fid)
+        if header.file_version >= 13:
+            header.booth_snapshot = _read_booth_snapshot(fid)
+        if header.file_version >= 15:
+            header.filter_config = _read_filter_config(fid)
 
         while True:
             chunk = fid.read(4)
@@ -1069,8 +1095,14 @@ def read_hrs3(filepath: str):
     return header, trials, emg_blocks
 
 
-def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn):
-    """Shared block-loop body for V3 stage readers (hrs4/hrs5/hrs6)."""
+def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn,
+                        booth_snapshot_fv=None, filter_config_fv=None):
+    """Shared block-loop body for V3 stage readers (hrs4/hrs5/hrs6).
+
+    booth_snapshot_fv / filter_config_fv: the file_version threshold at which
+    each new header block first appears for this specific stage.  Pass None to
+    skip a field that was never added to a particular stage.
+    """
     trials, emg_blocks = [], []
     with open(filepath, 'rb') as fid:
         header.file_version       = hrs_read_val(fid, 'int32')
@@ -1084,6 +1116,10 @@ def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn):
             # 12 extra header bytes added in conditioning-stage file_version 3
             # (3 × int32 session-level fields; value 0 in all known files).
             fid.read(12)
+        if booth_snapshot_fv is not None and header.file_version >= booth_snapshot_fv:
+            header.booth_snapshot = _read_booth_snapshot(fid)
+        if filter_config_fv is not None and header.file_version >= filter_config_fv:
+            header.filter_config = _read_filter_config(fid)
 
         _UNIX_MS_LO = 5e11
         _UNIX_MS_HI = 3e12
@@ -1158,7 +1194,8 @@ def read_hrs4(filepath: str):
     """
     header = MhRecHeader()
     trials, emg_blocks = _make_v3_block_loop(
-        filepath, header, BLOCK_UP_COND_PELLET_TRIAL, _read_up_cond_pellet_trial_block)
+        filepath, header, BLOCK_UP_COND_PELLET_TRIAL, _read_up_cond_pellet_trial_block,
+        booth_snapshot_fv=6, filter_config_fv=8)
     if trials:
         header.sample_rate = 10000.0
     header.settings = _load_settings_json(filepath)
@@ -1172,7 +1209,8 @@ def read_hrs5(filepath: str):
     """
     header = MhRecHeader()
     trials, emg_blocks = _make_v3_block_loop(
-        filepath, header, BLOCK_DOWN_COND_VNS_TRIAL, _read_down_cond_vns_trial_block)
+        filepath, header, BLOCK_DOWN_COND_VNS_TRIAL, _read_down_cond_vns_trial_block,
+        booth_snapshot_fv=5, filter_config_fv=7)
     if trials:
         header.sample_rate = 10000.0
     header.settings = _load_settings_json(filepath)
@@ -1186,7 +1224,8 @@ def read_hrs6(filepath: str):
     """
     header = MhRecHeader()
     trials, emg_blocks = _make_v3_block_loop(
-        filepath, header, BLOCK_UP_COND_VNS_TRIAL, _read_up_cond_vns_trial_block)
+        filepath, header, BLOCK_UP_COND_VNS_TRIAL, _read_up_cond_vns_trial_block,
+        booth_snapshot_fv=5, filter_config_fv=7)
     if trials:
         header.sample_rate = 10000.0
     header.settings = _load_settings_json(filepath)
@@ -2298,17 +2337,20 @@ def _reconstruct_offline_trial_data(trials, emg_blocks, sample_rate,
                                     verbose=True, label=''):
     """Replace ``trial.trial_data`` in-place with zero-phase (filtfilt) data.
 
-    Replicates the ``_apply_filter_config('bp_100_1000_ff')`` approach from
-    Filtering_Analysis.ipynb:
+    Matches the ``bp_100_1000_ff`` config used in Filtering_Analysis.ipynb exactly:
 
-    1. Build a sosfilt session cache for xcorr / OE-sample onset alignment.
-    2. Per trial: call ``get_trial_window_from_session_cache(use_raw=True)``
-       with 300 ms warmup prepended — the OE-sample fallback handles trials
-       where xcorr fails (e.g. ``trigger_wall_time_ms`` absent).
-    3. Apply per-trial filtfilt bandpass (100–1000 Hz, order 2).
-    4. Trim warmup.
-    5. Write back in-place so ``rec['ft_trials']`` / ``ft_trial_hz`` id-maps
-       stay consistent.
+    1. Build a sosfilt session cache for OE-sample onset alignment.
+    2. Per trial: determine pre_ms / post_ms from the original trial_data length
+       and onset_sample_index.  Slice raw_diff over (pre_ms + 200 ms) before the
+       onset and (post_ms + 200 ms) after — the symmetric 200 ms on each side
+       conditions both the forward and backward passes of filtfilt before either
+       reaches the analysis window.
+    3. Apply filtfilt bandpass (100–1000 Hz, order 2) to the full extended window.
+    4. Trim both 200 ms conditioning regions, extracting exactly the original
+       (pre_ms + post_ms) window centred on the onset.
+    5. onset_sample_index and stim_adc_data are preserved unchanged — the trimmed
+       window has the same length and onset position as the original trial.
+    6. Write back in-place so rec['ft_trials'] / ft_trial_hz id-maps stay consistent.
 
     Returns the same ``trials`` list.
     """
@@ -2321,8 +2363,7 @@ def _reconstruct_offline_trial_data(trials, emg_blocks, sample_rate,
             print(f'   [OFFLINE] {label}: no usable EMG blocks — keeping stored data')
         return trials
 
-    WARMUP_MS  = 300.0
-    warmup_samp = int(round(WARMUP_MS * sample_rate / 1000.0))
+    WARMUP_MS = 200.0  # symmetric conditioning added to EACH side of the analysis window
 
     n_ok = n_fail = 0
     for t in trials:
@@ -2330,37 +2371,151 @@ def _reconstruct_offline_trial_data(trials, emg_blocks, sample_rate,
             td = getattr(t, 'trial_data', None)
             if td is None or len(td) == 0:
                 raise ValueError('empty trial_data')
-            osi = int(getattr(t, 'onset_sample_index', 0) or 0)
-            pre_ms  = osi / sample_rate * 1000.0
-            post_ms = (len(td) - osi) / sample_rate * 1000.0
 
-            # Slice raw_diff with warmup prepended; OE-sample fallback handles
-            # trials that lack trigger_wall_time_ms for xcorr.
+            osi = int(getattr(t, 'onset_sample_index', 0) or 0)
+            pre_ms    = osi / sample_rate * 1000.0
+            post_ms   = (len(td) - osi) / sample_rate * 1000.0
+            pre_samp  = osi
+            post_samp = len(td) - osi
+
+            # Slice raw_diff: (pre_ms + 200 ms) before onset, (post_ms + 200 ms) after.
+            # Symmetric conditioning ensures both filtfilt passes are settled before
+            # they reach the analysis window.  OE-sample fallback handles trials
+            # that lack trigger_wall_time_ms for xcorr.
             win = get_trial_window_from_session_cache(
-                t, sc, pre_ms + WARMUP_MS, post_ms, use_raw=True)
+                t, sc, pre_ms + WARMUP_MS, post_ms + WARMUP_MS, use_raw=True)
             if win is None:
                 raise ValueError('window not found')
             _t_ms_full, sig_full = win
 
-            # Per-trial filtfilt, then trim warmup.
-            sig = apply_emg_filter(
+            # Onset position in the returned window (may be less than requested
+            # when the trial is near the session start).
+            actual_osi = int(round(-_t_ms_full[0] * sample_rate / 1000.0))
+            s0 = actual_osi - pre_samp   # start of the original analysis window
+            s1 = actual_osi + post_samp  # end   of the original analysis window
+            if s0 < 0 or s1 > len(sig_full):
+                raise ValueError('trim bounds out of range')
+
+            # filtfilt on the full extended window; 200 ms on each side conditions
+            # both passes before they reach the analysis region.
+            sig_ff = apply_emg_filter(
                 sig_full, sample_rate, mode='bandpass',
                 lowcut=100.0, highcut=1000.0, order=2, method='filtfilt')
-            sig = sig[warmup_samp:]
+
+            # Trim both conditioning regions — result is exactly the original window.
+            sig = sig_ff[s0:s1]
 
             t.trial_data = np.asarray(sig, dtype=np.float32)
-            # onset_sample_index stays the same (pre_ms didn't change)
+            # onset_sample_index stays = osi — stim_adc_data alignment preserved.
             t.onset_sample_index = osi
             n_ok += 1
         except Exception:
             n_fail += 1
 
     if verbose:
-        msg = f'   [OFFLINE] {label}: {n_ok}/{len(trials)} trials rebuilt (raw→diff→filtfilt)'
+        msg = (f'   [OFFLINE] {label}: {n_ok}/{len(trials)} trials rebuilt '
+               f'(raw→diff→filtfilt ±200 ms)')
         if n_fail:
             msg += f'  ({n_fail} kept stored — alignment miss)'
         print(msg)
     return trials
+
+
+def apply_filter_method_to_trials(trials, emg_blocks, sample_rate,
+                                   method: str = 'filtfilt',
+                                   warmup_ms: float = 200.0):
+    """Re-filter OFFLINE trial_data from raw diff using the specified method.
+
+    Identical ±200 ms symmetric conditioning and 100–1000 Hz bandpass as
+    ``_reconstruct_offline_trial_data``, but returns **shallow copies** so the
+    stored ``trial.trial_data`` (filtfilt) is never mutated.  Use this at
+    analysis/render time to toggle between filtfilt (zero-phase) and lfilter
+    (causal) views without reloading data.
+
+    For trials where re-filtering fails (insufficient raw data, no session
+    cache, …) the original trial object is returned unchanged.
+
+    Parameters
+    ----------
+    trials : list[MhRecTrial]
+    emg_blocks : list   — raw EMG blocks from the recording
+    sample_rate : float
+    method : str        — ``'filtfilt'`` or ``'lfilter'``
+    warmup_ms : float   — symmetric conditioning added to each side (default 200 ms)
+
+    Returns
+    -------
+    list — shallow copies where re-filtered, originals elsewhere
+    """
+    import copy as _copy
+
+    if not emg_blocks or not trials:
+        return trials
+
+    sc = build_session_emg_filter_cache(emg_blocks, sample_rate, method='sosfilt')
+    if sc is None:
+        return trials
+
+    result = []
+    for t in trials:
+        try:
+            td = getattr(t, 'trial_data', None)
+            if td is None or len(td) == 0:
+                result.append(t)
+                continue
+            osi       = int(getattr(t, 'onset_sample_index', 0) or 0)
+            pre_ms    = osi / sample_rate * 1000.0
+            post_ms   = (len(td) - osi) / sample_rate * 1000.0
+            pre_samp  = osi
+            post_samp = len(td) - osi
+
+            win = get_trial_window_from_session_cache(
+                t, sc, pre_ms + warmup_ms, post_ms + warmup_ms, use_raw=True)
+            if win is None:
+                result.append(t)
+                continue
+            _t_ms_full, sig_full = win
+
+            actual_osi = int(round(-_t_ms_full[0] * sample_rate / 1000.0))
+            s0 = actual_osi - pre_samp
+            s1 = actual_osi + post_samp
+            if s0 < 0 or s1 > len(sig_full):
+                result.append(t)
+                continue
+
+            sig = apply_emg_filter(
+                sig_full, sample_rate, mode='bandpass',
+                lowcut=100.0, highcut=1000.0, order=2, method=method)[s0:s1]
+
+            tc = _copy.copy(t)
+            tc.trial_data = np.asarray(sig, dtype=np.float32)
+            tc.onset_sample_index = osi
+            result.append(tc)
+        except Exception:
+            result.append(t)
+    return result
+
+
+def compute_peri_stim_bg(trial, sample_rate: float,
+                          start_ms: float = None, end_ms: float = None) -> float:
+    """MRA of trial_data in the [-start_ms, -end_ms] window relative to stim onset.
+
+    Defaults to PERI_STIM_BG_START_MS / PERI_STIM_BG_END_MS (50 ms → 5 ms).
+    Falls back gracefully when the stored trial does not extend that far pre-stim
+    (returns the available segment's MRA, or nan if nothing is available).
+    """
+    _start = PERI_STIM_BG_START_MS if start_ms is None else float(start_ms)
+    _end   = PERI_STIM_BG_END_MS   if end_ms   is None else float(end_ms)
+    osi = int(getattr(trial, 'onset_sample_index', 0) or 0)
+    td  = np.asarray(getattr(trial, 'trial_data', []), dtype=float)
+    if len(td) == 0:
+        return float('nan')
+    s0 = max(0, osi - int(round(_start * sample_rate / 1000.0)))
+    s1 = max(s0, osi - int(round(_end   * sample_rate / 1000.0)))
+    s1 = min(s1, len(td))
+    if s1 <= s0:
+        return float('nan')
+    return float(np.nanmean(np.abs(td[s0:s1])))
 
 
 def apply_emg_filter(signal: np.ndarray, sample_rate: float,
@@ -3129,9 +3284,8 @@ def plot_hm_ratio_summary(trials_by_polarity, header,
                                                    record_samples=_rec_s)
             mm = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
             hm = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
-            _bg_mask_hm = t_ms < 0
-            _bg_hm = (float(np.nanmean(np.abs(emg[_bg_mask_hm])))
-                      if _bg_mask_hm.any() else 0.0)
+            _bg_hm = compute_peri_stim_bg(tr, sample_rate)
+            if np.isnan(_bg_hm): _bg_hm = 0.0
             mv = (float(np.nanmean(np.abs(emg[mm]))) - _bg_hm) if mm.any() else np.nan
             hv = (float(np.nanmean(np.abs(emg[hm]))) - _bg_hm) if hm.any() else np.nan
             if np.isfinite(mv):
@@ -3361,10 +3515,10 @@ def plot_mwave_control_error(trials, header, title_suffix: str = '',
             t_ms, emg, _, _, _ = get_trial_window(t, pre_ms, post_ms,
                                                    ms_per_sample=_ms_ps,
                                                    record_samples=_rec_s)
-            mm      = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
-            bg_mask = t_ms < 0
-            bg      = float(np.nanmean(np.abs(emg[bg_mask]))) if bg_mask.any() else 0.0
-            m_size  = float(np.nanmean(np.abs(emg[mm]))) - bg if mm.any() else float('nan')
+            mm     = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+            bg     = compute_peri_stim_bg(t, sample_rate)
+            if np.isnan(bg): bg = 0.0
+            m_size = float(np.nanmean(np.abs(emg[mm]))) - bg if mm.any() else float('nan')
         except Exception:
             m_size = float('nan')
         m_sizes.append(m_size)
@@ -4818,8 +4972,8 @@ def plot_hwave_regression(trials, emg_blocks=None,
             _tr, pre_ms, post_ms,
             ms_per_sample=_ms_ps, bin_samples=_bin_s, record_samples=_rec_s)
         _hm = (_t >= h_start_ms) & (_t <= h_end_ms)
-        _bg_mask_hr = _t < 0
-        _bg_hr = float(np.nanmean(np.abs(_emg[_bg_mask_hr]))) if _bg_mask_hr.any() else 0.0
+        _bg_hr = compute_peri_stim_bg(_tr, sample_rate)
+        if np.isnan(_bg_hr): _bg_hr = 0.0
         h_mra.append((float(np.nanmean(np.abs(_emg[_hm]))) - _bg_hr) if _hm.any() else float('nan'))
 
     # ── per-trial M-wave Size (MRA − pre-stim BG) ────────────────────────
@@ -4829,8 +4983,8 @@ def plot_hwave_regression(trials, emg_blocks=None,
             _tr, pre_ms, post_ms,
             ms_per_sample=_ms_ps, bin_samples=_bin_s, record_samples=_rec_s)
         _mm = (_t >= m_start_ms) & (_t <= m_end_ms)
-        _bg_mask_mr = _t < 0
-        _bg_mr = float(np.nanmean(np.abs(_emg[_bg_mask_mr]))) if _bg_mask_mr.any() else 0.0
+        _bg_mr = compute_peri_stim_bg(_tr, sample_rate)
+        if np.isnan(_bg_mr): _bg_mr = 0.0
         m_mra.append((float(np.nanmean(np.abs(_emg[_mm]))) - _bg_mr) if _mm.any() else float('nan'))
 
     # ── per-trial background bins and grand mean ──────────────────────────
@@ -5483,9 +5637,8 @@ def plot_hrs2_analysis(trials, header,
                                                    ms_per_sample=_ms_ps,
                                                    bin_samples=_bin_s,
                                                    record_samples=_rec_s)
-            _bg_mask_rc = t_ms < 0
-            _bg_rc = (float(np.nanmean(np.abs(emg[_bg_mask_rc])))
-                      if _bg_mask_rc.any() else 0.0)
+            _bg_rc = compute_peri_stim_bg(trial, sample_rate)
+            if np.isnan(_bg_rc): _bg_rc = 0.0
             m_mask = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
             if np.any(m_mask):
                 _md[amp_key].append(np.mean(np.abs(emg[m_mask])) - _bg_rc)
@@ -12000,9 +12153,8 @@ def plot_bin_overview(
                 if t_ref is None:
                     t_ref = tm
                 stacks.append(emg[:len(t_ref)])
-                _bg_mask_bo = tm < 0
-                _bg_bo = (float(np.nanmean(np.abs(emg[_bg_mask_bo])))
-                          if _bg_mask_bo.any() else 0.0)
+                _bg_bo = compute_peri_stim_bg(tr, 1000.0 / ms_per_sample)
+                if np.isnan(_bg_bo): _bg_bo = 0.0
                 mm = (tm >= m_start_ms) & (tm <= m_end_ms)
                 hm = (tm >= h_start_ms) & (tm <= h_end_ms)
                 if mm.any():
@@ -12391,9 +12543,8 @@ def print_bin_statistics(
             m_mra, h_mra, hm = [], [], []
             for tr in bin_trs:
                 tm, emg, _, _, _ = get_trial_window(tr, pre_avg_ms, post_avg_ms, ms_per_sample=ms_per_sample)
-                _bg_mask_bs = tm < 0
-                _bg_bs = (float(np.nanmean(np.abs(emg[_bg_mask_bs])))
-                          if _bg_mask_bs.any() else 0.0)
+                _bg_bs = compute_peri_stim_bg(tr, sample_rate)
+                if np.isnan(_bg_bs): _bg_bs = 0.0
                 mm      = (tm >= m_start_ms) & (tm <= m_end_ms)
                 hm_mask = (tm >= h_start_ms) & (tm <= h_end_ms)
                 if mm.any():
@@ -12451,13 +12602,15 @@ def plot_background_grand_means(hrs2_trials, emg_blocks, header, sample_rate):
     n_stored, n_recon = 0, 0
 
     for tr in hrs2_trials:
-        stored_gm   = getattr(tr, 'background_emg_mean', None)
         stored_bins = getattr(tr, 'background_bins', None)
-        if stored_gm is not None and float(stored_gm) > 0:
-            bg_gm.append(float(stored_gm))
-            n_stored += 1
-        elif stored_bins is not None and len(stored_bins) > 0:
-            bg_gm.append(float(np.mean(stored_bins)))
+        stored_gm   = getattr(tr, 'background_emg_mean', None)
+        # Only trust stored_gm when stored_bins is also populated: bins-present means
+        # the old ~2.5 s monitoring-window formula was used, and stored_gm is its grand
+        # mean. When stored_bins is empty (new format: background_emg_mean now holds
+        # the 45 ms peri-stim snippet instead), reconstruct the monitoring window
+        # background from emg_blocks so this plot stays meaningful.
+        if stored_bins is not None and len(stored_bins) > 0:
+            bg_gm.append(float(stored_gm) if stored_gm is not None else float(np.mean(stored_bins)))
             n_stored += 1
         else:
             _, gm = compute_background_bins(tr, emg_blocks, sample_rate=sample_rate)
@@ -12614,10 +12767,9 @@ def compute_h_comparison_data(all_recordings, pre_ms, post_ms, h_start_ms, h_end
                         t, pre_ms, post_ms,
                         ms_per_sample=ms_per_sample,
                         record_samples=rec_samples)
-                    bg_mask = t_ms < 0
-                    if not bg_mask.any():
+                    bg_mra = compute_peri_stim_bg(t, sr)
+                    if np.isnan(bg_mra):
                         continue
-                    bg_mra = float(np.mean(np.abs(emg[bg_mask])))
                     bg_sizes.append(bg_mra)
                     h_mask = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
                     if h_mask.any():
@@ -12804,7 +12956,8 @@ def prepare_plotly_amp_data(trials, sample_rate, pre_ms, post_ms,
     from collections import defaultdict
     ms_per_sample = 1000.0 / float(sample_rate)
 
-    groups = defaultdict(list)
+    groups       = defaultdict(list)
+    trial_groups = defaultdict(list)
     for trial in trials:
         key = round(trial.stimulation_amplitude_ma, 2)
         t_win, bip_win, adc_win, stim_end, _ = get_trial_window(
@@ -12812,6 +12965,7 @@ def prepare_plotly_amp_data(trials, sample_rate, pre_ms, post_ms,
         _, uni_win, _, _, _ = get_trial_window(
             trial, pre_ms, post_ms, use_unipolar=True, ms_per_sample=ms_per_sample)
         groups[key].append((t_win, bip_win, adc_win, uni_win, stim_end))
+        trial_groups[key].append(trial)
 
     def _pad(rows, n_pts):
         p = np.full((len(rows), n_pts), np.nan)
@@ -12840,9 +12994,9 @@ def prepare_plotly_amp_data(trials, sample_rate, pre_ms, post_ms,
 
         mm = (t_ref >= m_start_ms) & (t_ref <= m_end_ms)
         hm = (t_ref >= h_start_ms) & (t_ref <= h_end_ms)
-        bg_mask_pp = t_ref < 0
-        bg_mra_pp  = (float(np.nanmean(avg_ab[bg_mask_pp]))
-                      if bg_mask_pp.any() else 0.0)
+        _amp_trials = trial_groups[amp]
+        bg_mra_pp = float(np.nanmean([compute_peri_stim_bg(tr, sample_rate) for tr in _amp_trials]))
+        if np.isnan(bg_mra_pp): bg_mra_pp = 0.0
         mi = int(np.argmax(avg_ab[mm])) if mm.any() else 0
         hi = int(np.argmax(avg_ab[hm])) if hm.any() else 0
         m_t    = float(t_ref[mm][mi])  if mm.any() else m_start_ms
