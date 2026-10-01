@@ -330,10 +330,15 @@ class MhRecTrial:
     # --- file_version >= 7 fields ---
     digital_onset_sample_num: int = -1   # absolute OE sample of DIGITAL IN rising edge; -1 = none
     digital_onset_channel: int = -1      # OE digital channel index (0-based); -1 = none
-    # --- file_version >= 9 fields (S1 MH Recruitment Curve only) ---
+    # --- file_version >= 9 fields (S1 MH Recruitment Curve / .hrs1 only at fv9; .hrs2 fv10+ also) ---
     digital_event_sample_offsets: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int32))
     digital_event_channels: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int32))
     digital_event_states: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int8))
+    # --- file_version >= 10 fields (.hrs2 Control Mode only) ---
+    auto_thresholding_enabled: int = 0
+    m_wave_adjust_occurrence: int = 0
+    m_wave_distribution_window_size: int = 0
+    m_wave_adjust_trial_counter: int = 0
     # --- file_version >= 9 fields (S2 Control Mode; inherited by V3 stages) ---
     h_wave_response:          float = float('nan')
     m_wave_response:          float = float('nan')
@@ -514,45 +519,23 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0,
         t.m_wave_min_intensity_ma = hrs_read_val(fid, 'float32')
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
         if file_version >= 10:
-            # fv=10 appends a trailer after the M-wave block whose exact
-            # field layout isn't known (observed as a consistent 43 bytes in
-            # recordings from 2026-09-14, vs. 25 bytes reverse-engineered
-            # from an earlier 2026-08-25 batch — it isn't a fixed constant
-            # across app versions). Rather than assume a byte count, we
-            # resynchronise by scanning forward for the next EMG_DATA block,
-            # confirmed by the same ascending-timestamp signature used
-            # elsewhere in this reader. We deliberately do NOT also treat a
-            # bare trial block_id as a resync candidate here: unlike the
-            # 3-timestamp EMG signature, a single plausible-looking Unix-ms
-            # value is weak enough that it can spuriously match inside the
-            # trailer's own opaque bytes (seen in practice), landing at the
-            # wrong offset. Falls back to "no extra fields" (pre-fv10
-            # layout) if no EMG block is found within the scan window —
-            # which should be rare, since a Control Mode session continuously
-            # emits EMG blocks between trials during background monitoring.
-            _MWAVE_TAIL_UNIX_MS_LO = 5e11
-            _MWAVE_TAIL_UNIX_MS_HI = 3e12
-            _tail_pos  = fid.tell()
-            _tail_peek = fid.read(256)
-            _resync_off = None
-            for _off in range(0, max(0, len(_tail_peek) - 28)):
-                if struct.unpack('<i', _tail_peek[_off:_off + 4])[0] != BLOCK_EMG_DATA:
-                    continue
-                _t0, _t1, _t2 = struct.unpack('<QQQ', _tail_peek[_off + 4:_off + 28])
-                if (_MWAVE_TAIL_UNIX_MS_LO < _t0 < _MWAVE_TAIL_UNIX_MS_HI and
-                        _MWAVE_TAIL_UNIX_MS_LO < _t1 < _MWAVE_TAIL_UNIX_MS_HI and
-                        _MWAVE_TAIL_UNIX_MS_LO < _t2 < _MWAVE_TAIL_UNIX_MS_HI and
-                        _t1 >= _t0 and _t2 >= _t1 and (_t2 - _t0) < 3_600_000):
-                    _resync_off = _off
-                    break
-            # fv >= 13 appends m_wave_reversed_direction (1 byte, int8) after
-            # the M-wave tail, immediately before the next EMG block.
-            # _resync_off points to BLOCK_EMG_DATA; the byte just before it is
-            # m_wave_reversed_direction (when the scan found the EMG block at
-            # offset > 0, meaning there was at least one byte before it).
-            if file_version >= 13 and _resync_off is not None and _resync_off >= 1:
-                t.m_wave_reversed_direction = struct.unpack('b', bytes([_tail_peek[_resync_off - 1]]))[0]
-            fid.seek(_tail_pos + (_resync_off or 0))
+            # Confirmed layout (from control_mode_data_file.py in the app source):
+            #   int8   auto_thresholding_enabled
+            #   int32  m_wave_adjust_occurrence
+            #   int32  m_wave_distribution_window_size
+            #   int32  m_wave_adjust_trial_counter
+            #   int32[]  digital_event_sample_offsets  (count-prefixed)
+            #   int32[]  digital_event_channels         (count-prefixed)
+            #   int8[]   digital_event_states           (count-prefixed)
+            t.auto_thresholding_enabled       = hrs_read_val(fid, 'int8')
+            t.m_wave_adjust_occurrence        = hrs_read_val(fid, 'int32')
+            t.m_wave_distribution_window_size = hrs_read_val(fid, 'int32')
+            t.m_wave_adjust_trial_counter     = hrs_read_val(fid, 'int32')
+            t.digital_event_sample_offsets    = np.array(hrs_read_array(fid, 'int32'), dtype=np.int32)
+            t.digital_event_channels          = np.array(hrs_read_array(fid, 'int32'), dtype=np.int32)
+            t.digital_event_states            = np.array(hrs_read_array(fid, 'int8'),  dtype=np.int8)
+        if file_version >= 13:
+            t.m_wave_reversed_direction = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -1528,7 +1511,10 @@ def get_trial_window(trial: MhRecTrial,
             adc = candidate
 
     stim_end_ms = None
-    if has_sync and onset_idx < len(trial.sync_data):
+    # onset_detected==2 means DIG-IN trigger mode: sync_data is all-zero by design.
+    # Skip threshold detection on a dead channel — it would always return 0 ms.
+    _od_val = getattr(trial, 'onset_detected', 0)
+    if has_sync and _od_val != 2 and onset_idx < len(trial.sync_data):
         ends = np.where(trial.sync_data[onset_idx:] < end_threshold)[0]
         if len(ends) > 0:
             stim_end_ms = float(ends[0]) * ms_per_sample
@@ -1541,6 +1527,314 @@ def get_trial_window(trial: MhRecTrial,
             stim_adc = candidate
 
     return t_ms, emg, adc, stim_end_ms, stim_adc
+
+
+def get_digin_intervals(trial, onset_ref_samples: float, ms_per_sample: float,
+                        t_max_ms: float):
+    """Reconstruct DIGIN (digital input) channel high-intervals, in ms relative
+    to *onset_ref_samples*, from ``trial.digital_event_sample_offsets`` /
+    ``digital_event_channels`` / ``digital_event_states``.
+
+    Mirrors the app's own rising/falling-edge reconstruction exactly: offsets
+    share the same trial-buffer coordinate system as ``trial.onset_sample_index``
+    (sample 0 = start of ``trial_data``), so pass the same ``onset_ref_samples``
+    used to build this trial's EMG time axis (``onset_sample_index`` when
+    ``onset_detected >= 1``, else the bin/trigger-boundary fallback) to get an
+    overlay that lines up with the EMG trace already being plotted.
+
+    Returns ``{channel: [(rise_ms, fall_ms), ...]}``. An interval still high at
+    the end of the window is closed at ``t_max_ms``. Returns ``{}`` when this
+    trial has no event array — this is expected (not a bug) for Control Mode
+    (``.hrs2``) trials, which only ever log a single summary event
+    (``digital_onset_sample_num``/``digital_onset_channel``), never the full
+    per-edge array; use :func:`get_digin_onset_marker` for a fallback in that
+    case.
+    """
+    offsets  = np.asarray(getattr(trial, 'digital_event_sample_offsets', []), dtype=np.int64)
+    channels = np.asarray(getattr(trial, 'digital_event_channels', []), dtype=np.int32)
+    states   = np.asarray(getattr(trial, 'digital_event_states', []), dtype=np.int8)
+    if len(offsets) == 0 or len(offsets) != len(channels) or len(offsets) != len(states):
+        return {}
+
+    events_by_channel = defaultdict(list)
+    for off, ch, st in zip(offsets, channels, states):
+        events_by_channel[int(ch)].append((int(off), int(st)))
+
+    result = {}
+    for ch, evs in events_by_channel.items():
+        evs.sort(key=lambda e: e[0])
+        intervals = []
+        pending_rise_ms = None
+        for off, state in evs:
+            t_ms = (float(off) - onset_ref_samples) * ms_per_sample
+            if state == 1:
+                pending_rise_ms = t_ms
+            elif state == 0 and pending_rise_ms is not None:
+                intervals.append((pending_rise_ms, t_ms))
+                pending_rise_ms = None
+        if pending_rise_ms is not None:
+            intervals.append((pending_rise_ms, t_max_ms))
+        # Pad very narrow intervals (a brief TTL pulse can be sub-millisecond)
+        # to a minimum visible width, symmetrically around the true edges —
+        # otherwise a real, correctly-detected interval can render as an
+        # imperceptible sliver on a 15-40ms-wide plot and look like nothing
+        # happened when the DIGIN toggle is switched on.
+        _MIN_VISIBLE_MS = 0.3
+        _padded = []
+        for rise_ms, fall_ms in intervals:
+            if fall_ms - rise_ms < _MIN_VISIBLE_MS:
+                _pad = (_MIN_VISIBLE_MS - (fall_ms - rise_ms)) / 2.0
+                rise_ms, fall_ms = rise_ms - _pad, fall_ms + _pad
+            _padded.append((rise_ms, fall_ms))
+        result[ch] = _padded
+    return result
+
+
+def get_digin_onset_marker(trial):
+    """Single-event DIGIN fallback for trials with no usable
+    ``digital_event_sample_offsets`` array (see :func:`get_digin_intervals`).
+
+    For Control Mode (``.hrs2``) trials at file_version < 10, no digital event
+    arrays are stored — only the single triggering event is inferrable from
+    ``onset_sample_index``.  At fv>=10 the full arrays are present; callers
+    should prefer :func:`get_digin_intervals` in that case.
+
+    When ``onset_detected == 2`` (onset was found via the digital input line),
+    ``onset_sample_index`` is, by construction, already the trial-buffer
+    position of that channel's rising edge — so it lands at exactly 0 ms in
+    the onset-aligned coordinate system every viewer already uses. Returns
+    ``(0.0, digital_onset_channel)`` in that case, or ``None`` if onset wasn't
+    digitally detected (no digital event info available at all).
+    """
+    if getattr(trial, 'onset_detected', 0) == 2:
+        return (0.0, int(getattr(trial, 'digital_onset_channel', -1)))
+    return None
+
+
+def draw_digin_intervals(ax, intervals: dict, onset_marker=None,
+                         alpha: float = 0.25, zorder: int = 1):
+    """Shade DIGIN channel high-intervals on a matplotlib ``Axes`` (one color
+    per channel, tab10 colormap, one legend entry per channel — matches the
+    app's own plotting style).
+
+    When *intervals* is empty, falls back to drawing a single vertical tick at
+    *onset_marker* (see :func:`get_digin_onset_marker`) if given, rather than
+    silently showing nothing.
+
+    Always adds a small colored triangle marker at the top of the axes (in
+    addition to the shaded span / tick), since the marker-only fallback case
+    lands at exactly t=0 — the same x-position as the plot's own red onset
+    line — where a same-colored or thin vline would otherwise be completely
+    hidden underneath it.
+    """
+    import matplotlib.pyplot as plt
+    colors = plt.cm.tab10.colors
+    _xax = ax.get_xaxis_transform()
+    if intervals:
+        drawn = set()
+        for ch, ivs in sorted(intervals.items()):
+            color = colors[ch % len(colors)]
+            label = f'DIGIN {ch + 1}'
+            for rise_ms, fall_ms in ivs:
+                ax.axvspan(rise_ms, fall_ms, alpha=alpha, color=color,
+                          label=(label if label not in drawn else None), zorder=zorder)
+                ax.plot([(rise_ms + fall_ms) / 2.0], [0.97], marker='v', color=color,
+                        markersize=7, transform=_xax, clip_on=False, zorder=zorder + 10)
+                drawn.add(label)
+    elif onset_marker is not None:
+        t_ms, ch = onset_marker
+        color = colors[ch % len(colors)] if ch >= 0 else 'black'
+        label = f'DIGIN {ch + 1} onset' if ch >= 0 else 'DIGIN onset'
+        ax.axvline(t_ms, color=color, linestyle=':', linewidth=2.0, alpha=0.95,
+                  label=label, zorder=zorder + 5)
+        ax.plot([t_ms], [0.97], marker='v', color=color, markersize=9,
+                transform=_xax, clip_on=False, zorder=zorder + 10)
+
+
+def _nice_tick_step_ms(span_ms, max_ticks=20):
+    """Pick a 'nice' tick step (ms) so an axis spanning *span_ms* shows at
+    most roughly *max_ticks* ticks, regardless of window size — used by
+    :func:`draw_peristim_decorations` for wide windows where a fixed 1ms step
+    would overlap into an unreadable smear.
+    """
+    if span_ms <= 0:
+        return 1
+    raw_step = span_ms / max(1, max_ticks)
+    for step in (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000):
+        if step >= raw_step:
+            return step
+    return 1000
+
+
+def draw_peristim_decorations(ax, t_ms, *,
+                              m_start_ms, m_end_ms, h_start_ms, h_end_ms,
+                              pre_window_ms, post_window_ms,
+                              m_line_y=None, m_size_uv=None,
+                              h_line_y=None, h_size_uv=None,
+                              stim_adc=None, pre_stim_emg_uv=None,
+                              stim_end_ms=None,
+                              digin_trials=None, digin_ms_per_sample=None,
+                              digin_bin_samples=None,
+                              small=True, max_xticks=None):
+    """Shared peri-stimulus panel decorations: grid/x-ticks/axis labels, the
+    red stim-duration box + onset/offset markers, M/H-wave shading + size
+    markers/text, Stim P2P (bottom-left) / Pre-stim EMG (bottom-right) corner
+    annotations, and an optional DIGIN overlay.
+
+    Draws on top of whatever EMG trace(s) the caller already plotted on `ax`
+    — does not touch y-limits or the final legend (callers keep managing
+    those, since y-autoscale/twinx state and which traces got a legend label
+    differ per caller). Used by `plot_hrs2_analysis`, `plot_hrs2_trials`, and
+    `make_failed_trials_viewer` so all three render identically by
+    construction instead of drifting apart as hand-copied code.
+
+    stim_end_ms : the app-stored stim-pulse-end time (ms, relative to onset
+        0). Frequently 0.0 (or ``None``) for ``onset_detected == 2``
+        (digital-trigger) recordings, since it's derived from
+        ``trial.sync_data`` — a dead all-zero channel in that trigger mode.
+        Any value <= 0 (or ``None``) falls back to `m_start_ms` (the
+        stim-artifact zone before the M-wave window) rather than silently
+        collapsing the red box to zero width.
+    digin_trials : list of trials to overlay DIGIN intervals/markers for (pass
+        a single-element list for a single-trial plot, or every trial in an
+        averaged group) — omit/`None` to skip the DIGIN overlay entirely.
+    max_xticks : when ``None`` (default), x-ticks are spaced every 1 ms,
+        matching this function's original behavior. For a much wider window
+        (e.g. the ±100 ms default in `make_failed_trials_viewer`) 1ms ticks
+        overlap into an unreadable smear — pass a target tick count (e.g.
+        ``20``) to instead space ticks at a "nice" step (1/2/5/10/20/25/50/...
+        ms) chosen so the total tick count stays near that target.
+    """
+    fsz = 8 if small else 11
+    lw  = 0.8 if small else 1.5
+
+    # ── DIGIN overlay (drawn first, with its own always-on legend — see
+    # draw_digin_intervals; the other signal-overlay legends below are only
+    # shown in the zoomed, non-`small` view, so DIGIN needs its own) ─────────
+    if digin_trials:
+        for _trial in digin_trials:
+            _od  = getattr(_trial, 'onset_detected', 0)
+            _osi = getattr(_trial, 'onset_sample_index', -1)
+            _onset_ref = _osi if (_od >= 1 and _osi >= 0) else digin_bin_samples
+            _ivs = get_digin_intervals(_trial, _onset_ref, digin_ms_per_sample,
+                                       t_max_ms=post_window_ms)
+            _marker = get_digin_onset_marker(_trial) if not _ivs else None
+            draw_digin_intervals(ax, _ivs, onset_marker=_marker, alpha=0.25)
+        _handles, _labels = ax.get_legend_handles_labels()
+        _seen, _dedup_h, _dedup_l = set(), [], []
+        for _h, _l in zip(_handles, _labels):
+            if _l not in _seen:
+                _seen.add(_l); _dedup_h.append(_h); _dedup_l.append(_l)
+        if _dedup_l:
+            ax.legend(_dedup_h, _dedup_l, loc='upper right', fontsize=fsz - 2)
+
+    # ── Red stim-duration box + onset/offset markers ─────────────────────────
+    end_ms = stim_end_ms if (stim_end_ms is not None and stim_end_ms > 1e-6) else m_start_ms
+    ax.axvspan(0, end_ms, color='red', alpha=0.20)
+    ax.axvline(0,      color='red', linestyle='--', linewidth=lw)
+    ax.axvline(end_ms, color='red', linestyle='--', linewidth=lw)
+
+    # ── M/H-wave shading ──────────────────────────────────────────────────────
+    ax.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.20, zorder=2)
+    ax.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.20, zorder=2)
+    ax.axvline(m_start_ms, color='blue',  linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
+    ax.axvline(m_end_ms,   color='blue',  linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
+    ax.axvline(h_start_ms, color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
+    ax.axvline(h_end_ms,   color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
+
+    if m_line_y is not None and not np.isnan(m_line_y):
+        ax.hlines(m_line_y, m_start_ms, m_end_ms, colors='blue', linestyles='dotted',
+                  linewidth=lw * 2.5, zorder=5, label=f'M-Size: {m_size_uv:.1f} µV')
+        ax.text((m_start_ms + m_end_ms) / 2, 0.93, f'M Size: {m_size_uv:.1f} µV',
+                transform=ax.get_xaxis_transform(),
+                color='blue', fontsize=fsz - 1, ha='center', va='top',
+                bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='blue', alpha=0.85),
+                zorder=8)
+    if h_line_y is not None and not np.isnan(h_line_y):
+        ax.hlines(h_line_y, h_start_ms, h_end_ms, colors='green', linestyles='dotted',
+                  linewidth=lw * 2.5, zorder=5, label=f'H-Size: {h_size_uv:.1f} µV')
+        ax.text((h_start_ms + h_end_ms) / 2, 0.93, f'H Size: {h_size_uv:.1f} µV',
+                transform=ax.get_xaxis_transform(),
+                color='darkgreen', fontsize=fsz - 1, ha='center', va='top',
+                bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
+                zorder=8)
+
+    # ── Stim pulse peak-to-peak annotation (bottom-left) ─────────────────────
+    # Window is [0, m_start_ms) rather than [0, end_ms] — see stim_end_ms note
+    # above; the same sync_data-is-dead issue would otherwise suppress this.
+    if stim_adc is not None and len(stim_adc) > 0:
+        _stm = (t_ms >= 0) & (t_ms <= m_start_ms)
+        if _stm.sum() >= 2:
+            _seg = np.asarray(stim_adc, dtype=float)[_stm]
+            _seg = _seg[~np.isnan(_seg)]
+            if len(_seg) >= 2:
+                _ptp = float(np.max(_seg) - np.min(_seg))
+                ax.text(0.01, 0.01, f'Stim P2P: {_ptp:.3f} V',
+                        transform=ax.transAxes, color='magenta',
+                        fontsize=fsz - 1, ha='left', va='bottom',
+                        bbox=dict(boxstyle='round,pad=0.2', fc='white',
+                                  ec='magenta', alpha=0.85),
+                        zorder=8)
+
+    # ── Pre-stim EMG activity annotation (bottom-right) ──────────────────────
+    if pre_stim_emg_uv is not None and not np.isnan(pre_stim_emg_uv):
+        ax.text(0.99, 0.01, f'Pre-stim EMG: {pre_stim_emg_uv:.1f} µV',
+                transform=ax.transAxes, color='dimgray',
+                fontsize=fsz - 1, ha='right', va='bottom',
+                bbox=dict(boxstyle='round,pad=0.2', fc='white',
+                          ec='dimgray', alpha=0.85),
+                zorder=8)
+
+    # ── Shared axis style ─────────────────────────────────────────────────────
+    ax.set_xlim(-pre_window_ms, post_window_ms)
+    ax.set_xlabel('Time (ms)', fontsize=fsz)
+    ax.set_ylabel('EMG (uV)', fontsize=fsz)
+    ax.tick_params(labelsize=fsz - 1)
+    ax.tick_params(axis='x', width=2.0)
+    ax.spines['bottom'].set_linewidth(2.5)
+    ax.grid(True, alpha=0.3)
+    _min_ms = int(np.floor(t_ms[0]))
+    _max_ms = int(np.ceil(t_ms[-1]))
+    _step = _nice_tick_step_ms(_max_ms - _min_ms, max_xticks) if max_xticks else 1
+    _tick_lo = int(np.floor(_min_ms / _step) * _step)
+    ax.set_xticks(np.arange(_tick_lo, _max_ms + _step, _step))
+
+
+def add_digin_shapes_plotly(fig, intervals: dict, onset_marker=None,
+                            opacity: float = 0.2, row=None, col=None):
+    """Plotly equivalent of :func:`draw_digin_intervals` — adds one
+    ``add_vrect`` per DIGIN high-interval (tab10-equivalent colors, one legend
+    entry per channel via an invisible helper trace, since ``add_vrect`` itself
+    doesn't support a legend), or a single ``add_vline`` fallback when
+    *intervals* is empty and *onset_marker* is given.
+    """
+    import plotly.graph_objects as go
+    _colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+              '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    _kw = {}
+    if row is not None:
+        _kw['row'], _kw['col'] = row, col
+    if intervals:
+        shown = set()
+        for ch, ivs in sorted(intervals.items()):
+            color = _colors[ch % len(_colors)]
+            label = f'DIGIN {ch + 1}'
+            for rise_ms, fall_ms in ivs:
+                fig.add_vrect(x0=rise_ms, x1=fall_ms, fillcolor=color,
+                              opacity=opacity, line_width=0, **_kw)
+            if label not in shown:
+                fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+                                         marker=dict(size=8, color=color, symbol='square'),
+                                         name=label, showlegend=True))
+                shown.add(label)
+    elif onset_marker is not None:
+        t_ms, ch = onset_marker
+        color = _colors[ch % len(_colors)] if ch >= 0 else '#000000'
+        label = f'DIGIN {ch + 1} onset' if ch >= 0 else 'DIGIN onset'
+        fig.add_vline(x=t_ms, line=dict(color=color, dash='dot', width=1.5), **_kw)
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+                                 marker=dict(size=8, color=color, symbol='line-ns'),
+                                 name=label, showlegend=True))
 
 
 def get_trial_context_window(trial: 'MhRecTrial',
@@ -2367,6 +2661,7 @@ def _reconstruct_offline_trial_data(trials, emg_blocks, sample_rate,
 
     n_ok = n_fail = 0
     for t in trials:
+        t._alignment_miss = False
         try:
             td = getattr(t, 'trial_data', None)
             if td is None or len(td) == 0:
@@ -2410,6 +2705,7 @@ def _reconstruct_offline_trial_data(trials, emg_blocks, sample_rate,
             t.onset_sample_index = osi
             n_ok += 1
         except Exception:
+            t._alignment_miss = True
             n_fail += 1
 
     if verbose:
@@ -2852,6 +3148,12 @@ def make_filtering_viewer(all_recordings, active_rec_label,
             _is_online = (getattr(header, 'filtering_protocol', '')
                           == FILTERING_PROTOCOL_ONLINE)
 
+            # Manual correction (ms) from the "Onset offset" field — applied to the
+            # wall-clock-anchored extra-channel lookups (e.g. DIGIN below), which use
+            # trial.trigger_wall_time_ms directly rather than the xcorr-based session
+            # cache alignment the main EMG trace uses above.
+            _total_offset_ms = _offset_f.value
+
             # All modes use the session cache for alignment (xcorr against trial.trial_data,
             # verified 0% error).  ts_open_ephys_sent is NOT an OE sample number — it
             # carries only wall-clock-ish ms — so OE-sample arithmetic via
@@ -2944,26 +3246,25 @@ def make_filtering_viewer(all_recordings, active_rec_label,
                 else:
                     print('Stim ADC: trial.stim_adc_data is empty or not present.')
 
-            # ── DIGIN channel (extracted from emg_blocks; must be a continuous channel) ──
+            # ── DIGIN (digital input) high-intervals for the sync line ───────────────
+            # Referenced to trial.onset_sample_index (the app's own onset index,
+            # same coordinate system as digital_event_sample_offsets) — note this
+            # may show a small residual offset vs. the main trace above, which is
+            # aligned by cross-correlation instead (see get_trial_window_from_session_cache).
             if _digin_c.value:
-                _dg_ctx = get_trial_raw_extra_channel(
-                    trial, emg_blocks, 'DIG',
-                    pre_ms=pre_ms, post_ms=post_ms,
-                    sample_rate=sr, onset_offset_ms=_total_offset_ms)
-                if _dg_ctx is not None:
-                    _dg_t, _dg_data, _dg_name = _dg_ctx
-                    fig.add_trace(go.Scatter(x=_dg_t, y=_dg_data, mode='lines',
-                                             name=f'DIGIN ({_dg_name})',
-                                             line=dict(color='#9467bd', width=1.2),
-                                             yaxis='y2'))
-                    _show_y2 = True
+                # digital_onset_sample_num (_dig_oe_val) is an absolute OE sample
+                # number, a different coordinate system from digital_event_sample_offsets
+                # — only onset_sample_index (trial-buffer-relative) is usable here.
+                if _osi is not None and _osi >= 0:
+                    _dg_ivs = get_digin_intervals(trial, _osi, 1000.0 / sr, t_max_ms=post_ms)
+                    _dg_marker = get_digin_onset_marker(trial) if not _dg_ivs else None
+                    if _dg_ivs or _dg_marker is not None:
+                        add_digin_shapes_plotly(fig, _dg_ivs, onset_marker=_dg_marker)
+                    else:
+                        print('DIGIN: no digital_event data and onset was not digitally detected '
+                              'for this trial.')
                 else:
-                    _sample_blk = sorted(emg_blocks,
-                                         key=lambda b: int(b.ts_background_emitted))[:1]
-                    _avail = ([cn for blk in _sample_blk for cn in blk.channel_names]
-                              if _sample_blk else [])
-                    print(f'DIGIN: no channel containing "DIG" found in emg_blocks. '
-                          f'Available channel names (first block): {_avail}')
+                    print('DIGIN: trial has no usable onset reference.')
 
             fig.add_vrect(x0=m_start_ms, x1=m_end_ms, fillcolor='green', opacity=0.12,
                          line_width=0, annotation_text='M', annotation_position='top left')
@@ -3474,6 +3775,135 @@ def plot_hm_ratio_summary(trials_by_polarity, header,
     plt.show()
 
 
+def compute_mwave_size(trial, sample_rate: float,
+                       m_start_ms: float = 2.0, m_end_ms: float = 4.0,
+                       pre_ms: float = 15.0, post_ms: float = 20.0) -> float:
+    """Per-trial M-wave size (µV): MRA of trial_data in [m_start_ms, m_end_ms]
+    minus the pre-stim background MRA (:func:`compute_peri_stim_bg`).
+
+    Shared convention used by :func:`plot_mwave_control_error` and
+    :func:`plot_mwave_stabilization_groups`. Returns ``nan`` if the trial's
+    window can't be extracted or has no samples in the M-wave range.
+    """
+    _ms_ps = 1000.0 / sample_rate
+    _rec_s = int(TRIAL_RECORD_MS * sample_rate / 1000)
+    try:
+        t_ms, emg, _, _, _ = get_trial_window(trial, pre_ms, post_ms,
+                                              ms_per_sample=_ms_ps,
+                                              record_samples=_rec_s)
+        mm = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+        if not mm.any():
+            return float('nan')
+        bg = compute_peri_stim_bg(trial, sample_rate)
+        if np.isnan(bg):
+            bg = 0.0
+        return float(np.nanmean(np.abs(emg[mm]))) - bg
+    except Exception:
+        return float('nan')
+
+
+def plot_mwave_stabilization_groups(trials, header, sample_rate: float,
+                                    m_start_ms: float = 2.0, m_end_ms: float = 4.0,
+                                    pre_ms: float = 15.0, post_ms: float = 20.0,
+                                    metric: str = 'm_wave_size'):
+    """Bar + whisker + per-trial-dots plot of M-wave stabilization trials,
+    grouped by the stored ``m_wave_distribution_window_size`` (V3 S2+).
+
+    Groups are detected directly from the per-trial stamped value — if you
+    changed the window size mid-recording, each setting shows up as its own
+    group automatically (no need to know when the change happened).
+
+    NOTE: ``m_wave_distribution_window_size`` is not yet read by this codebase
+    — verified against a real fv=14 Control Mode file that the already-known
+    "opaque trailer" after the M-wave block (see ``_read_mh_trial_block``)
+    does NOT contain it (it re-echoes ``onset_sample_index``/
+    ``stim_end_sample_index`` instead, at offsets 17/21). Until the real byte
+    position is found, every trial reports window size -1 and this renders as
+    a single "N=?" group — the bar/whisker/dots and metric toggle are fully
+    functional today, just not yet split by window size.
+
+    Parameters
+    ----------
+    metric : 'm_wave_size' (default) or 'abs_error'
+        'm_wave_size' — each trial's own M-wave size (µV), via
+            :func:`compute_mwave_size`.
+        'abs_error' — ``abs(m_wave_size - trial.m_wave_set_value_uv)``: how far
+            that trial's own M-wave size landed from the stabilizer's target.
+    """
+    import matplotlib.pyplot as plt
+
+    valid_trials = [t for t in trials
+                    if not np.isnan(getattr(t, 'm_wave_error', float('nan'))) or
+                       not np.isnan(getattr(t, 'm_wave_window_median', float('nan')))]
+    if not valid_trials:
+        print('No M-wave stabilization data in these trials.')
+        return
+
+    groups = defaultdict(list)
+    for t in valid_trials:
+        m_size = compute_mwave_size(t, sample_rate, m_start_ms, m_end_ms, pre_ms, post_ms)
+        if np.isnan(m_size):
+            continue
+        if metric == 'abs_error':
+            set_v = getattr(t, 'm_wave_set_value_uv', float('nan'))
+            val = abs(m_size - set_v) if not np.isnan(set_v) else float('nan')
+        else:
+            val = m_size
+        if not np.isnan(val):
+            w = int(getattr(t, 'm_wave_distribution_window_size', -1))
+            groups[w].append(val)
+
+    if not groups:
+        print('No valid M-wave size values to plot.')
+        return
+
+    group_keys = sorted(groups.keys())
+    if group_keys == [-1]:
+        print('Note: m_wave_distribution_window_size is not available in this file '
+              'format yet — showing all trials as a single group.')
+    n = len(group_keys)
+    metric_label = ('M-wave Size (µV)' if metric == 'm_wave_size'
+                    else '|M-wave Size − Set Value| (µV)')
+
+    fig, ax = plt.subplots(figsize=(max(6, n * 1.8), 5))
+    rng = np.random.default_rng(0)
+    y_max = 0.0
+
+    for i, w in enumerate(group_keys):
+        vals = np.asarray(groups[w], dtype=float)
+        mn = float(np.mean(vals))
+        sd = float(np.std(vals, ddof=1)) if len(vals) >= 2 else 0.0
+        ax.bar(i, mn, width=0.55, color='lightsteelblue', edgecolor='steelblue',
+               lw=1.5, zorder=2)
+        if sd > 0:
+            ax.errorbar(i, mn, yerr=sd, fmt='none', ecolor='#1e3a5f',
+                       elinewidth=1.8, capsize=6, zorder=4)
+        jitter = rng.uniform(-0.18, 0.18, size=len(vals))
+        ax.scatter(i + jitter, vals, color='firebrick', s=18, alpha=0.65,
+                  zorder=5, edgecolors='none')
+        top = max(float(vals.max()), mn + sd)
+        y_max = max(y_max, top)
+        ax.text(i, top, f'n={len(vals)}', ha='center', va='bottom',
+               fontsize=9, color='#444', zorder=6)
+
+    ax.set_xticks(range(n))
+    ax.set_xticklabels([f'N={w}' if w >= 0 else 'N=?' for w in group_keys])
+    ax.set_xlabel('M-wave Distribution Window Size (trials)', fontsize=10)
+    ax.set_ylabel(metric_label, fontsize=10)
+    ax.set_title(
+        f'M-Wave Stabilization — {header.subject_id}\n'
+        f'bar = group mean  ·  whisker = ±1 SD  ·  dots = individual trials',
+        fontsize=10)
+    ax.set_xlim(-0.65, n - 0.35)
+    ax.margins(y=0.15)
+    ax.set_ylim(bottom=0)
+    ax.grid(axis='y', alpha=0.3, ls='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_mwave_control_error(trials, header, title_suffix: str = '',
                               m_start_ms: float = 2.0, m_end_ms: float = 4.0,
                               pre_ms: float = 15.0, post_ms: float = 20.0,
@@ -3502,26 +3932,12 @@ def plot_mwave_control_error(trials, header, title_suffix: str = '',
         print("No trials to plot.")
         return
 
-    _ms_ps = 1000.0 / sample_rate
-    _rec_s = int(TRIAL_RECORD_MS * sample_rate / 1000)
-
     trial_nums = list(range(1, len(trials) + 1))
     stim_amps  = [t.stimulation_amplitude_ma for t in trials]
 
     # ── M-wave size from raw EMG ──────────────────────────────────────────────
-    m_sizes = []
-    for t in trials:
-        try:
-            t_ms, emg, _, _, _ = get_trial_window(t, pre_ms, post_ms,
-                                                   ms_per_sample=_ms_ps,
-                                                   record_samples=_rec_s)
-            mm     = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
-            bg     = compute_peri_stim_bg(t, sample_rate)
-            if np.isnan(bg): bg = 0.0
-            m_size = float(np.nanmean(np.abs(emg[mm]))) - bg if mm.any() else float('nan')
-        except Exception:
-            m_size = float('nan')
-        m_sizes.append(m_size)
+    m_sizes = [compute_mwave_size(t, sample_rate, m_start_ms, m_end_ms, pre_ms, post_ms)
+              for t in trials]
 
     # ── Resolve target reference values ──────────────────────────────────────
     if target_uv is not None:
@@ -3712,7 +4128,8 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
                                 fig_w=11.0, fig_h=5.0,
                                 simplified=False,
                                 show_sync=False,
-                                show_stim_adc=False):
+                                show_stim_adc=False,
+                                show_digin=False):
     """All pulse waveforms from a single FT trial overlaid on one plot.
 
     zoom_pulse    : int (0-based) or None.  None = all equal; int = highlight that
@@ -3731,6 +4148,12 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
                     (trial.stim_adc_data — the stimulator's own pulse output)
                     windowed around each displayed pulse. Combines with show_sync
                     (each gets its own row).
+    show_digin    : If True, overlay DIGIN (digital input) high-intervals on the
+                    main EMG axis, re-referenced to each pulse's own onset (one
+                    overlay per displayed pulse, semi-transparent so overlapping
+                    pulses blend) — see get_digin_intervals(). Falls back to a
+                    single onset tick per pulse when only the summary
+                    digital_onset_channel is available (no full event array).
     """
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
@@ -3830,6 +4253,21 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
 
     _shade(ax)
 
+    if show_digin:
+        _ms_ps_dg = 1000.0 / sr
+        for _k in range(n_pulses):
+            if _k >= len(pulse_onsets):
+                break
+            _ivs = get_digin_intervals(trial, int(pulse_onsets[_k]), _ms_ps_dg, t_max_ms=post_pulse_ms)
+            _marker = get_digin_onset_marker(trial) if (not _ivs and _k == 0) else None
+            draw_digin_intervals(ax, _ivs, onset_marker=_marker, alpha=0.08)
+        _handles, _labels = ax.get_legend_handles_labels()
+        _seen, _dedup_h, _dedup_l = set(), [], []
+        for _h, _l in zip(_handles, _labels):
+            if _l not in _seen:
+                _seen.add(_l); _dedup_h.append(_h); _dedup_l.append(_l)
+        if _dedup_l:
+            ax.legend(_dedup_h, _dedup_l, loc='upper left', fontsize=7)
     trans = ax.get_xaxis_transform()
     ax.text((m_start_ms + m_end_ms) / 2, -0.01, 'M-wave',
             transform=trans, ha='center', va='top', fontsize=8,
@@ -5152,7 +5590,14 @@ def plot_hrs2_analysis(trials, header,
             _avg_ab  = np.abs(_avg_b)
             _avg_au  = np.abs(_avg_u)
             _se  = [w[4] for w in _wins if w[4] is not None]
-            _mse = float(np.mean(_se)) if _se else 0.5
+            # None (not a hardcoded placeholder) when no trial in this group has a
+            # usable stim_end_ms — draw_peristim_decorations already falls back to
+            # m_start_ms for that case, exactly like it does for an individual
+            # trial's own stim_end_ms being None; a hardcoded value here would
+            # silently diverge from that per-trial behavior (this used to be 0.5,
+            # which rendered a visibly different, inconsistent box width here vs.
+            # the single-trial viewers for a group with zero valid readings).
+            _mse = float(np.mean(_se)) if _se else None
             _mm  = (_t_ref >= m_start_ms) & (_t_ref <= m_end_ms)
             _hm  = (_t_ref >= h_start_ms) & (_t_ref <= h_end_ms)
             _pre_mask_a = _t_ref < 0
@@ -5269,68 +5714,24 @@ def plot_hrs2_analysis(trials, header,
             _ax2.set_ylabel('ADC (V)', fontsize=fsz - 1)
             _ax2.tick_params(axis='y', labelsize=fsz - 2)
 
-        ax.axvspan(0, end_ms, color='red', alpha=0.20)
-        ax.axvline(0,      color='red', linestyle='--', linewidth=lw)
-        ax.axvline(end_ms, color='red', linestyle='--', linewidth=lw)
-
-        ax.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.20, zorder=2)
-        ax.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.20, zorder=2)
-        ax.axvline(m_start_ms, color='blue',  linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
-        ax.axvline(m_end_ms,   color='blue',  linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
-        ax.axvline(h_start_ms, color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
-        ax.axvline(h_end_ms,   color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
-
-        m_a    = abs(d['m_peak_amp'])
-        h_a    = abs(d['h_peak_amp'])
-        m_size = d.get('m_size', float('nan'))
-        h_size = d.get('h_size', float('nan'))
-        if not np.isnan(m_a):
-            ax.hlines(m_a, m_start_ms, m_end_ms, colors='blue', linestyles='dotted',
-                      linewidth=lw * 2.5, zorder=5, label=f'M-Size: {m_size:.1f} µV')
-            ax.text((m_start_ms + m_end_ms) / 2, 0.93, f'M Size: {m_size:.1f} µV',
-                    transform=ax.get_xaxis_transform(),
-                    color='blue', fontsize=fsz - 1, ha='center', va='top',
-                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='blue', alpha=0.85),
-                    zorder=8)
-        if not np.isnan(h_a):
-            ax.hlines(h_a, h_start_ms, h_end_ms, colors='green', linestyles='dotted',
-                      linewidth=lw * 2.5, zorder=5, label=f'H-Size: {h_size:.1f} µV')
-            ax.text((h_start_ms + h_end_ms) / 2, 0.93, f'H Size: {h_size:.1f} µV',
-                    transform=ax.get_xaxis_transform(),
-                    color='darkgreen', fontsize=fsz - 1, ha='center', va='top',
-                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
-                    zorder=8)
-
-        # ── stim pulse peak-to-peak annotation ───────────────────────────
-        _sa_avg = d.get('avg_stim_adc')
-        if _sa_avg is not None and len(_sa_avg) > 0:
-            _stm = (t >= 0) & (t <= end_ms)
-            if _stm.sum() >= 2:
-                _seg = _sa_avg[_stm]
-                _seg = _seg[~np.isnan(_seg)]
-                if len(_seg) >= 2:
-                    _ptp = float(np.max(_seg) - np.min(_seg))
-                    ax.text(0.01, 0.01, f'Stim P2P: {_ptp:.3f} V',
-                            transform=ax.transAxes, color='magenta',
-                            fontsize=fsz - 1, ha='left', va='bottom',
-                            bbox=dict(boxstyle='round,pad=0.2', fc='white',
-                                      ec='magenta', alpha=0.85),
-                            zorder=8)
-
-        # ── pre-stim EMG activity annotation ─────────────────────────────
         _pre_mask = t < 0
-        if _pre_mask.sum() >= 2:
-            _pre_abs = d['padded_abs_bip'][:, _pre_mask]
-            _pre_emg = float(np.nanmean(_pre_abs))
-            if not np.isnan(_pre_emg):
-                ax.text(0.99, 0.01, f'Pre-stim EMG: {_pre_emg:.1f} µV',
-                        transform=ax.transAxes, color='dimgray',
-                        fontsize=fsz - 1, ha='right', va='bottom',
-                        bbox=dict(boxstyle='round,pad=0.2', fc='white',
-                                  ec='dimgray', alpha=0.85),
-                        zorder=8)
+        _pre_emg = (float(np.nanmean(d['padded_abs_bip'][:, _pre_mask]))
+                   if _pre_mask.sum() >= 2 else float('nan'))
 
-        ax.set_xlim(-pre_avg_ms, post_avg_ms)
+        draw_peristim_decorations(
+            ax, t,
+            m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+            h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+            pre_window_ms=pre_avg_ms, post_window_ms=post_avg_ms,
+            m_line_y=abs(d['m_peak_amp']), m_size_uv=d.get('m_size', float('nan')),
+            h_line_y=abs(d['h_peak_amp']), h_size_uv=d.get('h_size', float('nan')),
+            stim_adc=d.get('avg_stim_adc'), pre_stim_emg_uv=_pre_emg,
+            stim_end_ms=end_ms,
+            digin_trials=d['trials'] if 'digin' in sigs else None,
+            digin_ms_per_sample=_ms_ps, digin_bin_samples=_bin_s,
+            small=small,
+        )
+
         ax.set_ylim(_get_ylim())
         if _ax2 is not None:
             _y1_lo, _y1_hi = ax.get_ylim()
@@ -5340,15 +5741,6 @@ def plot_hrs2_analysis(trials, header,
                 _y2_span = _y2_hi - _y2_lo
                 _ax2.set_ylim(-_zero_frac * _y2_span,
                               (1.0 - _zero_frac) * _y2_span)
-        ax.set_xlabel('Time (ms)', fontsize=fsz)
-        ax.set_ylabel('EMG (uV)', fontsize=fsz)
-        ax.tick_params(labelsize=fsz - 1)
-        ax.tick_params(axis='x', width=2.0)
-        ax.spines['bottom'].set_linewidth(2.5)
-        ax.grid(True, alpha=0.3)
-        _min_ms = int(np.floor(t[0]))
-        _max_ms = int(np.ceil(t[-1]))
-        ax.set_xticks(np.arange(_min_ms, _max_ms + 1, 1))
         if not small:
             ax.legend(fontsize=fsz - 2, loc='upper right')
 
@@ -5535,6 +5927,8 @@ def plot_hrs2_analysis(trials, header,
                             layout={'width': '185px'})
     _cb_abs_uni  = Checkbox(value=False, description='|Unipolar| (purple)',  indent=False,
                             layout={'width': '195px'})
+    _cb_digin    = Checkbox(value=False, description='DIGIN (Sync)',         indent=False,
+                            layout={'width': '175px'})
     _cb_bg       = Checkbox(value=False, description='BG EMG range',          indent=False,
                             layout={'width': '160px'})
 
@@ -5561,6 +5955,7 @@ def plot_hrs2_analysis(trials, header,
     _cb_abs_bip.observe(_make_sig_cb('abs_bip'), names='value')
     _cb_uni.observe(_make_sig_cb('uni'), names='value')
     _cb_abs_uni.observe(_make_sig_cb('abs_uni'), names='value')
+    _cb_digin.observe(_make_sig_cb('digin'), names='value')
 
     def _on_bg_toggle(change):
         _show_bg['val'] = bool(change['new'])
@@ -5603,7 +5998,7 @@ def plot_hrs2_analysis(trials, header,
     _sig_row = HBox([
         VBox([
             HTML('<b>Signal overlays:</b>'),
-            HBox([_cb_adc, _cb_stim_adc, _cb_abs_bip, _cb_uni, _cb_abs_uni]),
+            HBox([_cb_adc, _cb_stim_adc, _cb_abs_bip, _cb_uni, _cb_abs_uni, _cb_digin]),
             HBox([_cb_bg, HTML('<i style="color:#555;font-size:0.85em">'
                                ' toggle BG EMG range in labels</i>')]),
         ]),
@@ -5936,18 +6331,6 @@ def plot_hrs2_trials(trials, header,
             _ax2.set_ylabel('ADC (V)', fontsize=fsz - 1)
             _ax2.tick_params(axis='y', labelsize=fsz - 2)
 
-        if end_ms is not None:
-            ax.axvspan(0, end_ms, color='red', alpha=0.20)
-            ax.axvline(end_ms, color='red', linestyle='--', linewidth=lw)
-        ax.axvline(0, color='red', linestyle='--', linewidth=lw)
-
-        ax.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.20, zorder=2)
-        ax.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.20, zorder=2)
-        ax.axvline(m_start_ms, color='blue',  linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
-        ax.axvline(m_end_ms,   color='blue',  linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
-        ax.axvline(h_start_ms, color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
-        ax.axvline(h_end_ms,   color='green', linestyle='--', linewidth=1.5, alpha=0.9, zorder=3)
-
         _mm = (t >= m_start_ms) & (t <= m_end_ms)
         _hm = (t >= h_start_ms) & (t <= h_end_ms)
         _pre_mask_mh = t < 0
@@ -5957,53 +6340,25 @@ def plot_hrs2_trials(trials, header,
         _h_mra = float(np.nanmean(np.abs(emg[_hm]))) if _hm.any() else float('nan')
         _m_size = _m_mra - _pre_emg_mh
         _h_size = _h_mra - _pre_emg_mh
-        if not np.isnan(_m_mra):
-            ax.hlines(_m_mra, m_start_ms, m_end_ms, colors='blue', linestyles='dotted',
-                      linewidth=lw * 2.5, zorder=5)
-            ax.text((m_start_ms + m_end_ms) / 2, 0.93, f'M Size: {_m_size:.1f} µV',
-                    transform=ax.get_xaxis_transform(),
-                    color='blue', fontsize=fsz - 1, ha='center', va='top',
-                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='blue', alpha=0.85),
-                    zorder=8)
-        if not np.isnan(_h_mra):
-            ax.hlines(_h_mra, h_start_ms, h_end_ms, colors='green', linestyles='dotted',
-                      linewidth=lw * 2.5, zorder=5)
-            ax.text((h_start_ms + h_end_ms) / 2, 0.93, f'H Size: {_h_size:.1f} µV',
-                    transform=ax.get_xaxis_transform(),
-                    color='darkgreen', fontsize=fsz - 1, ha='center', va='top',
-                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='green', alpha=0.85),
-                    zorder=8)
 
-        # ── stim pulse peak-to-peak annotation ───────────────────────────
-        _sa = d.get('stim_adc')
-        if _sa is not None and len(_sa) > 0:
-            _end = end_ms if end_ms is not None else 1.0
-            _stm = (t >= 0) & (t <= _end)
-            if _stm.sum() >= 2:
-                _seg = _sa[_stm]
-                _seg = _seg[~np.isnan(_seg)]
-                if len(_seg) >= 2:
-                    _ptp = float(np.max(_seg) - np.min(_seg))
-                    ax.text(0.01, 0.01, f'Stim P2P: {_ptp:.3f} V',
-                            transform=ax.transAxes, color='magenta',
-                            fontsize=fsz - 1, ha='left', va='bottom',
-                            bbox=dict(boxstyle='round,pad=0.2', fc='white',
-                                      ec='magenta', alpha=0.85),
-                            zorder=8)
-
-        # ── pre-stim EMG activity annotation ─────────────────────────────
         _pre_mask = t < 0
-        if _pre_mask.sum() >= 2:
-            _pre_emg = float(np.nanmean(np.abs(d['emg'][_pre_mask])))
-            if not np.isnan(_pre_emg):
-                ax.text(0.99, 0.01, f'Pre-stim EMG: {_pre_emg:.1f} µV',
-                        transform=ax.transAxes, color='dimgray',
-                        fontsize=fsz - 1, ha='right', va='bottom',
-                        bbox=dict(boxstyle='round,pad=0.2', fc='white',
-                                  ec='dimgray', alpha=0.85),
-                        zorder=8)
+        _pre_emg = (float(np.nanmean(np.abs(d['emg'][_pre_mask])))
+                   if _pre_mask.sum() >= 2 else float('nan'))
 
-        ax.set_xlim(-pre_plot_ms, post_plot_ms)
+        draw_peristim_decorations(
+            ax, t,
+            m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+            h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+            pre_window_ms=pre_plot_ms, post_window_ms=post_plot_ms,
+            m_line_y=_m_mra, m_size_uv=_m_size,
+            h_line_y=_h_mra, h_size_uv=_h_size,
+            stim_adc=d.get('stim_adc'), pre_stim_emg_uv=_pre_emg,
+            stim_end_ms=end_ms,
+            digin_trials=[d['trial']] if 'digin' in sigs else None,
+            digin_ms_per_sample=_ms_ps, digin_bin_samples=_bin_s,
+            small=small,
+        )
+
         ax.set_ylim(_get_ylim())
         if _ax2 is not None:
             _y1_lo, _y1_hi = ax.get_ylim()
@@ -6014,15 +6369,6 @@ def plot_hrs2_trials(trials, header,
                 _ax2.set_ylim(-_zero_frac * _y2_span,
                               (1.0 - _zero_frac) * _y2_span)
 
-        ax.set_xlabel('Time (ms)', fontsize=fsz)
-        ax.set_ylabel('EMG (uV)', fontsize=fsz)
-        ax.tick_params(labelsize=fsz - 1)
-        ax.tick_params(axis='x', width=2.0)
-        ax.spines['bottom'].set_linewidth(2.5)
-        ax.grid(True, alpha=0.3)
-        _min_ms = int(np.floor(t[0]))
-        _max_ms = int(np.ceil(t[-1]))
-        ax.set_xticks(np.arange(_min_ms, _max_ms + 1, 1))
         if not small:
             handles, labels = ax.get_legend_handles_labels()
             if _ax2 is not None:
@@ -6235,6 +6581,8 @@ def plot_hrs2_trials(trials, header,
                             layout={'width': '185px'})
     _cb_stim_adc = Checkbox(value=False, description='Stim ADC (magenta)', indent=False,
                             layout={'width': '195px'}, disabled=not _has_stim_adc)
+    _cb_digin    = Checkbox(value=False, description='DIGIN (Sync)',       indent=False,
+                            layout={'width': '175px'})
     _cb_bg_t     = Checkbox(value=False, description='BG EMG',             indent=False,
                             layout={'width': '130px'})
 
@@ -6286,6 +6634,7 @@ def plot_hrs2_trials(trials, header,
     _view_btn.on_click(_on_view)
     _cb_adc.observe(_make_sig_cb('adc'), names='value')
     _cb_stim_adc.observe(_make_sig_cb('stim_adc'), names='value')
+    _cb_digin.observe(_make_sig_cb('digin'), names='value')
 
     def _on_bg_toggle_t(change):
         _show_bg_t['val'] = bool(change['new'])
@@ -6307,7 +6656,7 @@ def plot_hrs2_trials(trials, header,
     _sig_row = HBox([
         VBox([
             HTML('<b>Signal overlays:</b>'),
-            HBox([_cb_adc, _cb_stim_adc, Label('  '), _abs_emg_btn]),
+            HBox([_cb_adc, _cb_stim_adc, _cb_digin, Label('  '), _abs_emg_btn]),
             HBox([_cb_bg_t, HTML('<i style="color:#555;font-size:0.85em">'
                                  ' show BG EMG in labels</i>')]),
         ]),
@@ -14010,6 +14359,7 @@ def make_ft_viewer(all_recordings: dict,
         'simplified':    False,
         'show_sync':     False,
         'show_stim_adc': False,
+        'show_digin':    False,
         # ── Trial Average mode ────────────────────────────────────────────────
         'mode':             'per_trial',  # 'per_trial' or 'trial_avg'
         'avg_window_start': 0,
@@ -14060,6 +14410,7 @@ def make_ft_viewer(all_recordings: dict,
     _ft_simplified_chk  = Checkbox(value=False, description='Simplified View', indent=False)
     _ft_show_sync_chk   = Checkbox(value=False, description='Show Sync', indent=False)
     _ft_show_stim_adc_chk = Checkbox(value=False, description='Show Stim ADC', indent=False)
+    _ft_show_digin_chk = Checkbox(value=False, description='Show DIGIN (Sync)', indent=False)
     # ── Mode toggle ────────────────────────────────────────────────────────────
     _ft_mode_tog = ToggleButtons(
         options=[('Per Trial', 'per_trial'), ('Trial Average', 'trial_avg')],
@@ -14221,6 +14572,7 @@ def make_ft_viewer(all_recordings: dict,
                     y_min=None if _ft_st['y_auto'] else _ft_st['y_min'],
                     y_max=None if _ft_st['y_auto'] else _ft_st['y_max'],
                     show_stim_adc=_ft_st['show_stim_adc'],
+                    show_digin=_ft_st['show_digin'],
                     title_suffix=_ft_rec_d.value,
                 )
         else:
@@ -14255,6 +14607,7 @@ def make_ft_viewer(all_recordings: dict,
                     simplified=_ft_st['simplified'],
                     show_sync=_ft_st['show_sync'],
                     show_stim_adc=_ft_st['show_stim_adc'],
+                    show_digin=_ft_st['show_digin'],
                 )
 
     def _ft_render_curves():
@@ -14472,6 +14825,10 @@ def make_ft_viewer(all_recordings: dict,
         _ft_st['show_sync'] = c['new']
         _ft_render_wave()
 
+    def _ft_on_show_digin(c):
+        _ft_st['show_digin'] = c['new']
+        _ft_render_wave()
+
     # ── Trial Average helpers & observers ──────────────────────────────────────
     def _ft_avg_clamp_window():
         n = len(_ft_st['filtered'])
@@ -14561,6 +14918,7 @@ def make_ft_viewer(all_recordings: dict,
     _ft_simplified_chk.observe(_ft_on_simplified,  names='value')
     _ft_show_sync_chk.observe(_ft_on_show_sync,     names='value')
     _ft_show_stim_adc_chk.observe(_ft_on_show_stim_adc, names='value')
+    _ft_show_digin_chk.observe(_ft_on_show_digin,   names='value')
     _ft_mode_tog.observe(_ft_on_mode,               names='value')
     _ft_avg_n_txt.observe(_ft_on_avg_n,             names='value')
     _ft_avg_show_ind_chk.observe(_ft_on_show_individual,  names='value')
@@ -14599,7 +14957,7 @@ def make_ft_viewer(all_recordings: dict,
         HBox([_ft_mode_tog, _ft_amp_drop, _ft_freq_drop]),
         HBox([_ft_yauto_chk, _ft_ymin_txt, _ft_ymax_txt,
               _ft_figw_txt, _ft_figh_txt, _ft_prems_txt, _ft_postms_txt]),
-        HBox([_ft_show_stim_adc_chk]),
+        HBox([_ft_show_stim_adc_chk, _ft_show_digin_chk]),
         _ft_per_trial_section,
         _ft_avg_section,
     ])
@@ -14879,6 +15237,7 @@ def plot_ft_trial_average(trials, header,
                           sample_rate=None,
                           show_individual=True,
                           show_stim_adc=False,
+                          show_digin=False,
                           simplified=False,
                           fig_w=11.0, fig_h=5.0,
                           y_min=None, y_max=None,
@@ -14917,6 +15276,10 @@ def plot_ft_trial_average(trials, header,
         When True, add a subplot below showing the same cross-trial averaging
         applied to ``trial.stim_adc_data`` (the stimulator's own pulse output)
         instead of EMG.
+    show_digin : bool
+        When True, overlay each selected trial's DIGIN high-intervals (one per
+        trial per pulse position, semi-transparent) on the main axis — see
+        get_digin_intervals().
     simplified : bool
         When True, show three groups instead of all per-position coolwarm traces:
         pulse-1 cross-trial average (blue), per-position cross-trial averages for
@@ -15029,6 +15392,26 @@ def plot_ft_trial_average(trials, header,
 
     _shade(ax)
 
+    if show_digin:
+        _ms_ps_dg = 1000.0 / sr
+        for _trial in sel:
+            _has_events = len(getattr(_trial, 'digital_event_sample_offsets', [])) > 0
+            if _has_events:
+                _onsets, _ = _trial_params(_trial)
+                for _onset in _onsets:
+                    _ivs = get_digin_intervals(_trial, int(_onset), _ms_ps_dg, t_max_ms=post_pulse_ms)
+                    draw_digin_intervals(ax, _ivs, onset_marker=None, alpha=0.04)
+            else:
+                _marker = get_digin_onset_marker(_trial)
+                if _marker is not None:
+                    draw_digin_intervals(ax, {}, onset_marker=_marker, alpha=0.04)
+        _handles, _labels = ax.get_legend_handles_labels()
+        _seen, _dedup_h, _dedup_l = set(), [], []
+        for _h, _l in zip(_handles, _labels):
+            if _l not in _seen:
+                _seen.add(_l); _dedup_h.append(_h); _dedup_l.append(_l)
+        if _dedup_l:
+            ax.legend(_dedup_h, _dedup_l, loc='upper left', fontsize=7)
     trans = ax.get_xaxis_transform()
     ax.text((m_start_ms + m_end_ms) / 2, -0.01, 'M-wave',
             transform=trans, ha='center', va='top', fontsize=8,
@@ -15217,6 +15600,7 @@ def make_ft_avg_viewer(all_recordings: dict,
         'n_trials':       5,
         'show_individual': True,
         'show_stim_adc':  False,
+        'show_digin':     False,
         'pre_ms':         2.0,
         'post_ms':        float(post_plot_ms),
         'y_auto':         True,
@@ -15259,6 +15643,7 @@ def make_ft_avg_viewer(all_recordings: dict,
     _yauto_chk   = Checkbox(value=True,  description='Auto Y',          indent=False)
     _show_ind_chk = Checkbox(value=True, description='Show individual', indent=False)
     _show_stim_adc_chk = Checkbox(value=False, description='Show Stim ADC', indent=False)
+    _show_digin_chk = Checkbox(value=False, description='Show DIGIN (Sync)', indent=False)
     _ymin_txt  = FloatText(value=-500.0, description='Y min:', step=50,
                            layout={'width': '165px'}, disabled=True)
     _ymax_txt  = FloatText(value=500.0,  description='Y max:', step=50,
@@ -15397,6 +15782,7 @@ def make_ft_avg_viewer(all_recordings: dict,
                 y_min=None if _st['y_auto'] else _st['y_min'],
                 y_max=None if _st['y_auto'] else _st['y_max'],
                 show_stim_adc=_st['show_stim_adc'],
+                show_digin=_st['show_digin'],
                 title_suffix=rec_lbl,
             )
 
@@ -15468,6 +15854,10 @@ def make_ft_avg_viewer(all_recordings: dict,
 
     def _on_show_stim_adc(c):
         _st['show_stim_adc'] = c['new']
+        _render()
+
+    def _on_show_digin(c):
+        _st['show_digin'] = c['new']
         _render()
 
     def _on_amp(c):
@@ -15548,6 +15938,7 @@ def make_ft_avg_viewer(all_recordings: dict,
     _ymax_txt.observe(_on_ymax,      names='value')
     _show_ind_chk.observe(_on_show_ind, names='value')
     _show_stim_adc_chk.observe(_on_show_stim_adc, names='value')
+    _show_digin_chk.observe(_on_show_digin, names='value')
 
     _update_freq_drop()
     _init_controls()
@@ -15560,7 +15951,7 @@ def make_ft_avg_viewer(all_recordings: dict,
         HBox([_rewind_btn, _prev_btn, _next_btn, _fwd_btn,
               _reset_btn, _n_txt, _window_lbl]),
         HBox([_prems_txt, _postms_txt, _figw_txt, _figh_txt]),
-        HBox([_yauto_chk, _ymin_txt, _ymax_txt, _show_ind_chk, _show_stim_adc_chk]),
+        HBox([_yauto_chk, _ymin_txt, _ymax_txt, _show_ind_chk, _show_stim_adc_chk, _show_digin_chk]),
         _out,
     ])
 
@@ -15684,6 +16075,16 @@ def _write_mh_trial_block(fid: BinaryIO, trial: MhRecTrial,
         hrs_write_val(fid, trial.m_wave_adjust_step_ma,              'float32')
         hrs_write_val(fid, trial.m_wave_min_intensity_ma,            'float32')
         hrs_write_val(fid, trial.m_wave_max_intensity_ma,            'float32')
+        if file_version >= 10:
+            hrs_write_val(fid, trial.auto_thresholding_enabled,       'int8')
+            hrs_write_val(fid, trial.m_wave_adjust_occurrence,        'int32')
+            hrs_write_val(fid, trial.m_wave_distribution_window_size, 'int32')
+            hrs_write_val(fid, trial.m_wave_adjust_trial_counter,     'int32')
+            hrs_write_array(fid, trial.digital_event_sample_offsets,  'int32')
+            hrs_write_array(fid, trial.digital_event_channels,        'int32')
+            hrs_write_array(fid, trial.digital_event_states,          'int8')
+        if file_version >= 13:
+            hrs_write_val(fid, trial.m_wave_reversed_direction,       'int8')
 
 
 def _write_mh_trial_block_full(fid: BinaryIO, trial: MhRecTrial) -> None:
@@ -15712,6 +16113,297 @@ def _write_mh_trial_block_full(fid: BinaryIO, trial: MhRecTrial) -> None:
     hrs_write_val(fid, trial.stim_polarity_reversed,             'int8')
     hrs_write_val(fid, trial.digital_onset_sample_num,           'int64')
     hrs_write_val(fid, trial.digital_onset_channel,              'int32')
+
+
+def make_failed_trials_viewer(all_recordings,
+                               pre_ms: float = 100.0,
+                               post_ms: float = 100.0,
+                               m_start_ms: float = 2.0,
+                               m_end_ms:   float = 4.0,
+                               h_start_ms: float = 6.0,
+                               h_end_ms:   float = 9.0):
+    """Interactive viewer for alignment-miss trials, styled identically to make_ft_viewer.
+
+    Scans all stages in *all_recordings* for trials where ``_alignment_miss`` was set
+    to ``True`` by ``_reconstruct_offline_trial_data``.
+
+    Controls (same layout as make_ft_viewer):
+
+    - Prev / Next       — navigate between missed trials
+    - Auto Y / Y min / Y max — manual EMG y-axis limits
+    - Fig W / Fig H     — figure dimensions
+    - Pre ms / Post ms  — window around stored onset
+    - Show Stim ADC     — adds Stim ADC subplot row below EMG (steelblue)
+    - Show Sync         — adds Sync analog-in subplot row below EMG (darkgreen)
+    - Show Sync DIG IN  — overlays red axvspan shading on all subplots for DIG-IN "On" periods
+    - Show ±10 s context — optional wider EMG-block context figure
+    """
+    from ipywidgets import (Button, Checkbox, FloatText, Output, HBox, VBox, Label)
+
+    # ── Collect alignment-miss trials ──────────────────────────────────────────
+    _items = []
+    for _rl, _rec in all_recordings.items():
+        for _sk, (_trials, _hdr, _emg_bl, _slbl) in _rec.get('stage_map', {}).items():
+            _sr = float(_rec.get('sample_rate') or
+                        getattr(_hdr, 'sample_rate', None) or SAMPLE_RATE)
+            for _i, _t in enumerate(_trials):
+                if getattr(_t, '_alignment_miss', False):
+                    _items.append((_rl, _sk, _slbl, _i, _t, _sr, _emg_bl, _hdr))
+
+    if not _items:
+        return Label('No alignment-miss trials found.  '
+                     'Run load_all_recordings with OFFLINE recordings to flag failed trials.')
+
+    _n = len(_items)
+
+    # ── State ─────────────────────────────────────────────────────────────────
+    _st = {
+        'idx':           0,
+        'y_auto':        True,
+        'y_min':        -1000.0,
+        'y_max':         1000.0,
+        'fig_w':          11.0,
+        'fig_h':           5.0,
+        'pre_ms':         float(pre_ms),
+        'post_ms':        float(post_ms),
+        'show_stim_adc':  False,
+        'show_sync':      False,
+        'show_dig_in':    False,
+        'show_ctx':       False,
+    }
+
+    # ── Widgets (mirroring make_ft_viewer layout exactly) ──────────────────────
+    _prev_btn     = Button(description='Prev', button_style='')
+    _next_btn     = Button(description='Next', button_style='primary')
+    _trial_lbl    = Label(value='')
+    _yauto_chk    = Checkbox(value=True,    description='Auto Y',          indent=False)
+    _ymin_txt     = FloatText(value=-1000.0, description='Y min:', step=50,
+                              layout={'width': '165px'}, disabled=True)
+    _ymax_txt     = FloatText(value=1000.0,  description='Y max:', step=50,
+                              layout={'width': '165px'}, disabled=True)
+    _figw_txt     = FloatText(value=11.0, description='Fig W:', step=0.5,
+                              layout={'width': '145px'})
+    _figh_txt     = FloatText(value=5.0,  description='Fig H:', step=0.5,
+                              layout={'width': '145px'})
+    _prems_txt    = FloatText(value=float(pre_ms),  description='Pre ms:',
+                              step=5.0, layout={'width': '148px'})
+    _postms_txt   = FloatText(value=float(post_ms), description='Post ms:',
+                              step=5.0, layout={'width': '158px'})
+    _stim_adc_chk = Checkbox(value=False, description='Show Stim ADC',    indent=False)
+    _sync_chk     = Checkbox(value=False, description='Show Sync',         indent=False)
+    _dig_in_chk   = Checkbox(value=False, description='Show DIG IN spans',  indent=False)
+    _ctx_chk      = Checkbox(value=False, description='Show ±10 s context', indent=False)
+    _out     = Output()
+    _ctx_out = Output()
+
+    # ── Label updater ──────────────────────────────────────────────────────────
+    def _update_lbl():
+        _rl, _sk, _slbl, _i, _t, *_ = _items[_st['idx']]
+        amp = getattr(_t, 'stimulation_amplitude_ma', float('nan'))
+        _trial_lbl.value = (f"Miss {_st['idx'] + 1} / {_n}  —  {_rl}  |  {_slbl}  "
+                            f"|  trial [{_i}]  |  {amp:.3f} mA")
+
+    # ── Main draw ─────────────────────────────────────────────────────────────
+    def _draw(idx):
+        _rl, _sk, _slbl, _i, _t, _sr, _emg_bl, _hdr = _items[idx]
+        _ms    = 1000.0 / _sr
+        _bin_s = int(BIN_DURATION_MS * _sr / 1000)
+        _rec_s = int(TRIAL_RECORD_MS  * _sr / 1000)
+
+        # Use get_trial_window exactly as plot_hrs2_trials does — this ensures
+        # identical onset detection (stored index → sync detection → bin fallback)
+        # and identical time axis zero point.
+        t_ms, emg_w, sync_w, stim_end_ms, sadc_w = get_trial_window(
+            _t, _st['pre_ms'], _st['post_ms'],
+            ms_per_sample=_ms, bin_samples=_bin_s, record_samples=_rec_s)
+
+        # M/H size — same convention as plot_hrs2_trials' _draw_trial_panel,
+        # so the M/H size annotations match exactly.
+        _pre_mask = t_ms < 0
+        _pre_emg  = (float(np.nanmean(np.abs(emg_w[_pre_mask])))
+                    if emg_w is not None and _pre_mask.sum() >= 2 else float('nan'))
+        _bg_for_size = _pre_emg if not np.isnan(_pre_emg) else 0.0
+        _mm = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
+        _hm = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
+        _m_mra = (float(np.nanmean(np.abs(emg_w[_mm]))) if emg_w is not None and _mm.any()
+                 else float('nan'))
+        _h_mra = (float(np.nanmean(np.abs(emg_w[_hm]))) if emg_w is not None and _hm.any()
+                 else float('nan'))
+        _m_size = _m_mra - _bg_for_size
+        _h_size = _h_mra - _bg_for_size
+
+        # Extra channel subplot rows: Stim ADC and/or Sync
+        extra_ch = []
+        if _st['show_stim_adc'] and sadc_w is not None and len(sadc_w) > 0:
+            extra_ch.append(('Stim ADC', sadc_w, 'Stim ADC (V)', 'steelblue', True))
+        if _st['show_sync']     and sync_w  is not None and len(sync_w)  > 0:
+            extra_ch.append(('Sync (analog in)', sync_w, 'Sync (V)', 'darkgreen', True))
+        n_extra = len(extra_ch)
+
+        amp   = getattr(_t, 'stimulation_amplitude_ma', float('nan'))
+        title = (f'{_rl}  |  {_slbl}  |  trial [{_i}]  |  {amp:.3f} mA'
+                 f'  [ALIGNMENT MISS — stored data]')
+
+        with _out:
+            _out.clear_output(wait=True)
+            try:
+                # Figure layout — identical to plot_ft_averaged_waveforms
+                fig_h_use = _st['fig_h'] * (1.0 + 0.45 * n_extra)
+                if n_extra > 0:
+                    height_ratios = [3] + [1] * n_extra
+                    fig, axes = plt.subplots(
+                        1 + n_extra, 1, figsize=(_st['fig_w'], fig_h_use),
+                        gridspec_kw={'height_ratios': height_ratios, 'hspace': 0.38},
+                        sharex=True)
+                    ax         = axes[0]
+                    extra_axes = list(axes[1:])
+                else:
+                    fig, ax    = plt.subplots(figsize=(_st['fig_w'], _st['fig_h']))
+                    extra_axes = []
+
+                # ── Main EMG subplot — same decorations (grid, x-axis, red
+                # stim-duration box, onset/offset markers, M/H shading +
+                # size annotations, Stim P2P / Pre-stim EMG corner labels,
+                # DIGIN overlay) as plot_hrs2_analysis / plot_hrs2_trials. ──
+                if emg_w is not None:
+                    ax.plot(t_ms, emg_w, color='black', linewidth=1.2,
+                            label='EMG (stored)')
+                ax.axhline(0, color='gray', linewidth=0.6, alpha=0.5)
+
+                draw_peristim_decorations(
+                    ax, t_ms,
+                    m_start_ms=m_start_ms, m_end_ms=m_end_ms,
+                    h_start_ms=h_start_ms, h_end_ms=h_end_ms,
+                    pre_window_ms=_st['pre_ms'], post_window_ms=_st['post_ms'],
+                    m_line_y=_m_mra, m_size_uv=_m_size,
+                    h_line_y=_h_mra, h_size_uv=_h_size,
+                    stim_adc=sadc_w, pre_stim_emg_uv=_pre_emg,
+                    stim_end_ms=stim_end_ms,
+                    digin_trials=[_t] if _st['show_dig_in'] else None,
+                    digin_ms_per_sample=_ms, digin_bin_samples=_bin_s,
+                    small=False, max_xticks=20,
+                )
+                ax.set_title(title, fontsize=9)
+                ax.legend(fontsize=8, loc='upper right')
+                if not _st['y_auto']:
+                    ax.set_ylim(_st['y_min'], _st['y_max'])
+
+                # Same stim-end fallback as draw_peristim_decorations (m_start_ms
+                # when the stored stim-end is missing/≈0 — see its docstring).
+                _end_ms_eff = (stim_end_ms if (stim_end_ms is not None and stim_end_ms > 1e-6)
+                              else m_start_ms)
+
+                # ── Extra channel subplots ────────────────────────────────────
+                for eax, (ch_name, ch_data, ch_ylabel, ch_color, has_thresh) in \
+                        zip(extra_axes, extra_ch):
+                    eax.plot(t_ms, ch_data, color=ch_color, linewidth=0.9,
+                             label=ch_name)
+                    eax.axvline(0, color='red', linestyle='--', linewidth=1.0)
+                    eax.axvline(_end_ms_eff, color='darkorange',
+                                linestyle=':', linewidth=1.0)
+                    if has_thresh:
+                        eax.axhline(STIM_ONSET_THRESHOLD, color='red',
+                                    linestyle=':', linewidth=0.8, alpha=0.7,
+                                    label=f'Thresh ({STIM_ONSET_THRESHOLD} V)')
+                    eax.set_ylabel(ch_ylabel, fontsize=8)
+                    eax.grid(True, alpha=0.3)
+                    eax.legend(fontsize=7, loc='upper right')
+
+                if extra_axes:
+                    extra_axes[-1].set_xlabel('Time (ms)')
+
+                plt.tight_layout()
+                plt.show()
+
+            except Exception as _ex:
+                print(f'  [viewer] plot error: {_ex}')
+
+        # ── Optional ±10 s EMG-block context (separate Output widget) ─────────
+        with _ctx_out:
+            _ctx_out.clear_output(wait=True)
+            if _st['show_ctx'] and _emg_bl:
+                _bin_s = int(round(BIN_DURATION_MS / _ms))
+                ctx = get_trial_context_window(
+                    _t, _emg_bl, pre_s=10.0, post_s=10.0,
+                    sample_rate=_sr, bin_samples=_bin_s)
+                if ctx is not None:
+                    _t_s, _emg_c, _, _adc_c = ctx
+                    fig2, (ax2a, ax2b) = plt.subplots(
+                        2, 1, figsize=(_st['fig_w'] + 3, 5), sharex=True,
+                        gridspec_kw={'height_ratios': [2, 1], 'hspace': 0.35})
+                    ax2a.plot(_t_s, _emg_c, color='black', linewidth=0.4,
+                              label='EMG context (raw diff)')
+                    ax2a.axvline(0, color='red', linestyle='--', linewidth=1.2,
+                                 label='Sensed onset')
+                    ax2a.set_ylabel('EMG (µV)')
+                    ax2a.set_title(
+                        f'±10 s context  —  {_rl}  trial [{_i}]'
+                        f'  (xcorr failed → stored data kept)', fontsize=8)
+                    ax2a.legend(fontsize=8); ax2a.grid(True, alpha=0.25)
+                    if _adc_c is not None:
+                        ax2b.plot(_t_s, np.abs(_adc_c), color='green',
+                                  linewidth=0.5, label='|ADC sync| (V)')
+                        ax2b.axhline(STIM_ONSET_THRESHOLD, color='red',
+                                     linestyle='--', linewidth=0.8)
+                        ax2b.axvline(0, color='red', linestyle='--', linewidth=1.0)
+                        ax2b.set_ylabel('|ADC| (V)')
+                        ax2b.legend(fontsize=8); ax2b.grid(True, alpha=0.25)
+                    ax2b.set_xlabel('Time re: sensed onset (s)')
+                    plt.tight_layout(); plt.show()
+                else:
+                    print('  [context] EMG-block window unavailable for this trial.')
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+    def _on_prev(b):
+        if _st['idx'] > 0:
+            _st['idx'] -= 1; _update_lbl(); _draw(_st['idx'])
+
+    def _on_next(b):
+        if _st['idx'] < _n - 1:
+            _st['idx'] += 1; _update_lbl(); _draw(_st['idx'])
+
+    def _on_yauto(c):
+        _st['y_auto'] = bool(c['new'])
+        _ymin_txt.disabled = bool(c['new'])
+        _ymax_txt.disabled = bool(c['new'])
+        _draw(_st['idx'])
+
+    def _on_ymin(c):         _st['y_min']         = float(c['new']); _draw(_st['idx'])
+    def _on_ymax(c):         _st['y_max']         = float(c['new']); _draw(_st['idx'])
+    def _on_figw(c):         _st['fig_w']         = float(c['new']); _draw(_st['idx'])
+    def _on_figh(c):         _st['fig_h']         = float(c['new']); _draw(_st['idx'])
+    def _on_pre(c):          _st['pre_ms']         = float(c['new']); _draw(_st['idx'])
+    def _on_post(c):         _st['post_ms']        = float(c['new']); _draw(_st['idx'])
+    def _on_stim_adc(c):     _st['show_stim_adc'] = bool(c['new']);  _draw(_st['idx'])
+    def _on_sync(c):         _st['show_sync']      = bool(c['new']);  _draw(_st['idx'])
+    def _on_dig_in(c):       _st['show_dig_in']    = bool(c['new']);  _draw(_st['idx'])
+    def _on_ctx(c):          _st['show_ctx']        = bool(c['new']);  _draw(_st['idx'])
+
+    _prev_btn.on_click(_on_prev)
+    _next_btn.on_click(_on_next)
+    _yauto_chk.observe(_on_yauto,       names='value')
+    _ymin_txt.observe(_on_ymin,         names='value')
+    _ymax_txt.observe(_on_ymax,         names='value')
+    _figw_txt.observe(_on_figw,         names='value')
+    _figh_txt.observe(_on_figh,         names='value')
+    _prems_txt.observe(_on_pre,         names='value')
+    _postms_txt.observe(_on_post,       names='value')
+    _stim_adc_chk.observe(_on_stim_adc, names='value')
+    _sync_chk.observe(_on_sync,         names='value')
+    _dig_in_chk.observe(_on_dig_in,     names='value')
+    _ctx_chk.observe(_on_ctx,           names='value')
+
+    # Populate immediately (same pattern as make_ft_viewer calling _ft_render_all)
+    _update_lbl()
+    _draw(0)
+    return VBox([
+        HBox([_prev_btn, _next_btn, _trial_lbl]),
+        HBox([_yauto_chk, _ymin_txt, _ymax_txt,
+              _figw_txt, _figh_txt, _prems_txt, _postms_txt]),
+        HBox([_stim_adc_chk, _sync_chk, _dig_in_chk, _ctx_chk]),
+        _out,
+        _ctx_out,
+    ])
 
 
 def write_hrs2(out_path: str, header: MhRecHeader, trials: list,
