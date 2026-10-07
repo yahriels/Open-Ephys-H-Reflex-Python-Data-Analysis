@@ -46,8 +46,14 @@ FILTERING_PROTOCOL_UNKNOWN = ""
 # are background-subtracted).  Grab the 45 ms window from -50 ms to -5 ms
 # relative to stim onset; far enough from the artifact to be clean, but close
 # enough to reflect the state the animal was in at stimulus time.
-PERI_STIM_BG_START_MS = 50.0  # ms before stim onset — start of bg window
+PERI_STIM_BG_START_MS = 55.0  # ms before stim onset — start of bg window
 PERI_STIM_BG_END_MS   =  5.0  # ms before stim onset — end   of bg window
+# Standardized pre-stim EMG ("background") window: -55 ms to -5 ms before stim
+# onset. Used by compute_peri_stim_bg() and every "pre-stim EMG" calculation in
+# this file (plot_hrs2_analysis, plot_hrs2_trials, make_failed_trials_viewer,
+# compute_h_comparison_data) so the same number is always produced regardless of
+# which viewer computed it — this intentionally does NOT follow whatever
+# pre_avg_ms/pre_plot_ms window a given viewer happens to be plotting.
 
 # trial.condition values (Frequency Test, file_version >= 6): which of 3
 # randomly-alternating conditions fired for that trial.
@@ -253,9 +259,36 @@ class EmgDataBlock:
     ts_background_emitted: int = 0
     channel_names: list = field(default_factory=list)
     raw_channels: list = field(default_factory=list)
-    diff: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     filtered: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
-    abs_val: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    # Memory: `diff` (== raw_channels[1] - raw_channels[0]) and `abs_val`
+    # (== |filtered|) are exact copies of other arrays in every block checked,
+    # so _read_emg_data_block stores them only when they DON'T match and
+    # otherwise leaves these as None → recomputed on access by the properties
+    # below. Saves ~25% of EMG-block RAM (≈1 GB for a 4.7 h session).
+    _diff: np.ndarray = None
+    _abs_val: np.ndarray = None
+
+    @property
+    def diff(self) -> np.ndarray:
+        if self._diff is not None:
+            return self._diff
+        if len(self.raw_channels) >= 2:
+            return self.raw_channels[1] - self.raw_channels[0]
+        return np.array([], dtype=np.float32)
+
+    @diff.setter
+    def diff(self, value):
+        self._diff = value
+
+    @property
+    def abs_val(self) -> np.ndarray:
+        if self._abs_val is not None:
+            return self._abs_val
+        return np.abs(self.filtered)
+
+    @abs_val.setter
+    def abs_val(self, value):
+        self._abs_val = value
 
 
 @dataclass
@@ -287,11 +320,23 @@ class MhRecHeader:
     #                             placed immediately after the sweep_* fields by
     #                             the same "newest field appended last" pattern
     #                             confirmed correct for Control Mode)
-    #   .hrs3/.hrs4/.hrs5/.hrs6:  NOT implemented — a real .hrs4 file at
-    #                             file_version 4 does not contain this field where
-    #                             the "same bump as .hrs5 (fv>=4)" claim would
-    #                             place it, so the threshold is unverified and
-    #                             (deliberately) not guessed here.
+    #   .hrft:                    file_version >= 7   (confirmed against a real file)
+    #   .hrs6 Up Condition VNS:   file_version >= 4   (position CONFIRMED against a
+    #                             real fv=11 file via direct byte-walk: a string field
+    #                             reading "OFFLINE" sits immediately before
+    #                             booth_snapshot, exactly as for every other file type
+    #                             below. Lower threshold of 4 is INFERRED, not directly
+    #                             observed — see next line — but follows the same
+    #                             "one version before booth_snapshot_fv" rule confirmed
+    #                             exactly for .hrs1 (10 vs 11), .hrs2 (11 vs 12), and
+    #                             .hrft (7 vs 8) above, applied to hrs6's booth_snapshot_fv=5)
+    #   .hrs3/.hrs4/.hrs5:        INFERRED by the same "one version before
+    #                             booth_snapshot_fv" rule (hrs3: 12 vs 13, hrs4: 5 vs 6,
+    #                             hrs5: 4 vs 5) — not directly verified against real
+    #                             bytes (no real .hrs3/.hrs5 file exists in this repo,
+    #                             and the only real .hrs4 files are at file_version=4,
+    #                             below even the inferred threshold of 5, so this
+    #                             remains untested for hrs4 specifically).
     filtering_protocol: str = FILTERING_PROTOCOL_UNKNOWN
     # booth_snapshot: .hrs1 >= fv11, .hrs2 >= fv12, .hrft >= fv8
     booth_snapshot: object = None
@@ -354,6 +399,27 @@ class MhRecTrial:
     #   .hrs4 Up Pellet >= fv7  |  .hrs3 Down Pellet >= fv14
     #   .hrs6 Up VNS   >= fv6  |  .hrs5 Down VNS    >= fv6
     m_wave_reversed_direction: int = 0  # 0 = normal, 1 = reversed
+    # pre_stim_emg_mean: MRA over -55ms to -5ms pre-stimulus-onset window (mirrors
+    # compute_peri_stim_bg's default window). h_wave_response/m_wave_response are
+    # computed by the app as (MRA in M/H window) - pre_stim_emg_mean.
+    # Per-stage version thresholds (per the app's own changelog, CORRECTED for a
+    # hrs3/hrs5 and hrs4/hrs6 column swap in that table — confirmed via
+    # filter_config, whose already-verified gates only match the table once
+    # swapped the same way; see the per-reader comments for the full argument):
+    #   .hrs1 >= fv13 | .hrs2 >= fv15 | .hrs3 >= fv16 | .hrs4 >= fv9
+    #   .hrs5 >= fv8  | .hrs6 >= fv8  | .hrsft >= fv10
+    # Defaults to 0.0 for older files (matches the app's own stated default).
+    pre_stim_emg_mean: float = 0.0
+    # data_integrity_flags: app-computed bitmask (bit0/1=stim_adc flagged,
+    # bit1/2=sync flagged) for the same BackgroundWorker channel-length-mismatch
+    # corruption this module's own detect_data_integrity_flags() heuristically
+    # re-derives — prefer this stored value over the heuristic once a file's
+    # file_version meets the stage's gate.
+    # Per-stage version thresholds (same hrs3/hrs5, hrs4/hrs6 swap correction as
+    # pre_stim_emg_mean above):
+    #   .hrs1 >= fv14 | .hrs2 >= fv16 | .hrs3 >= fv17 | .hrs4 >= fv10
+    #   .hrs5 >= fv9  | .hrs6 >= fv9  | .hrsft >= fv11
+    data_integrity_flags: int = 0
 
 
 @dataclass
@@ -442,6 +508,31 @@ class UpCondVnsTrial(MhRecTrial):
 # HRS FILE READERS
 # ====================================================================
 
+_F32_SCRATCH = {'buf': np.empty(0, dtype='<f4')}
+
+
+def _read_f32_array(fid: BinaryIO, scratch: bool = False) -> np.ndarray:
+    """Same on-disk layout as ``hrs_read_array(fid, 'float32')`` (int32 count +
+    little-endian float32s), read straight into a numpy array instead of via a
+    Python list — far less transient memory and much faster for the hundreds
+    of thousands of EMG blocks in a long session.
+
+    ``scratch=True`` reads into a reused module-level buffer (no allocation)
+    and returns a view of it — only valid until the next scratch read; used for
+    arrays that are compared and then usually discarded.
+    """
+    n = hrs_read_val(fid, 'int32')
+    if scratch:
+        if len(_F32_SCRATCH['buf']) < n:
+            _F32_SCRATCH['buf'] = np.empty(max(n, 4096), dtype='<f4')
+        arr = _F32_SCRATCH['buf'][:n]
+    else:
+        arr = np.empty(n, dtype='<f4')
+    if fid.readinto(memoryview(arr).cast('B')) != n * 4:
+        raise EOFError('truncated float32 array')
+    return arr
+
+
 def _read_emg_data_block(fid: BinaryIO) -> EmgDataBlock:
     block = EmgDataBlock()
     block.ts_open_ephys_sent     = hrs_read_val(fid, 'uint64')
@@ -450,10 +541,18 @@ def _read_emg_data_block(fid: BinaryIO) -> EmgDataBlock:
     n_names = hrs_read_val(fid, 'uint8')
     block.channel_names = [hrs_read_string(fid) for _ in range(n_names)]
     n_ch = hrs_read_val(fid, 'uint8')
-    block.raw_channels = [np.array(hrs_read_array(fid, 'float32'), dtype=np.float32) for _ in range(n_ch)]
-    block.diff     = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
-    block.filtered = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
-    block.abs_val  = np.array(hrs_read_array(fid, 'float32'), dtype=np.float32)
+    block.raw_channels = [_read_f32_array(fid) for _ in range(n_ch)]
+    # Keep diff/abs_val only if they aren't reproducible (see EmgDataBlock);
+    # read each into the scratch buffer first so the usual case allocates nothing.
+    diff = _read_f32_array(fid, scratch=True)
+    if not (len(block.raw_channels) >= 2 and len(block.raw_channels[0]) == len(diff)
+            and len(block.raw_channels[1]) == len(diff)
+            and np.array_equal(diff, block.raw_channels[1] - block.raw_channels[0])):
+        block.diff = diff.copy()
+    block.filtered = _read_f32_array(fid)
+    abs_val = _read_f32_array(fid, scratch=True)
+    if not np.array_equal(abs_val, np.abs(block.filtered)):
+        block.abs_val = abs_val.copy()
     return block
 
 
@@ -536,6 +635,16 @@ def _read_mh_trial_block(fid: BinaryIO, file_version: int = 0,
             t.digital_event_states            = np.array(hrs_read_array(fid, 'int8'),  dtype=np.int8)
         if file_version >= 13:
             t.m_wave_reversed_direction = hrs_read_val(fid, 'int8')
+    if block_id == BLOCK_MH_TRIAL:
+        if file_version >= 13:
+            t.pre_stim_emg_mean = hrs_read_val(fid, 'float32')
+        if file_version >= 14:
+            t.data_integrity_flags = hrs_read_val(fid, 'int8')
+    if block_id == BLOCK_CONTROL_MODE_TRIAL:
+        if file_version >= 15:
+            t.pre_stim_emg_mean = hrs_read_val(fid, 'float32')
+        if file_version >= 16:
+            t.data_integrity_flags = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -607,6 +716,22 @@ def _read_up_cond_pellet_trial_block(fid: BinaryIO, file_version: int) -> UpCond
         t.aux_flag = hrs_read_val(fid, 'int8')
     if file_version >= 7:
         t.m_wave_reversed_direction = hrs_read_val(fid, 'int8')
+    # pre_stim_emg_mean / data_integrity_flags: placed here (end of the per-trial
+    # trailer) by the "newest field appended last" convention used everywhere else
+    # in this file. The app's changelog table labeled this stage's gates as 8/9,
+    # but that table's hrs4/hrs6 (and hrs3/hrs5) columns are swapped relative to
+    # the already-verified file-extension mapping (confirmed via filter_config:
+    # the table's "hrs4=7"/"hrs6=8" only match this codebase's already-correct
+    # hrs4=8/hrs6=7 gates once swapped back) — so this stage's real gates are
+    # 9/10, not 8/9.
+    # UNVERIFIED against real bytes — no real .hrs4 file at file_version >= 9
+    # exists in this repo to confirm, and a byte-level reverse-engineering attempt
+    # against a real .hrs6 file at the analogous position did NOT resolve cleanly
+    # (see _read_up_cond_vns_trial_block).
+    if file_version >= 9:
+        t.pre_stim_emg_mean = hrs_read_val(fid, 'float32')
+    if file_version >= 10:
+        t.data_integrity_flags = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -637,6 +762,17 @@ def _read_down_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> DownCon
         t.aux_flag = hrs_read_val(fid, 'int8')
     if file_version >= 6:
         t.m_wave_reversed_direction = hrs_read_val(fid, 'int8')
+    # pre_stim_emg_mean / data_integrity_flags: the app's changelog table labeled
+    # this stage's gates as 16/17, but that table's hrs3/hrs5 (and hrs4/hrs6)
+    # columns are swapped relative to the already-verified file-extension mapping
+    # (same swap confirmed via filter_config: the table's "hrs5=15" / "hrs3=7"
+    # only match this codebase's already-correct hrs3=15/hrs5=7 gates once
+    # swapped back) — so this stage's real gates are 8/9, not 16/17.
+    # UNVERIFIED against real bytes — no real .hrs5 file exists in this repo.
+    if file_version >= 8:
+        t.pre_stim_emg_mean = hrs_read_val(fid, 'float32')
+    if file_version >= 9:
+        t.data_integrity_flags = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -667,6 +803,29 @@ def _read_up_cond_vns_trial_block(fid: BinaryIO, file_version: int) -> UpCondVns
         t.aux_flag = hrs_read_val(fid, 'int8')
     if file_version >= 6:
         t.m_wave_reversed_direction = hrs_read_val(fid, 'int8')
+    # pre_stim_emg_mean / data_integrity_flags: placed here (end of the per-trial
+    # trailer) by the "newest field appended last" convention used everywhere else
+    # in this file. The app's changelog table labeled this stage's gates as 9/10,
+    # but that table's hrs4/hrs6 (and hrs3/hrs5) columns are swapped relative to
+    # the already-verified file-extension mapping (confirmed via filter_config:
+    # the table's "hrs6=8"/"hrs4=7" only match this codebase's already-correct
+    # hrs4=8/hrs6=7 gates once swapped back) — so this stage's real gates are 8/9,
+    # not 9/10.
+    # UNVERIFIED against real bytes: a direct byte-level reverse-engineering
+    # attempt against the one real .hrs6 file in this repo (file_version=11,
+    # which should include both fields under either gate hypothesis) could NOT
+    # find a placement/ordering of these two fields (in any combination, with or
+    # without an additional digital-event triplet) that cleanly resynced to the
+    # next valid block marker after the first trial. That file still reads only
+    # its first trial before emitting an "unknown block_id" warning and stopping.
+    # If you can get the app's exact source-level field order for the V3
+    # conditioning-stage trial trailer (as was done previously for
+    # control_mode_data_file.py's file_version>=10 layout above), or a second real
+    # .hrs6 file at a lower file_version, that would resolve this definitively.
+    if file_version >= 8:
+        t.pre_stim_emg_mean = hrs_read_val(fid, 'float32')
+    if file_version >= 9:
+        t.data_integrity_flags = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -714,6 +873,13 @@ def _read_frequency_test_trial_block(fid: BinaryIO, file_version: int) -> Freque
         t.condition = hrs_read_val(fid, 'int32')
     else:
         t.condition = 0
+    # pre_stim_emg_mean / data_integrity_flags: gates per the app's changelog.
+    # UNVERIFIED against real bytes — no real .hrsft file at file_version >= 10
+    # exists in this repo to confirm placement.
+    if file_version >= 10:
+        t.pre_stim_emg_mean = hrs_read_val(fid, 'float32')
+    if file_version >= 11:
+        t.data_integrity_flags = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -745,6 +911,17 @@ def _read_dcp_trial_block(fid: BinaryIO, file_version: int = 8) -> DcpTrial:
         t.m_wave_max_intensity_ma = hrs_read_val(fid, 'float32')
     if file_version >= 14:
         t.m_wave_reversed_direction = hrs_read_val(fid, 'int8')
+    # pre_stim_emg_mean / data_integrity_flags: the app's changelog table labeled
+    # this stage's gates as 8/9, but that table's hrs3/hrs5 (and hrs4/hrs6)
+    # columns are swapped relative to the already-verified file-extension mapping
+    # (same swap confirmed via filter_config: the table's "hrs3=7"/"hrs5=15" only
+    # match this codebase's already-correct hrs3=15/hrs5=7 gates once swapped
+    # back) — so this stage's real gates are 16/17, not 8/9.
+    # UNVERIFIED against real bytes — no real .hrs3 file exists in this repo.
+    if file_version >= 16:
+        t.pre_stim_emg_mean = hrs_read_val(fid, 'float32')
+    if file_version >= 17:
+        t.data_integrity_flags = hrs_read_val(fid, 'int8')
     return t
 
 
@@ -862,6 +1039,129 @@ def read_hrs1(filepath: str):
     return header, trials, emg_blocks
 
 
+def _scan_trial_positions_by_block_id(filepath: str, block_id_target: int) -> list:
+    """Pre-scan a file to locate all trial block positions for the given block_id.
+
+    When a trial block has a large unknown tail (e.g. fv>=15 Control Mode, fv>=10
+    VNS conditioning stages), the sequential block loop misreads the tail's first bytes
+    as an unknown block_id and stops after 1 trial.  This helper pre-scans the entire
+    file for the pattern
+
+        [<block_id_target as little-endian int32>] + <float64 in MATLAB-datenum range>
+
+    which uniquely marks the start of a trial block (the float64 is the trial's
+    start_time stored as a MATLAB datenum, ~738000–741000 for 2026 recordings).
+
+    Returns a sorted, deduplicated list of absolute byte offsets, each pointing at the
+    first byte of the 4-byte block_id prefix.
+    """
+    MATLAB_LO = 700000.0   # generous lower bound (~year 1916)
+    MATLAB_HI = 800000.0   # generous upper bound (~year 2119)
+    OVERLAP   = 11         # bytes carried across chunk boundaries
+    CHUNK     = 8 * 1024 * 1024  # 8 MB per read
+
+    # Little-endian int32 bytes for the target block_id
+    target_b0 = block_id_target & 0xFF
+    target_b1 = (block_id_target >> 8) & 0xFF
+    target_b2 = (block_id_target >> 16) & 0xFF
+    target_b3 = (block_id_target >> 24) & 0xFF
+
+    positions = []
+
+    with open(filepath, 'rb') as fid:
+        file_offset = 0
+        prev_tail   = b''
+
+        while True:
+            raw = fid.read(CHUNK)
+            if not raw:
+                break
+
+            data = prev_tail + raw
+            arr  = np.frombuffer(data, dtype=np.uint8)
+
+            # Find every byte position where the low byte of block_id matches
+            cands = np.where(arr[:-11] == target_b0)[0]
+            for idx in cands.tolist():
+                if idx + 12 <= len(arr):
+                    if (arr[idx + 1] == target_b1 and
+                            arr[idx + 2] == target_b2 and
+                            arr[idx + 3] == target_b3):
+                        f64_bytes = arr[idx + 4 : idx + 12].tobytes()
+                        f64 = struct.unpack('<d', f64_bytes)[0]
+                        if MATLAB_LO < f64 < MATLAB_HI:
+                            abs_pos = file_offset - len(prev_tail) + idx
+                            if abs_pos >= 0:
+                                positions.append(abs_pos)
+
+            prev_tail    = data[-OVERLAP:] if len(data) > OVERLAP else data
+            file_offset += len(raw)
+
+    return sorted(set(positions))
+
+
+def _scan_trial_positions_fv15(filepath: str) -> list:
+    """Alias for Control Mode .hrs2 (block_id=6). See _scan_trial_positions_by_block_id."""
+    return _scan_trial_positions_by_block_id(filepath, BLOCK_CONTROL_MODE_TRIAL)
+
+
+def _read_emg_blocks_in_range(fid: BinaryIO, start: int, end: int) -> list:
+    """Read every EMG data block (block_id=1) lying in byte range [start, end).
+
+    Companion to the pre-scan trial readers: a trial block with an undocumented
+    tail can't be stepped past sequentially, so the EMG blocks the app writes
+    between trials were previously never read for fv>=15 Control Mode files
+    (only those before the first trial were — e.g. 59 blocks / 3.4 s of raw
+    EMG for a 4.7 h CM13 session, so offline reconstruction failed for ~all
+    trials).
+
+    Locates the first EMG block by its signature — int32 ``1`` followed by three
+    ascending Unix-ms uint64 timestamps within 1 h of each other (see
+    :func:`_read_emg_data_block`) — then reads blocks back-to-back, re-scanning
+    from the current position if a non-EMG block id interrupts the run.
+    """
+    _UNIX_MS_LO, _UNIX_MS_HI = 5e11, 3e12
+    blocks = []
+    if end <= start:
+        return blocks
+    fid.seek(start)
+    data = fid.read(end - start)
+    arr = np.frombuffer(data, dtype=np.uint8)
+    # Candidate block_id=1 (little-endian int32) positions.
+    cands = np.flatnonzero((arr[:-27] == 1) & (arr[1:-26] == 0)
+                           & (arr[2:-25] == 0) & (arr[3:-24] == 0)) if len(arr) > 28 else []
+
+    def _is_emg_sig(i):
+        ts0, ts1, ts2 = struct.unpack_from('<QQQ', data, i + 4)
+        return (_UNIX_MS_LO < ts0 < _UNIX_MS_HI and ts1 >= ts0 and ts2 >= ts1
+                and ts2 < _UNIX_MS_HI and (ts2 - ts0) < 3_600_000)
+
+    ci = 0
+    pos = 0  # relative to start
+    n_c = len(cands)
+    while True:
+        # Find next signature at or after pos.
+        while ci < n_c and (cands[ci] < pos or not _is_emg_sig(int(cands[ci]))):
+            ci += 1
+        if ci >= n_c:
+            break
+        pos = int(cands[ci])
+        # Read consecutive EMG blocks from here.
+        while pos + 28 <= len(data) and _is_emg_sig(pos):
+            fid.seek(start + pos + 4)
+            try:
+                blk = _read_emg_data_block(fid)
+            except (struct.error, EOFError, ValueError, MemoryError):
+                pos += 1
+                break
+            new_pos = fid.tell() - start
+            if new_pos > len(data):
+                break
+            blocks.append(blk)
+            pos = new_pos
+    return blocks
+
+
 def read_hrs2(filepath: str):
     """Read a peri-stimulus trial file (.hrs1 or .hrs2).
 
@@ -903,8 +1203,8 @@ def read_hrs2(filepath: str):
             header.sweep_step_size     = hrs_read_val(fid, 'float32')
             header.sweep_sequential    = bool(hrs_read_val(fid, 'int8'))
         # filtering_protocol: .hrs1 MH Recruitment >= fv10, .hrs2 Control Mode >= fv11
-        # (confirmed against a real fv=11 Control Mode file; the fv=10 MH Recruitment
-        # threshold/position is inferred by the same pattern, not yet seen in real data).
+        # (confirmed against real files: fv=11 Control Mode, and fv=10/11/12 MH
+        # Recruitment files all read cleanly with sane "OFFLINE" values).
         _fp_threshold = 10 if _is_mh_recruitment else 11
         if header.file_version >= _fp_threshold:
             header.filtering_protocol = hrs_read_string(fid)
@@ -917,77 +1217,125 @@ def read_hrs2(filepath: str):
         if header.file_version >= _fc_threshold:
             header.filter_config = _read_filter_config(fid)
 
-        while True:
-            chunk = fid.read(4)
-            if len(chunk) < 4:
-                break
-            block_id = struct.unpack('i', chunk)[0]
+        # For fv>=15 Control Mode files, each trial block has a large embedded
+        # multi-channel data section (~1 MB) whose layout is not yet documented.
+        # The sequential loop can't navigate past it, so pre-scan the file for
+        # all trial block positions and seek directly to each one.
+        _cm_fv15_scan = (not _is_mh_recruitment and header.file_version >= 15)
 
-            if block_id in (BLOCK_MH_TRIAL, BLOCK_CONTROL_MODE_TRIAL):
+        if _cm_fv15_scan:
+            print(f"[read_hrs2] fv={header.file_version}>=15 Control Mode: "
+                  f"pre-scanning for trial positions …")
+            _trial_positions = _scan_trial_positions_fv15(filepath)
+            print(f"[read_hrs2] Found {len(_trial_positions)} trial block(s)")
+
+            # Collect any EMG blocks that appear before the first trial.
+            _first_trial_pos = _trial_positions[0] if _trial_positions else None
+            while True:
+                if _first_trial_pos is not None and fid.tell() >= _first_trial_pos:
+                    break
+                _chunk = fid.read(4)
+                if len(_chunk) < 4:
+                    break
+                _bid = struct.unpack('i', _chunk)[0]
+                if _bid == BLOCK_EMG_DATA:
+                    try:
+                        emg_blocks.append(_read_emg_data_block(fid))
+                    except (struct.error, EOFError):
+                        break
+                else:
+                    fid.seek(-4, 1)
+                    break
+
+            # Read each trial from its pre-scanned position, then the EMG
+            # blocks written between it and the next trial.
+            _file_size = os.path.getsize(filepath)
+            for _k, _pos in enumerate(_trial_positions):
+                fid.seek(_pos + 4)   # +4 skips the block_id bytes (already known = 6)
                 try:
-                    trials.append(_read_mh_trial_block(fid, header.file_version, block_id))
+                    trials.append(
+                        _read_mh_trial_block(fid, header.file_version,
+                                             BLOCK_CONTROL_MODE_TRIAL)
+                    )
                 except (struct.error, EOFError):
                     break
-            elif block_id == BLOCK_EMG_DATA:
-                # App bug: MhRecruitmentCurveTrial.save_to_file writes block_id=1 (EMG_DATA)
-                # instead of block_id=3 (MH_TRIAL).  Disambiguate by peeking at the first
-                # 24 bytes after the block_id.
-                #
-                # EMG block layout  (bytes 0-23):
-                #   [0:8]   ts_open_ephys_sent  (uint64, wall-clock Unix ms from OE ZMQ)
-                #   [8:16]  ts_python_received  (uint64, wall-clock Unix ms from time.time()*1000)
-                #   [16:24] ts_background_emitted (uint64, wall-clock Unix ms)
-                #   → all three are Unix ms (~1.7e12 for 2026), ascending, within seconds of each other
-                #
-                # Trial block layout (bytes 0-23):
-                #   [0:8]   start_time          (uint64 Unix ms, OR float64 MATLAB datenum in old format)
-                #   [8:12]  min_init_threshold  (float32)
-                #   [12:16] max_init_threshold  (float32)
-                #   [16:20] stimulation_amplitude_ma (float32)
-                #   [20:24] first 4 bytes of trial_data length (uint32)
-                #   → only bytes[0:8] is a Unix ms timestamp; [8:24] are floats/counts
-                #
-                # Strategy: read 24 bytes.  If all three uint64 windows are in the Unix-ms
-                # range AND they are ascending AND within 1 hour of each other → EMG block.
-                # Otherwise → trial block (only one or zero windows will be in range).
-                # Old format check: if bytes[0:8] interpreted as float64 is > 1.0 → MATLAB
-                # datenum → trial (float64 MATLAB datums for 2026 are ~738xxx, well above 1).
-                _UNIX_MS_LO = 5e11   # ~1985-01-01
-                _UNIX_MS_HI = 3e12   # ~2065-01-01
-                pos = fid.tell()
-                peek = fid.read(24)
-                fid.seek(pos)
-                if len(peek) < 24:
+                _next = (_trial_positions[_k + 1] if _k + 1 < len(_trial_positions)
+                         else _file_size)
+                emg_blocks.extend(_read_emg_blocks_in_range(fid, fid.tell(), _next))
+            print(f"[read_hrs2] Read {len(emg_blocks)} EMG block(s)")
+
+        else:
+            while True:
+                chunk = fid.read(4)
+                if len(chunk) < 4:
                     break
-                peek_f64 = struct.unpack('<d', peek[:8])[0]
-                if peek_f64 > 1.0:
-                    # Old format: MATLAB datenum stored as float64 → trial block
-                    trials.append(_read_mh_trial_block(fid, header.file_version))
-                else:
-                    ts0 = struct.unpack('<Q', peek[0:8])[0]
-                    ts1 = struct.unpack('<Q', peek[8:16])[0]
-                    ts2 = struct.unpack('<Q', peek[16:24])[0]
-                    _is_emg = (
-                        _UNIX_MS_LO < ts0 < _UNIX_MS_HI and
-                        _UNIX_MS_LO < ts1 < _UNIX_MS_HI and
-                        _UNIX_MS_LO < ts2 < _UNIX_MS_HI and
-                        ts1 >= ts0 and ts2 >= ts1 and
-                        (ts2 - ts0) < 3_600_000  # all three within 1 hour of each other
-                    )
-                    if _is_emg:
-                        try:
-                            emg_blocks.append(_read_emg_data_block(fid))
-                        except (struct.error, EOFError):
-                            # Truncated final EMG block (recording ended mid-frame); stop.
-                            break
+                block_id = struct.unpack('i', chunk)[0]
+
+                if block_id in (BLOCK_MH_TRIAL, BLOCK_CONTROL_MODE_TRIAL):
+                    try:
+                        trials.append(_read_mh_trial_block(fid, header.file_version, block_id))
+                    except (struct.error, EOFError):
+                        break
+                elif block_id == BLOCK_EMG_DATA:
+                    # App bug: MhRecruitmentCurveTrial.save_to_file writes block_id=1 (EMG_DATA)
+                    # instead of block_id=3 (MH_TRIAL).  Disambiguate by peeking at the first
+                    # 24 bytes after the block_id.
+                    #
+                    # EMG block layout  (bytes 0-23):
+                    #   [0:8]   ts_open_ephys_sent  (uint64, wall-clock Unix ms from OE ZMQ)
+                    #   [8:16]  ts_python_received  (uint64, wall-clock Unix ms from time.time()*1000)
+                    #   [16:24] ts_background_emitted (uint64, wall-clock Unix ms)
+                    #   → all three are Unix ms (~1.7e12 for 2026), ascending, within seconds of each other
+                    #
+                    # Trial block layout (bytes 0-23):
+                    #   [0:8]   start_time          (uint64 Unix ms, OR float64 MATLAB datenum in old format)
+                    #   [8:12]  min_init_threshold  (float32)
+                    #   [12:16] max_init_threshold  (float32)
+                    #   [16:20] stimulation_amplitude_ma (float32)
+                    #   [20:24] first 4 bytes of trial_data length (uint32)
+                    #   → only bytes[0:8] is a Unix ms timestamp; [8:24] are floats/counts
+                    #
+                    # Strategy: read 24 bytes.  If all three uint64 windows are in the Unix-ms
+                    # range AND they are ascending AND within 1 hour of each other → EMG block.
+                    # Otherwise → trial block (only one or zero windows will be in range).
+                    # Old format check: if bytes[0:8] interpreted as float64 is > 1.0 → MATLAB
+                    # datenum → trial (float64 MATLAB datums for 2026 are ~738xxx, well above 1).
+                    _UNIX_MS_LO = 5e11   # ~1985-01-01
+                    _UNIX_MS_HI = 3e12   # ~2065-01-01
+                    pos = fid.tell()
+                    peek = fid.read(24)
+                    fid.seek(pos)
+                    if len(peek) < 24:
+                        break
+                    peek_f64 = struct.unpack('<d', peek[:8])[0]
+                    if peek_f64 > 1.0:
+                        # Old format: MATLAB datenum stored as float64 → trial block
+                        trials.append(_read_mh_trial_block(fid, header.file_version))
                     else:
-                        try:
-                            trials.append(_read_mh_trial_block(fid, header.file_version))
-                        except (struct.error, EOFError):
-                            break
-            else:
-                print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
-                break
+                        ts0 = struct.unpack('<Q', peek[0:8])[0]
+                        ts1 = struct.unpack('<Q', peek[8:16])[0]
+                        ts2 = struct.unpack('<Q', peek[16:24])[0]
+                        _is_emg = (
+                            _UNIX_MS_LO < ts0 < _UNIX_MS_HI and
+                            _UNIX_MS_LO < ts1 < _UNIX_MS_HI and
+                            _UNIX_MS_LO < ts2 < _UNIX_MS_HI and
+                            ts1 >= ts0 and ts2 >= ts1 and
+                            (ts2 - ts0) < 3_600_000  # all three within 1 hour of each other
+                        )
+                        if _is_emg:
+                            try:
+                                emg_blocks.append(_read_emg_data_block(fid))
+                            except (struct.error, EOFError):
+                                # Truncated final EMG block (recording ended mid-frame); stop.
+                                break
+                        else:
+                            try:
+                                trials.append(_read_mh_trial_block(fid, header.file_version))
+                            except (struct.error, EOFError):
+                                break
+                else:
+                    print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
+                    break
 
     if trials:
         header.sample_rate = len(trials[0].trial_data) / (TRIAL_RECORD_MS / 1000)
@@ -1016,6 +1364,8 @@ def read_hrs3(filepath: str):
         header.stage_type         = hrs_read_val(fid, 'int32')
         if header.file_version >= 9:
             header.app_version = hrs_read_string(fid)
+        if header.file_version >= 12:
+            header.filtering_protocol = hrs_read_string(fid)
         if header.file_version >= 13:
             header.booth_snapshot = _read_booth_snapshot(fid)
         if header.file_version >= 15:
@@ -1079,12 +1429,14 @@ def read_hrs3(filepath: str):
 
 
 def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn,
-                        booth_snapshot_fv=None, filter_config_fv=None):
+                        booth_snapshot_fv=None, filter_config_fv=None,
+                        filtering_protocol_fv=None):
     """Shared block-loop body for V3 stage readers (hrs4/hrs5/hrs6).
 
-    booth_snapshot_fv / filter_config_fv: the file_version threshold at which
-    each new header block first appears for this specific stage.  Pass None to
-    skip a field that was never added to a particular stage.
+    booth_snapshot_fv / filter_config_fv / filtering_protocol_fv: the
+    file_version threshold at which each new header block first appears for
+    this specific stage.  Pass None to skip a field that was never added to a
+    particular stage.
     """
     trials, emg_blocks = [], []
     with open(filepath, 'rb') as fid:
@@ -1099,6 +1451,8 @@ def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn,
             # 12 extra header bytes added in conditioning-stage file_version 3
             # (3 × int32 session-level fields; value 0 in all known files).
             fid.read(12)
+        if filtering_protocol_fv is not None and header.file_version >= filtering_protocol_fv:
+            header.filtering_protocol = hrs_read_string(fid)
         if booth_snapshot_fv is not None and header.file_version >= booth_snapshot_fv:
             header.booth_snapshot = _read_booth_snapshot(fid)
         if filter_config_fv is not None and header.file_version >= filter_config_fv:
@@ -1165,7 +1519,36 @@ def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn,
                         except (struct.error, EOFError, ValueError, MemoryError):
                             break
             else:
-                print(f"Warning: unknown block_id={block_id} at offset {fid.tell()-4}")
+                _unknown_offset = fid.tell() - 4
+                print(f"Warning: unknown block_id={block_id} at offset {_unknown_offset}")
+                if trials:
+                    # Unknown block_id after at least one good trial — the trial block
+                    # likely has a large unknown tail from a newer file_version.
+                    # Fall back to byte-pattern pre-scan to locate all remaining trials.
+                    print(f"[_make_v3_block_loop] Falling back to byte-pattern scan "
+                          f"for block_id={block_id_expected} …")
+                    _all_positions = _scan_trial_positions_by_block_id(
+                        filepath, block_id_expected)
+                    _new_positions = [p for p in _all_positions
+                                      if p > _unknown_offset]
+                    print(f"[_make_v3_block_loop] Found {len(_new_positions)} "
+                          f"additional trial position(s)")
+                    # EMG blocks between the unknown offset and the first
+                    # re-found trial, then after each trial up to the next.
+                    _file_size = os.path.getsize(filepath)
+                    if _new_positions:
+                        emg_blocks.extend(_read_emg_blocks_in_range(
+                            fid, _unknown_offset, _new_positions[0]))
+                    for _k, _pos in enumerate(_new_positions):
+                        fid.seek(_pos + 4)   # +4 skips the known block_id bytes
+                        try:
+                            trials.append(reader_fn(fid, header.file_version))
+                        except (struct.error, EOFError, ValueError, MemoryError):
+                            break
+                        _next = (_new_positions[_k + 1] if _k + 1 < len(_new_positions)
+                                 else _file_size)
+                        emg_blocks.extend(_read_emg_blocks_in_range(
+                            fid, fid.tell(), _next))
                 break
     return trials, emg_blocks
 
@@ -1178,7 +1561,7 @@ def read_hrs4(filepath: str):
     header = MhRecHeader()
     trials, emg_blocks = _make_v3_block_loop(
         filepath, header, BLOCK_UP_COND_PELLET_TRIAL, _read_up_cond_pellet_trial_block,
-        booth_snapshot_fv=6, filter_config_fv=8)
+        booth_snapshot_fv=6, filter_config_fv=8, filtering_protocol_fv=5)
     if trials:
         header.sample_rate = 10000.0
     header.settings = _load_settings_json(filepath)
@@ -1193,7 +1576,7 @@ def read_hrs5(filepath: str):
     header = MhRecHeader()
     trials, emg_blocks = _make_v3_block_loop(
         filepath, header, BLOCK_DOWN_COND_VNS_TRIAL, _read_down_cond_vns_trial_block,
-        booth_snapshot_fv=5, filter_config_fv=7)
+        booth_snapshot_fv=5, filter_config_fv=7, filtering_protocol_fv=4)
     if trials:
         header.sample_rate = 10000.0
     header.settings = _load_settings_json(filepath)
@@ -1208,7 +1591,7 @@ def read_hrs6(filepath: str):
     header = MhRecHeader()
     trials, emg_blocks = _make_v3_block_loop(
         filepath, header, BLOCK_UP_COND_VNS_TRIAL, _read_up_cond_vns_trial_block,
-        booth_snapshot_fv=5, filter_config_fv=7)
+        booth_snapshot_fv=5, filter_config_fv=7, filtering_protocol_fv=4)
     if trials:
         header.sample_rate = 10000.0
     header.settings = _load_settings_json(filepath)
@@ -1430,6 +1813,269 @@ def detect_stim_onset(sync_data: np.ndarray,
         if len(cands) > 0:
             return search_start + int(cands[0])
     return bin_samples
+
+
+def longest_exact_run(arr: np.ndarray) -> int:
+    """Length of the longest run of consecutive identical values in *arr*.
+
+    Used by :func:`detect_data_integrity_flags` to spot a channel that's
+    "frozen" (stuck at a stale/zero value for many samples in a row) — the
+    signature of a channel-length-mismatch bug in the app's own live
+    BackgroundWorker (see that function's docstring).
+    """
+    arr = np.asarray(arr)
+    if len(arr) == 0:
+        return 0
+    boundaries = np.flatnonzero(np.concatenate(([True], np.diff(arr) != 0, [True])))
+    return int(np.max(np.diff(boundaries)))
+
+
+def detect_data_integrity_flags(stim_adc_data, sync_data, threshold: int = 300) -> int:
+    """Detect visible ``stim_adc_data``/``sync_data`` corruption from a
+    channel-length-mismatch bug in the app's own live BackgroundWorker: it
+    assembled each tick's frame by counting arrived channels with no check
+    that every channel reported the same sample count that tick, then
+    advanced one shared write pointer by the EMG channel's count regardless
+    of how many stim/sync samples were actually written. Whenever a tick's
+    channels disagreed in length (a dropped/split ZMQ message from Open
+    Ephys), this either left a permanent gap of pre-allocated 0.0 in the
+    shorter channel (already passed over by the pointer, so never
+    backfilled), or silently dropped the longer channel's tail — from that
+    point on, ``stim_adc_data``/``sync_data`` are offset from ``trial_data``
+    (EMG) by however many samples were lost.
+
+    Flags a channel when it has a run of `threshold`-or-more consecutive
+    identical samples that ISN'T simply the whole channel being unwired
+    (constant end-to-end — that's a wiring/config fact, not corruption).
+
+    ``threshold`` default of 300 samples (30 ms at 10 kHz) is empirically
+    tuned, not the app's own suggested starting point of 20: verified against
+    5 real stage/recording combinations that ``stim_adc_data``'s own
+    quantization noise during quiet baseline routinely produces "frozen" runs
+    up to ~100-200 samples long by chance alone (median ~20, p99 ~100-120,
+    max ~193 across clean trials) — a threshold of 20 flagged 40-64% of ALL
+    trials as "corrupted" in every file tested, which is not plausible as
+    genuine rare ZMQ-drop corruption. The one genuine case found in that same
+    testing (a trial with no onset detected at all, ``stim_adc_data`` stuck
+    saturated high for 2106 samples/210 ms) sits far above that noise
+    ceiling, with a clean separating gap in the data (next-highest real value
+    was 168) — 300 comfortably clears the noise floor while still catching
+    gaps far shorter than that confirmed case. Still worth tuning per-dataset
+    if your own ADC/booth has different noise characteristics.
+
+    Returns a bitmask: bit 1 (value 1) = ``stim_adc_data`` flagged, bit 2
+    (value 2) = ``sync_data`` flagged, 0 = neither. Works on any already-saved
+    trial — including ``onset_detected == 0`` ("no sync") trials, which the
+    app's own live detector never checked for this at all.
+    """
+    flags = 0
+    for bit, data in ((1, stim_adc_data), (2, sync_data)):
+        data = np.asarray(data, dtype=float)
+        if len(data) <= threshold:
+            continue
+        if np.all(data == data[0]):
+            continue
+        if longest_exact_run(data) >= threshold:
+            flags |= bit
+    return flags
+
+
+def get_sync_digin_channel(header, trials=None):
+    """Best-effort identification of which DIGIN channel the sync line is
+    wired to, for :func:`cross_check_onset`.
+
+    Prefers ``header.booth_snapshot['digital_in_roles']`` (see
+    ``MhRecHeader.booth_snapshot``) — finds the role whose name contains
+    "sync" (case-insensitive) and returns its channel index **minus 1**:
+    verified directly against real data that ``digital_in_roles``' channel
+    index is consistently 1 higher than the corresponding
+    ``digital_event_channels``/``digital_onset_channel`` numbering (e.g.
+    booth_snapshot channel 3 "Sync (digital)" ↔ digital_onset_channel 2,
+    confirmed across 3 real recordings).
+
+    Falls back to the most common ``digital_onset_channel`` among *trials*
+    with ``onset_detected == 2`` (when given, and no booth_snapshot) — the
+    channel actually used to detect onset digitally is almost certainly the
+    sync line.
+
+    Returns ``None`` if neither source is available.
+    """
+    bs = getattr(header, 'booth_snapshot', None)
+    if bs and bs.get('digital_in_roles'):
+        for role_name, ch_idx in bs['digital_in_roles']:
+            if 'sync' in role_name.lower():
+                return int(ch_idx) - 1
+    if trials:
+        from collections import Counter
+        chans = [int(getattr(t, 'digital_onset_channel', -1)) for t in trials
+                if getattr(t, 'onset_detected', 0) == 2
+                and int(getattr(t, 'digital_onset_channel', -1)) >= 0]
+        if chans:
+            return Counter(chans).most_common(1)[0][0]
+    return None
+
+
+def adc_crossing_near(sync_data, expected_idx: int, radius: int = 50,
+                      onset_threshold: float = STIM_ONSET_THRESHOLD):
+    """Find an ADC threshold crossing in `sync_data` within `radius` samples
+    of `expected_idx` — used by :func:`cross_check_onset`. Prefers the start
+    of a sustained (>=2-sample) crossing over an isolated single-sample blip.
+    Returns the absolute sample index, or `None` if nothing crosses nearby.
+    """
+    sync_data = np.asarray(sync_data, dtype=float)
+    lo = max(0, expected_idx - radius)
+    hi = min(len(sync_data), expected_idx + radius)
+    if hi <= lo:
+        return None
+    window = sync_data[lo:hi]
+    above = np.flatnonzero(window >= onset_threshold)
+    if len(above) == 0:
+        return None
+    chosen = above[0]
+    for i in range(len(above) - 1):
+        if above[i + 1] == above[i] + 1:
+            chosen = above[i]
+            break
+    return lo + int(chosen)
+
+
+def cross_check_onset(trial, sync_channel: int, tolerance: int = 3,
+                      radius: int = 50, onset_threshold: float = STIM_ONSET_THRESHOLD):
+    """Cross-validate a trial's stored ``onset_sample_index`` against the
+    independently-saved raw digital-event trace on the sync channel — catches
+    subtle few-sample onset misalignment from the BackgroundWorker bug (see
+    :func:`detect_data_integrity_flags`) that's too small to trip the
+    frozen-run detector.
+
+    ``onset_detected == 2`` (digital-derived) trials are structurally immune
+    to this bug — ``onset_sample_index`` never reads ``sync_data``'s content
+    at all for those — and are reported as an automatic pass.
+
+    For other trials, finds the nearest raw digital rising edge on
+    *sync_channel* (from ``digital_event_sample_offsets``/``channels``/
+    ``states`` — saved for every trial regardless of which method was used
+    for onset) to the stored ``onset_sample_index``.
+
+    Returns ``(ok, disagreement_samples)``:
+      - ``(True, 0)`` — digital-derived onset, not vulnerable to this bug.
+      - ``(True, n)`` — a digital edge was found within *tolerance* samples.
+      - ``(False, n)`` — a digital edge exists but disagrees by more than
+        *tolerance* samples.
+      - ``(None, None)`` — nothing to cross-check against (no digital events
+        on this channel for this trial).
+    """
+    if getattr(trial, 'onset_detected', 0) == 2:
+        return True, 0
+
+    osi = int(getattr(trial, 'onset_sample_index', -1))
+    if osi < 0:
+        return None, None
+
+    offsets  = np.asarray(getattr(trial, 'digital_event_sample_offsets', []), dtype=np.int64)
+    channels = np.asarray(getattr(trial, 'digital_event_channels', []), dtype=np.int32)
+    states   = np.asarray(getattr(trial, 'digital_event_states', []), dtype=np.int8)
+    if len(offsets) == 0 or len(offsets) != len(channels) or len(offsets) != len(states):
+        return None, None
+
+    mask = (channels == sync_channel) & (states > 0)
+    candidates = offsets[mask]
+    if len(candidates) == 0:
+        return None, None
+
+    nearest = candidates[np.argmin(np.abs(candidates - osi))]
+    disagreement = int(abs(int(nearest) - osi))
+    return (disagreement <= tolerance), disagreement
+
+
+def detect_corrupted_trials(trials, header, frozen_threshold: int = 300,
+                            cross_check_tolerance: int = 3,
+                            cross_check_radius: int = 50,
+                            onset_threshold: float = STIM_ONSET_THRESHOLD):
+    """Scan already-recorded trials for the two real-data-corruption failure
+    modes described above: visible saturation/frozen runs in
+    ``stim_adc_data``/``sync_data`` (:func:`detect_data_integrity_flags`), and
+    subtle few-sample onset misalignment independently detectable via the raw
+    digital-event trace on the sync channel (:func:`cross_check_onset`).
+
+    Both checks run on data you've already recorded — this cannot recover
+    samples the bug actually dropped, only flag trials where it looks like it
+    happened, so you can exclude or down-weight them in analysis.
+
+    Returns a list of dicts (one per flagged trial, in trial order), each:
+      ``{'trial': t, 'idx': i, 'integrity_flags': int, 'cross_check_ok':
+      True/False/None, 'cross_check_disagreement': int or None}``.
+    Only trials with ``integrity_flags != 0`` or ``cross_check_ok is False``
+    are included — clean trials, and trials with nothing to cross-check
+    against, are omitted.
+    """
+    sync_channel = get_sync_digin_channel(header, trials)
+    flagged = []
+    for i, t in enumerate(trials):
+        iflags = detect_data_integrity_flags(
+            getattr(t, 'stim_adc_data', []), getattr(t, 'sync_data', []),
+            threshold=frozen_threshold)
+        cc_ok, cc_dis = (None, None)
+        if sync_channel is not None:
+            cc_ok, cc_dis = cross_check_onset(
+                t, sync_channel, tolerance=cross_check_tolerance,
+                radius=cross_check_radius, onset_threshold=onset_threshold)
+        if iflags != 0 or cc_ok is False:
+            flagged.append({
+                'trial': t, 'idx': i,
+                'integrity_flags': iflags,
+                'cross_check_ok': cc_ok,
+                'cross_check_disagreement': cc_dis,
+            })
+    return flagged
+
+
+def detect_bad_stim_adc_window(trial, sample_rate: float = SAMPLE_RATE,
+                               threshold_v: float = 0.1,
+                               window_ms: tuple = (-1.0, 1.0),
+                               baseline_ms: tuple = (-10.0, -2.0),
+                               baseline_subtract: bool = True):
+    """"Recalculated bad stim ADC" check: did the stimulator-output monitor
+    actually show a pulse at the stim onset?
+
+    A trial is bad when ``stim_adc_data`` never leaves the ``±threshold_v``
+    band during ``window_ms`` (relative to the onset used by
+    :func:`get_trial_window` — stored ``onset_sample_index``, falling back to
+    the bin boundary for no-sync trials).
+
+    ``baseline_subtract=True`` (default) references the band to the trial's own
+    pre-stim median over ``baseline_ms``: the stim ADC carries a DC offset that
+    drifts across a session (≈ −0.7 V to +0.2 V in HRPILOT-36 CM13), so an
+    absolute ±0.1 V band would sit entirely off the trace for most trials. Good
+    pulses there are ≈0.5–1.5 V biphasic deflections; no-pulse trials stay flat.
+
+    Unrelated to the app's ``data_integrity_flags`` / frozen-run heuristic.
+
+    Returns ``(is_bad, peak_dev_v, baseline_v)`` — ``is_bad`` is ``None`` when
+    the trial has no stim ADC data in the window.
+    """
+    sa = getattr(trial, 'stim_adc_data', None)
+    if sa is None or len(sa) == 0:
+        return None, float('nan'), float('nan')
+    ms = 1000.0 / sample_rate
+    bin_s = int(BIN_DURATION_MS * sample_rate / 1000)
+    rec_s = int(TRIAL_RECORD_MS * sample_rate / 1000)
+    pre = max(abs(window_ms[0]), abs(baseline_ms[0])) + 1.0
+    t_ms, _emg, _sync, _se, sadc = get_trial_window(
+        trial, pre, max(window_ms[1], 0.0) + 1.0,
+        ms_per_sample=ms, bin_samples=bin_s, record_samples=rec_s)
+    if sadc is None or len(sadc) == 0:
+        return None, float('nan'), float('nan')
+    sadc = np.asarray(sadc, dtype=float)
+    win = (t_ms >= window_ms[0]) & (t_ms <= window_ms[1])
+    if not win.any():
+        return None, float('nan'), float('nan')
+    base = 0.0
+    if baseline_subtract:
+        bm = (t_ms >= baseline_ms[0]) & (t_ms <= baseline_ms[1])
+        if bm.any():
+            base = float(np.nanmedian(sadc[bm]))
+    peak = float(np.nanmax(np.abs(sadc[win] - base)))
+    return bool(peak < threshold_v), peak, base
 
 
 def _trial_onset_oe(trial, bin_samples: int) -> 'int | None':
@@ -2426,43 +3072,46 @@ def build_session_emg_filter_cache(emg_blocks, sample_rate,
     if ch_a_idx is None:
         return None
 
-    segs_a, segs_b = [], []
+    # Memory: a multi-hour session is >100 M samples, so build the differential
+    # straight into one preallocated float32 array (block by block) rather than
+    # concatenating float64 copies of both channels (~6 GB peak for a 4.7 h
+    # session → MemoryError when many recordings are loaded). float32 matches
+    # the app's own stored precision.
+    usable = [blk for blk in sorted_blks
+              if ch_a_idx < len(blk.raw_channels) and ch_b_idx < len(blk.raw_channels)]
+    if not usable:
+        return None
+    # Trim to shorter channel in case the app wrote unequal-length buffers.
+    lens = [min(len(blk.raw_channels[ch_a_idx]), len(blk.raw_channels[ch_b_idx]))
+            for blk in usable]
+    raw_diff = np.empty(int(sum(lens)), dtype=np.float32)
     block_wall_ms_list, block_len_list, block_map = [], [], []
     arr_idx = 0
-    for blk in sorted_blks:
-        if ch_a_idx >= len(blk.raw_channels) or ch_b_idx >= len(blk.raw_channels):
-            continue
-        wall_ms  = int(blk.ts_background_emitted)
-        oe_start = int(blk.ts_open_ephys_sent)
-        seg_a = np.asarray(blk.raw_channels[ch_a_idx], dtype=float)
-        seg_b = np.asarray(blk.raw_channels[ch_b_idx], dtype=float)
-        # Trim to shorter channel in case the app wrote unequal-length buffers.
-        length = min(len(seg_a), len(seg_b))
-        seg_a = seg_a[:length]
-        seg_b = seg_b[:length]
-        segs_a.append(seg_a)
-        segs_b.append(seg_b)
-        block_wall_ms_list.append(wall_ms)
+    for blk, length in zip(usable, lens):
+        np.subtract(blk.raw_channels[ch_b_idx][:length],
+                    blk.raw_channels[ch_a_idx][:length],
+                    out=raw_diff[arr_idx:arr_idx + length], dtype=np.float32)
+        block_wall_ms_list.append(int(blk.ts_background_emitted))
         block_len_list.append(length)
-        block_map.append((oe_start, arr_idx, length))
+        block_map.append((int(blk.ts_open_ephys_sent), arr_idx, length))
         arr_idx += length
-
-    if not segs_a:
-        return None
-
-    raw_a = np.concatenate(segs_a)
-    raw_b = np.concatenate(segs_b)
-    raw_diff = raw_b - raw_a
 
     nyq = sample_rate / 2.0
     hi_clamped = min(highcut, 0.9999 * nyq)
     sos = butter(filter_order, [lowcut, hi_clamped],
                  btype='bandpass', output='sos', fs=sample_rate)
     if method == 'filtfilt':
-        filtered = sosfiltfilt(sos, raw_diff)
+        filtered = sosfiltfilt(sos, raw_diff).astype(np.float32)
     else:
+        # One continuous causal run, processed in chunks with the filter state
+        # carried forward — mathematically identical to a single sosfilt call,
+        # without a full-length float64 intermediate.
+        filtered = np.empty_like(raw_diff)
         zi = sosfilt_zi(sos)
-        filtered, _ = sosfilt(sos, raw_diff, zi=zi)
+        CHUNK = 10_000_000
+        for i0 in range(0, len(raw_diff), CHUNK):
+            out, zi = sosfilt(sos, raw_diff[i0:i0 + CHUNK].astype(np.float64), zi=zi)
+            filtered[i0:i0 + CHUNK] = out
 
     block_wall_ms_arr   = np.array(block_wall_ms_list, dtype=np.float64)
     block_sample_starts = np.concatenate(([0], np.cumsum(block_len_list))).astype(np.int64)
@@ -2796,7 +3445,9 @@ def compute_peri_stim_bg(trial, sample_rate: float,
                           start_ms: float = None, end_ms: float = None) -> float:
     """MRA of trial_data in the [-start_ms, -end_ms] window relative to stim onset.
 
-    Defaults to PERI_STIM_BG_START_MS / PERI_STIM_BG_END_MS (50 ms → 5 ms).
+    Defaults to PERI_STIM_BG_START_MS / PERI_STIM_BG_END_MS (55 ms → 5 ms). This is
+    the one standardized "pre-stim EMG" calculation used everywhere in this file —
+    see PERI_STIM_BG_START_MS's comment.
     Falls back gracefully when the stored trial does not extend that far pre-stim
     (returns the available segment's MRA, or nan if nothing is available).
     """
@@ -3802,33 +4453,68 @@ def compute_mwave_size(trial, sample_rate: float,
         return float('nan')
 
 
+def _is_fixed_intensity_trial(trial, tol: float = 1e-9) -> bool:
+    """Return True when this trial used fixed stimulation intensity.
+
+    Two detection paths (either is sufficient):
+    - Future app field (fv bump TBD): ``trial.m_wave_stabilization_fixed == 1``
+    - Historical workaround: ``m_wave_min_intensity_ma == m_wave_max_intensity_ma``
+      within *tol* — when min and max are clamped to the same value the
+      controller cannot move the amplitude regardless of step size.
+    """
+    if int(getattr(trial, 'm_wave_stabilization_fixed', 0)) == 1:
+        return True
+    lo = getattr(trial, 'm_wave_min_intensity_ma', float('nan'))
+    hi = getattr(trial, 'm_wave_max_intensity_ma', float('nan'))
+    if not (np.isnan(lo) or np.isnan(hi)):
+        return abs(lo - hi) < tol
+    return False
+
+
 def plot_mwave_stabilization_groups(trials, header, sample_rate: float,
                                     m_start_ms: float = 2.0, m_end_ms: float = 4.0,
                                     pre_ms: float = 15.0, post_ms: float = 20.0,
-                                    metric: str = 'm_wave_size'):
+                                    metric: str = 'm_wave_size',
+                                    downsample: bool = False,
+                                    downsample_method: str = 'random',
+                                    downsample_seed: int = 0):
     """Bar + whisker + per-trial-dots plot of M-wave stabilization trials,
-    grouped by the stored ``m_wave_distribution_window_size`` (V3 S2+).
+    grouped by the stored ``m_wave_distribution_window_size`` (V3 S2 fv>=10).
 
-    Groups are detected directly from the per-trial stamped value — if you
-    changed the window size mid-recording, each setting shows up as its own
-    group automatically (no need to know when the change happened).
+    A separate **Fixed Intensity** group is extracted first (before window-size
+    grouping).  A trial is considered fixed-intensity when either:
 
-    NOTE: ``m_wave_distribution_window_size`` is not yet read by this codebase
-    — verified against a real fv=14 Control Mode file that the already-known
-    "opaque trailer" after the M-wave block (see ``_read_mh_trial_block``)
-    does NOT contain it (it re-echoes ``onset_sample_index``/
-    ``stim_end_sample_index`` instead, at offsets 17/21). Until the real byte
-    position is found, every trial reports window size -1 and this renders as
-    a single "N=?" group — the bar/whisker/dots and metric toggle are fully
-    functional today, just not yet split by window size.
+    * ``trial.m_wave_stabilization_fixed == 1``  (future app field), OR
+    * ``abs(m_wave_min_intensity_ma - m_wave_max_intensity_ma) < 1e-9``
+      — the historical workaround where min==max clamps the controller.
+
+    Fixed-intensity trials are plotted in gold at position 0; adaptive trials
+    follow, grouped by ``m_wave_distribution_window_size``.  Window size -1
+    means the field is unavailable (shown as ``N=?``).
 
     Parameters
     ----------
     metric : 'm_wave_size' (default) or 'abs_error'
-        'm_wave_size' — each trial's own M-wave size (µV), via
-            :func:`compute_mwave_size`.
-        'abs_error' — ``abs(m_wave_size - trial.m_wave_set_value_uv)``: how far
-            that trial's own M-wave size landed from the stabilizer's target.
+        'm_wave_size' — M-wave size (µV) via :func:`compute_mwave_size`.
+        'abs_error'   — ``|m_wave_size − m_wave_set_value_uv|``
+    downsample : bool
+        When True and there are ≥2 groups, every group larger than the smallest
+        one is reduced to the smallest group's n (Fixed Intensity counts as a
+        group). Bars, whiskers, dots and n labels then use only the kept trials.
+    downsample_method : 'random' | 'even' | 'first'
+        Which trials a larger group keeps (values are in trial order):
+        'random' — seeded draw without replacement (*downsample_seed*);
+        'even'   — evenly spaced through the session;
+        'first'  — the earliest n trials.
+    downsample_seed : int
+        RNG seed for 'random' — same seed → same subset.
+
+    Returns a summary dict (``None`` when there is no data) with the numbers
+    behind the plot — see :func:`format_mwave_stabilization_summary`:
+      ``{'subject', 'metric', 'metric_label', 'unit', 'downsampled',
+      'downsample_method', 'downsample_seed', 'groups': [ {label, n, orig_n,
+      mean, sd, cv_pct, median, q1, q3, amp_mean, amp_sd, amp_cv_pct}, ... ]}``
+    SD is the sample SD (ddof=1); CV = SD / |mean| × 100 (``nan`` for n < 2).
     """
     import matplotlib.pyplot as plt
 
@@ -3839,7 +4525,14 @@ def plot_mwave_stabilization_groups(trials, header, sample_rate: float,
         print('No M-wave stabilization data in these trials.')
         return
 
-    groups = defaultdict(list)
+    # ── Separate fixed-intensity from adaptive trials ─────────────────────────
+    # Stim amplitudes are kept index-aligned with the metric values so the
+    # summary's amplitude stats use exactly the same (possibly downsampled) trials.
+    fixed_vals   = []
+    fixed_amps   = []
+    adaptive     = defaultdict(list)   # keyed by m_wave_distribution_window_size
+    adaptive_amps = defaultdict(list)
+
     for t in valid_trials:
         m_size = compute_mwave_size(t, sample_rate, m_start_ms, m_end_ms, pre_ms, post_ms)
         if np.isnan(m_size):
@@ -3849,50 +4542,126 @@ def plot_mwave_stabilization_groups(trials, header, sample_rate: float,
             val = abs(m_size - set_v) if not np.isnan(set_v) else float('nan')
         else:
             val = m_size
-        if not np.isnan(val):
+        if np.isnan(val):
+            continue
+        amp = float(getattr(t, 'stimulation_amplitude_ma', float('nan')))
+        if _is_fixed_intensity_trial(t):
+            fixed_vals.append(val)
+            fixed_amps.append(amp)
+        else:
             w = int(getattr(t, 'm_wave_distribution_window_size', -1))
-            groups[w].append(val)
+            adaptive[w].append(val)
+            adaptive_amps[w].append(amp)
 
-    if not groups:
+    if not fixed_vals and not adaptive:
         print('No valid M-wave size values to plot.')
         return
 
-    group_keys = sorted(groups.keys())
-    if group_keys == [-1]:
+    # ── Build ordered group list: Fixed first, then adaptive by window size ───
+    # Each entry: (x_label, values, bar_color, dot_color, amps)
+    plot_groups = []
+    if fixed_vals:
+        plot_groups.append(('Fixed\nIntensity', np.asarray(fixed_vals, dtype=float),
+                            '#f0c060', '#c07000', np.asarray(fixed_amps, dtype=float)))
+    adaptive_keys = sorted(adaptive.keys())
+    if adaptive_keys == [-1] and not fixed_vals:
         print('Note: m_wave_distribution_window_size is not available in this file '
               'format yet — showing all trials as a single group.')
-    n = len(group_keys)
+    for w in adaptive_keys:
+        lbl = f'N={w}' if w >= 0 else 'N=?'
+        plot_groups.append((lbl, np.asarray(adaptive[w], dtype=float),
+                            'lightsteelblue', 'firebrick',
+                            np.asarray(adaptive_amps[w], dtype=float)))
+
+    # ── Optional: downsample every group to the smallest group's n ────────────
+    orig_n = [len(g[1]) for g in plot_groups]
+    n_min = min(orig_n)
+    downsampled = downsample and len(plot_groups) >= 2 and max(orig_n) > n_min
+    if downsampled:
+        _ds_rng = np.random.default_rng(downsample_seed)
+        _new = []
+        for lbl, vals, bc, dc, amps in plot_groups:
+            if len(vals) > n_min:
+                _idx = _downsample_indices(len(vals), n_min, downsample_method, _ds_rng)
+                vals, amps = vals[_idx], amps[_idx]
+            _new.append((lbl, vals, bc, dc, amps))
+        plot_groups = _new
+        print(f'Downsampled to n={n_min} per group ({downsample_method}'
+              + (f', seed={downsample_seed}' if downsample_method == 'random' else '') + '): '
+              + ', '.join(f"{g[0].replace(chr(10), ' ')} {o}→{len(g[1])}"
+                          for g, o in zip(plot_groups, orig_n)))
+    elif downsample and len(plot_groups) < 2:
+        print('Downsample: only one group — nothing to match.')
+
+    n = len(plot_groups)
     metric_label = ('M-wave Size (µV)' if metric == 'm_wave_size'
                     else '|M-wave Size − Set Value| (µV)')
 
-    fig, ax = plt.subplots(figsize=(max(6, n * 1.8), 5))
-    rng = np.random.default_rng(0)
-    y_max = 0.0
+    summary = {'subject': getattr(header, 'subject_id', ''), 'metric': metric,
+               'metric_label': metric_label, 'unit': 'µV',
+               'downsampled': bool(downsampled),
+               'downsample_method': downsample_method if downsampled else None,
+               'downsample_seed': (downsample_seed if downsampled and downsample_method == 'random'
+                                   else None),
+               'groups': []}
 
-    for i, w in enumerate(group_keys):
-        vals = np.asarray(groups[w], dtype=float)
+    fig, ax = plt.subplots(figsize=(max(6, n * 1.8 + (1.0 if fixed_vals and adaptive else 0)), 5))
+    rng = np.random.default_rng(0)
+    _texts = []
+
+    for i, (lbl, vals, bar_color, dot_color, amps) in enumerate(plot_groups):
         mn = float(np.mean(vals))
         sd = float(np.std(vals, ddof=1)) if len(vals) >= 2 else 0.0
-        ax.bar(i, mn, width=0.55, color='lightsteelblue', edgecolor='steelblue',
+        cv = _coef_of_variation(mn, sd) if len(vals) >= 2 else float('nan')
+        _amps = amps[~np.isnan(amps)]
+        amp_mean = float(np.mean(_amps)) if len(_amps) else float('nan')
+        amp_sd = float(np.std(_amps, ddof=1)) if len(_amps) >= 2 else float('nan')
+        _q = np.percentile(vals, [25, 50, 75])
+        summary['groups'].append({
+            'label': lbl.replace('\n', ' '), 'n': int(len(vals)), 'orig_n': int(orig_n[i]),
+            'mean': mn, 'sd': sd, 'cv_pct': cv,
+            'median': float(_q[1]), 'q1': float(_q[0]), 'q3': float(_q[2]),
+            'amp_mean': amp_mean, 'amp_sd': amp_sd,
+            'amp_cv_pct': (_coef_of_variation(amp_mean, amp_sd)
+                           if len(_amps) >= 2 else float('nan'))})
+        edge_color = '#8b6914' if bar_color == '#f0c060' else 'steelblue'
+        ax.bar(i, mn, width=0.55, color=bar_color, edgecolor=edge_color,
                lw=1.5, zorder=2)
         if sd > 0:
-            ax.errorbar(i, mn, yerr=sd, fmt='none', ecolor='#1e3a5f',
-                       elinewidth=1.8, capsize=6, zorder=4)
+            err_color = '#5a3a00' if bar_color == '#f0c060' else '#1e3a5f'
+            ax.errorbar(i, mn, yerr=sd, fmt='none', ecolor=err_color,
+                        elinewidth=1.8, capsize=6, zorder=4)
         jitter = rng.uniform(-0.18, 0.18, size=len(vals))
-        ax.scatter(i + jitter, vals, color='firebrick', s=18, alpha=0.65,
-                  zorder=5, edgecolors='none')
-        top = max(float(vals.max()), mn + sd)
-        y_max = max(y_max, top)
-        ax.text(i, top, f'n={len(vals)}', ha='center', va='bottom',
-               fontsize=9, color='#444', zorder=6)
+        ax.scatter(i + jitter, vals, color=dot_color, s=18, alpha=0.65,
+                   zorder=5, edgecolors='none')
+        top_val = float(vals.max())
+        top = max(top_val, mn + sd)
+        _n_lbl = (f'n={len(vals)}\n(of {orig_n[i]})'
+                  if downsampled and orig_n[i] != len(vals) else f'n={len(vals)}')
+        _n_lbl += f'\nμ = {mn:.3f} ± {sd:.3f} µV'
+        if not np.isnan(cv):
+            _n_lbl += f'\nCV = {cv:.1f}%'
+        _texts.append(ax.text(i, top, _n_lbl, ha='center', va='bottom',
+                              fontsize=9, color='#444', zorder=6))
+
+    # Separator line between Fixed and adaptive groups
+    if fixed_vals and adaptive:
+        ax.axvline(0.5, color='#aaa', lw=1.0, ls=':', zorder=1)
 
     ax.set_xticks(range(n))
-    ax.set_xticklabels([f'N={w}' if w >= 0 else 'N=?' for w in group_keys])
-    ax.set_xlabel('M-wave Distribution Window Size (trials)', fontsize=10)
+    ax.set_xticklabels([g[0] for g in plot_groups])
+    xlabel = 'M-wave Distribution Window Size (adaptive trials)'
+    if fixed_vals:
+        xlabel = 'Group  (Fixed Intensity  |  Adaptive by window size)'
+    ax.set_xlabel(xlabel, fontsize=10)
     ax.set_ylabel(metric_label, fontsize=10)
+    n_fixed = sum(len(g[1]) for g in plot_groups if g[0] == 'Fixed\nIntensity')
+    n_adaptive = sum(len(g[1]) for g in plot_groups if g[0] != 'Fixed\nIntensity')
     ax.set_title(
         f'M-Wave Stabilization — {header.subject_id}\n'
-        f'bar = group mean  ·  whisker = ±1 SD  ·  dots = individual trials',
+        f'bar = group mean  ·  whisker = ±1 SD  ·  dots = individual trials'
+        + (f'  [{n_fixed} fixed / {n_adaptive} adaptive]' if fixed_vals else '')
+        + (f'\ndownsampled to n={n_min} per group ({downsample_method})' if downsampled else ''),
         fontsize=10)
     ax.set_xlim(-0.65, n - 0.35)
     ax.margins(y=0.15)
@@ -3901,7 +4670,54 @@ def plot_mwave_stabilization_groups(trials, header, sample_rate: float,
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     plt.tight_layout()
+    _fit_texts_in_axes(ax, _texts)
+    plt.tight_layout()
     plt.show()
+    return summary
+
+
+def _coef_of_variation(mean: float, sd: float) -> float:
+    """Coefficient of variation in percent (SD / |mean| × 100); ``nan`` when
+    the mean is 0 or not finite."""
+    if not np.isfinite(mean) or not np.isfinite(sd) or mean == 0:
+        return float('nan')
+    return 100.0 * sd / abs(mean)
+
+
+def format_mwave_stabilization_summary(summary) -> str:
+    """Tab-separated text of a :func:`plot_mwave_stabilization_groups` summary —
+    prints readably in a notebook and pastes into Excel/Sheets as columns.
+    """
+    if not summary:
+        return ''
+    u = summary.get('unit', 'µV')
+    head = f"{summary['metric_label']}  ·  {summary['subject']}"
+    if summary.get('downsampled'):
+        head += f"  ·  downsampled ({summary['downsample_method']}"
+        if summary.get('downsample_seed') is not None:
+            head += f", seed={summary['downsample_seed']}"
+        head += ')'
+    lines = [head, '',
+             '\t'.join(['Group', 'n', 'n (before downsample)', f'Mean ({u})', f'SD ({u})',
+                        'CV (%)', f'Median ({u})', f'Q1 ({u})', f'Q3 ({u})',
+                        'Amp mean (mA)', 'Amp SD (mA)', 'Amp CV (%)'])]
+    for g in summary['groups']:
+        lines.append('\t'.join([g['label'], str(g['n']), str(g['orig_n'])] + [
+            f"{g[k]:.3f}" for k in ('mean', 'sd', 'cv_pct', 'median', 'q1', 'q3',
+                                    'amp_mean', 'amp_sd', 'amp_cv_pct')]))
+    return '\n'.join(lines)
+
+
+def _downsample_indices(n_total: int, n_keep: int, method: str, rng) -> np.ndarray:
+    """Sorted indices of *n_keep* items out of *n_total* (see
+    :func:`plot_mwave_stabilization_groups` ``downsample_method``)."""
+    if method == 'first':
+        return np.arange(n_keep)
+    if method == 'even':
+        return np.arange(n_keep) * n_total // n_keep
+    if method == 'random':
+        return np.sort(rng.choice(n_total, size=n_keep, replace=False))
+    raise ValueError(f"downsample_method must be 'random', 'even' or 'first', got {method!r}")
 
 
 def plot_mwave_control_error(trials, header, title_suffix: str = '',
@@ -4015,8 +4831,14 @@ def plot_mwave_control_error(trials, header, title_suffix: str = '',
     title = f'M-Wave Control — {header.subject_id}'
     if title_suffix:
         title += f'  {title_suffix}'
-    fig.update_layout(title=title, xaxis_title='Trial #', height=450,
-                      legend=dict(orientation='h', yanchor='bottom', y=1.02))
+    # Legend sits below the x-axis (not in the top margin) so a wrapped
+    # horizontal legend can never overlap the title or the plot area.
+    fig.update_layout(title=dict(text=title, x=0.0, xanchor='left',
+                                 y=0.98, yanchor='top'),
+                      xaxis_title='Trial #', height=520,
+                      margin=dict(t=60, b=130),
+                      legend=dict(orientation='h', x=0.0, xanchor='left',
+                                  y=-0.18, yanchor='top'))
     fig.update_yaxes(title_text='M-wave Size (µV)', secondary_y=False)
     fig.update_yaxes(title_text='Stim Amplitude (mA)', secondary_y=True)
     fig.show()
@@ -5600,11 +6422,15 @@ def plot_hrs2_analysis(trials, header,
             _mse = float(np.mean(_se)) if _se else None
             _mm  = (_t_ref >= m_start_ms) & (_t_ref <= m_end_ms)
             _hm  = (_t_ref >= h_start_ms) & (_t_ref <= h_end_ms)
-            _pre_mask_a = _t_ref < 0
-            # Per-trial: rectify each trial first, then average across trials.
-            # This matches compute_h_comparison_data and xr_df per-trial metrics.
-            _pre_a = (float(np.nanmean(_pab[:, _pre_mask_a]))
-                      if _pre_mask_a.any() else 0.0)
+            _trs = _trial_groups[_amp]
+            # Standardized pre-stim EMG background: -55 ms to -5 ms before onset
+            # (compute_peri_stim_bg), per trial then averaged across the group.
+            # Independent of pre_avg_ms — matches compute_h_comparison_data and
+            # every other "pre-stim EMG" calculation in this file exactly, so the
+            # HRS2 Analysis viewer and Cross-Recording Comparison always agree.
+            _bg_per_trial = [compute_peri_stim_bg(_t, sample_rate) for _t in _trs]
+            _bg_per_trial = [v for v in _bg_per_trial if not np.isnan(v)]
+            _pre_a = float(np.mean(_bg_per_trial)) if _bg_per_trial else 0.0
             _m_t   = float((m_start_ms + m_end_ms) / 2)
             _m_a   = float(np.nanmean(_pab[:, _mm])) if _mm.any() else float('nan')
             _m_ci  = int(len(_t_ref[_mm]) // 2) if _mm.any() else 0
@@ -5613,7 +6439,6 @@ def plot_hrs2_analysis(trials, header,
             _h_a   = float(np.nanmean(_pab[:, _hm])) if _hm.any() else float('nan')
             _h_ci  = int(len(_t_ref[_hm]) // 2) if _hm.any() else 0
             _h_bip = float(_avg_b[_hm][_h_ci]) if _hm.any() else float('nan')
-            _trs = _trial_groups[_amp]
             _bg_mean, _bg_lo, _bg_hi = get_group_bg_stats(_trs)
             _first_tr = _trs[0] if _trs else None
             _is_mg    = getattr(_first_tr, '_is_merged', False) if _first_tr else False
@@ -5622,6 +6447,7 @@ def plot_hrs2_analysis(trials, header,
             _adata.append({
                 'amp': _amp, 't_ref': _t_ref, 'n': len(_wins),
                 'mean_stim_end': _mse,
+                'pre_stim_bg': _pre_a,
                 'padded_bip': _pb,   'avg_bip': _avg_b,
                 'padded_adc': _pa,   'avg_adc': _avg_a,
                 'padded_uni': _pu,   'avg_uni': _avg_u,
@@ -5714,9 +6540,10 @@ def plot_hrs2_analysis(trials, header,
             _ax2.set_ylabel('ADC (V)', fontsize=fsz - 1)
             _ax2.tick_params(axis='y', labelsize=fsz - 2)
 
-        _pre_mask = t < 0
-        _pre_emg = (float(np.nanmean(d['padded_abs_bip'][:, _pre_mask]))
-                   if _pre_mask.sum() >= 2 else float('nan'))
+        # Same standardized -55→-5 ms background used for m_size/h_size in
+        # _build_amp_data (compute_peri_stim_bg) — not recomputed from the
+        # plotted pre_avg_ms window, so the displayed label always matches.
+        _pre_emg = d.get('pre_stim_bg', float('nan'))
 
         draw_peristim_decorations(
             ax, t,
@@ -6333,17 +7160,15 @@ def plot_hrs2_trials(trials, header,
 
         _mm = (t >= m_start_ms) & (t <= m_end_ms)
         _hm = (t >= h_start_ms) & (t <= h_end_ms)
-        _pre_mask_mh = t < 0
-        _pre_emg_mh = (float(np.nanmean(np.abs(d['emg'][_pre_mask_mh])))
-                       if _pre_mask_mh.sum() >= 2 else 0.0)
+        # Standardized -55->-5 ms background (compute_peri_stim_bg) — same
+        # calculation as _build_amp_data/compute_h_comparison_data, independent
+        # of the plotted pre_plot_ms window, so every viewer always agrees.
+        _pre_emg = compute_peri_stim_bg(d['trial'], sample_rate)
+        _pre_emg_mh = _pre_emg if not np.isnan(_pre_emg) else 0.0
         _m_mra = float(np.nanmean(np.abs(emg[_mm]))) if _mm.any() else float('nan')
         _h_mra = float(np.nanmean(np.abs(emg[_hm]))) if _hm.any() else float('nan')
         _m_size = _m_mra - _pre_emg_mh
         _h_size = _h_mra - _pre_emg_mh
-
-        _pre_mask = t < 0
-        _pre_emg = (float(np.nanmean(np.abs(d['emg'][_pre_mask])))
-                   if _pre_mask.sum() >= 2 else float('nan'))
 
         draw_peristim_decorations(
             ax, t,
@@ -13094,9 +13919,16 @@ def compute_h_comparison_data(all_recordings, pre_ms, post_ms, h_start_ms, h_end
 
     Returns
     -------
-    dict : {rec_label: {stage_key: {'h_sizes', 'm_sizes', 'bg_sizes': np.ndarray,
+    dict : {rec_label: {stage_key: {'h_sizes', 'm_sizes', 'bg_sizes', 'amps': np.ndarray,
                                     'mean_amp': float, 'std_amp': float}}}
-        Each array has one value per trial with a valid pre-stim window.
+        'h_sizes'/'m_sizes'/'bg_sizes'/'amps' are all the SAME length and
+        index-aligned one-per-trial (a trial with no valid H- or M-window
+        reading gets NaN in 'h_sizes'/'m_sizes' at that index rather than being
+        dropped), so a caller can mask any one of them and apply the same mask
+        to 'amps' to get the amplitudes of exactly the trials contributing to
+        that metric — this is what plot_h_reflex_comparison's cross-recording
+        range average does. 'mean_amp'/'std_amp' summarize ALL of this stage's
+        trials (independent of per-metric validity), matching prior behavior.
     """
     result = {}
     for rec_label, rec in all_recordings.items():
@@ -13109,7 +13941,7 @@ def compute_h_comparison_data(all_recordings, pre_ms, post_ms, h_start_ms, h_end
             if not trials:
                 continue
 
-            h_sizes, m_sizes, bg_sizes = [], [], []
+            h_sizes, m_sizes, bg_sizes, trial_amps = [], [], [], []
             for t in trials:
                 try:
                     t_ms, emg, *_ = get_trial_window(
@@ -13119,26 +13951,30 @@ def compute_h_comparison_data(all_recordings, pre_ms, post_ms, h_start_ms, h_end
                     bg_mra = compute_peri_stim_bg(t, sr)
                     if np.isnan(bg_mra):
                         continue
-                    bg_sizes.append(bg_mra)
                     h_mask = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
-                    if h_mask.any():
-                        h_sizes.append(float(np.mean(np.abs(emg[h_mask]))) - bg_mra)
                     m_mask = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
-                    if m_mask.any():
-                        m_sizes.append(float(np.mean(np.abs(emg[m_mask]))) - bg_mra)
+                    h_val = (float(np.mean(np.abs(emg[h_mask]))) - bg_mra
+                             if h_mask.any() else float('nan'))
+                    m_val = (float(np.mean(np.abs(emg[m_mask]))) - bg_mra
+                             if m_mask.any() else float('nan'))
+                    bg_sizes.append(bg_mra)
+                    h_sizes.append(h_val)
+                    m_sizes.append(m_val)
+                    trial_amps.append(float(t.stimulation_amplitude_ma))
                 except Exception:
                     continue
 
             if not bg_sizes:
                 continue
 
-            amps     = [t.stimulation_amplitude_ma for t in trials]
-            mean_amp = float(np.mean(amps))
-            std_amp  = float(np.std(amps, ddof=min(1, len(amps) - 1)))
+            all_amps = [t.stimulation_amplitude_ma for t in trials]
+            mean_amp = float(np.mean(all_amps))
+            std_amp  = float(np.std(all_amps, ddof=min(1, len(all_amps) - 1)))
             result[rec_label][stage_key] = {
                 'h_sizes':  np.array(h_sizes,  dtype=float),
                 'm_sizes':  np.array(m_sizes,  dtype=float),
                 'bg_sizes': np.array(bg_sizes, dtype=float),
+                'amps':     np.array(trial_amps, dtype=float),
                 'mean_amp': mean_amp,
                 'std_amp':  std_amp,
             }
@@ -13147,7 +13983,7 @@ def compute_h_comparison_data(all_recordings, pre_ms, post_ms, h_start_ms, h_end
 
 
 def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
-                             metric='h_reflex'):
+                             metric='h_reflex', avg_range=None):
     """
     Render a cross-recording comparison box-and-whisker plot.
 
@@ -13160,6 +13996,19 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
     stage_key : str — which stage to display (e.g. 'control_mode')
     stage_labels : dict — {stage_key: display_label}
     metric : str — 'h_reflex', 'm_wave', or 'background'
+    avg_range : (str, str) or None — (lo_label, hi_label) recording labels (as they
+        appear in ``recording_dirs``) bounding an inclusive range. When given, pools
+        every trial with a valid reading for the current ``metric`` across all
+        recordings in that range (regardless of order) and draws a dotted
+        horizontal line at the pooled mean, labeled with mean ± std for both the
+        metric and the stimulation amplitude of that same pooled trial set.
+
+    Returns a summary dict (``None`` when there is no data) with the numbers
+    behind the plot — see :func:`format_h_comparison_summary` for a
+    copy/paste-friendly text version:
+      ``{'stage', 'metric', 'metric_label', 'unit', 'recordings': [ {label, n,
+      mean, sd, median, q1, q3, amp_mean, amp_sd}, ... ], 'range_avg': {lo, hi,
+      labels, n, mean, sd, amp_mean, amp_sd} or None}``
     """
     import matplotlib.pyplot as plt
 
@@ -13172,34 +14021,51 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
     }
     sizes_key, ylabel, title_base = _metric_cfg.get(metric, _metric_cfg['h_reflex'])
 
-    # Collect data in RECORDING_DIRS order; skip recordings missing this stage/data
+    # Collect data in RECORDING_DIRS order; skip recordings missing this stage/data.
+    # sizes_key's array may contain NaN for trials with no valid H-/M-window
+    # reading (compute_h_comparison_data keeps it index-aligned with 'amps') —
+    # drop those here, masking 'amps' the same way so the two always agree.
     ordered = [lbl for lbl, _, _ in recording_dirs if lbl in h_cache]
     valid = []
     for lbl in ordered:
         entry = h_cache[lbl].get(stage_key)
-        if entry is not None:
-            sizes = entry.get(sizes_key, np.array([]))
-            if len(sizes) >= 1:
-                valid.append((lbl, sizes, entry['mean_amp'], entry.get('std_amp', 0.0)))
+        if entry is None:
+            continue
+        sizes = np.asarray(entry.get(sizes_key, np.array([])), dtype=float)
+        amps  = np.asarray(entry.get('amps', np.array([])), dtype=float)
+        mask  = ~np.isnan(sizes)
+        sizes = sizes[mask]
+        amps  = amps[mask] if len(amps) == len(mask) else np.array([])
+        if len(sizes) >= 1:
+            valid.append((lbl, sizes, amps, entry['mean_amp'], entry.get('std_amp', 0.0)))
 
     if not valid:
         print(f'No data for stage {stage_lbl!r} / metric {metric!r} in any recording.')
-        return
+        return None
+
+    summary = {'stage': stage_lbl, 'metric': metric,
+               'metric_label': ylabel, 'unit': 'µV',
+               'recordings': [], 'range_avg': None}
 
     n  = len(valid)
     bw = 0.46
     fig, ax = plt.subplots(figsize=(max(6, n * 2.0), 5))
 
-    all_flat = np.concatenate([d for _, d, _, _ in valid])
+    all_flat = np.concatenate([d for _, d, _, _, _ in valid])
     y_span   = float(all_flat.max() - all_flat.min()) or 1.0
 
-    means, xlbls = [], []
-    for i, (rl, sizes, mean_amp, std_amp) in enumerate(valid):
+    means, xlbls, _texts = [], [], []
+    for i, (rl, sizes, _amps, mean_amp, std_amp) in enumerate(valid):
         n_trials = len(sizes)
         mn = float(np.mean(sizes))
         sd = float(np.std(sizes, ddof=min(1, n_trials - 1)))
         means.append(mn)
         xlbls.append(f'{rl}\nσ={std_amp:.3f} mA')
+        _q = np.percentile(sizes, [25, 50, 75])
+        summary['recordings'].append({
+            'label': rl, 'n': n_trials, 'mean': mn, 'sd': sd,
+            'median': float(_q[1]), 'q1': float(_q[0]), 'q3': float(_q[2]),
+            'amp_mean': float(mean_amp), 'amp_sd': float(std_amp)})
 
         if n_trials >= 2:
             q1, med, q3 = (float(v) for v in np.percentile(sizes, [25, 50, 75]))
@@ -13215,12 +14081,47 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
         ax.plot(i, mn, 'D', color='#1e3a5f', ms=8, zorder=5)
 
         top = (mn + sd) if n_trials >= 2 else mn
-        ax.text(i, top + y_span * 0.04,
+        _texts.append(ax.text(i, top + y_span * 0.04,
                 f'n={n_trials}\namp = {mean_amp:.3f} ± {std_amp:.3f} mA\nμ = {mn:.3f} ± {sd:.3f} µV',
-                ha='center', va='bottom', fontsize=8, color='#444', zorder=6)
+                ha='center', va='bottom', fontsize=8, color='#444', zorder=6))
 
     if len(means) > 1:
         ax.plot(range(n), means, '--', color='#1e3a5f', lw=1.5, alpha=0.65, zorder=2)
+
+    # ── Range average: pool every valid trial across the selected recording
+    # range and draw a dotted line at that pooled mean. ────────────────────────
+    if avg_range is not None:
+        lo_lbl, hi_lbl = avg_range
+        by_label = {lbl: (sizes, amps) for lbl, sizes, amps, _, _ in valid}
+        in_ordered = [lbl for lbl in ordered if lbl in by_label]
+        if lo_lbl in in_ordered and hi_lbl in in_ordered:
+            lo_i, hi_i = sorted((in_ordered.index(lo_lbl), in_ordered.index(hi_lbl)))
+            range_labels = in_ordered[lo_i:hi_i + 1]
+            pooled_sizes = np.concatenate([by_label[lbl][0] for lbl in range_labels])
+            pooled_amps  = np.concatenate([by_label[lbl][1] for lbl in range_labels
+                                           if len(by_label[lbl][1]) == len(by_label[lbl][0])])
+            if len(pooled_sizes) >= 1:
+                rng_mean = float(np.mean(pooled_sizes))
+                rng_sd   = float(np.std(pooled_sizes, ddof=min(1, len(pooled_sizes) - 1)))
+                ax.axhline(rng_mean, color='darkorange', linestyle=':', linewidth=2.2,
+                           zorder=7)
+                amp_txt = ''
+                amp_mean = amp_sd = float('nan')
+                if len(pooled_amps) >= 1:
+                    amp_mean = float(np.mean(pooled_amps))
+                    amp_sd   = float(np.std(pooled_amps, ddof=min(1, len(pooled_amps) - 1)))
+                    amp_txt  = f'  |  amp = {amp_mean:.3f} ± {amp_sd:.3f} mA'
+                summary['range_avg'] = {
+                    'lo': lo_lbl, 'hi': hi_lbl, 'labels': list(range_labels),
+                    'n': int(len(pooled_sizes)), 'mean': rng_mean, 'sd': rng_sd,
+                    'amp_mean': amp_mean, 'amp_sd': amp_sd}
+                range_desc = lo_lbl if lo_lbl == hi_lbl else f'{lo_lbl} … {hi_lbl}'
+                _texts.append(ax.text(
+                        n - 0.35, rng_mean, f' Range avg ({range_desc}, n={len(pooled_sizes)}): '
+                        f'μ = {rng_mean:.3f} ± {rng_sd:.3f} µV{amp_txt}',
+                        ha='right', va='bottom', fontsize=8.5, color='darkorange',
+                        fontweight='bold', zorder=8,
+                        bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='darkorange', alpha=0.85)))
 
     ax.set_xticks(range(n))
     ax.set_xticklabels(xlbls, rotation=20, ha='right', fontsize=9)
@@ -13236,7 +14137,54 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     plt.tight_layout()
+    _fit_texts_in_axes(ax, _texts)
+    plt.tight_layout()
     plt.show()
+    return summary
+
+
+def _fit_texts_in_axes(ax, texts, pad_frac: float = 0.03, max_iter: int = 6):
+    """Raise the y-axis top until every text artist in *texts* sits inside the
+    axes (text is ignored by autoscaling, so data-anchored labels above the
+    tallest bar otherwise spill out and collide with the title)."""
+    if not texts:
+        return
+    fig = ax.figure
+    for _ in range(max_iter):
+        fig.canvas.draw()
+        _r = fig.canvas.get_renderer()
+        _inv = ax.transData.inverted()
+        _top = max(_inv.transform((0, t.get_window_extent(_r).y1))[1] for t in texts)
+        y0, y1 = ax.get_ylim()
+        if _top <= y1:
+            return
+        ax.set_ylim(y0, _top + (_top - y0) * pad_frac)
+
+
+def format_h_comparison_summary(summary) -> str:
+    """Tab-separated text of a :func:`plot_h_reflex_comparison` summary —
+    prints readably in a notebook and pastes into Excel/Sheets as columns.
+    """
+    if not summary:
+        return ''
+    u = summary.get('unit', 'µV')
+    lines = [f"{summary['metric_label']}  ·  {summary['stage']}", '',
+             '\t'.join(['Recording', 'n', f'Mean ({u})', f'SD ({u})',
+                        f'Median ({u})', f'Q1 ({u})', f'Q3 ({u})',
+                        'Amp mean (mA)', 'Amp SD (mA)'])]
+    for r in summary['recordings']:
+        lines.append('\t'.join([r['label'], str(r['n'])] + [
+            f"{r[k]:.3f}" for k in ('mean', 'sd', 'median', 'q1', 'q3',
+                                    'amp_mean', 'amp_sd')]))
+    ra = summary.get('range_avg')
+    if ra:
+        desc = ra['lo'] if ra['lo'] == ra['hi'] else f"{ra['lo']} … {ra['hi']}"
+        lines += ['', f"Range average ({desc}; {len(ra['labels'])} recordings pooled)",
+                  '\t'.join(['Range', 'n', f'Mean ({u})', f'SD ({u})',
+                             'Amp mean (mA)', 'Amp SD (mA)']),
+                  '\t'.join([desc, str(ra['n'])] + [
+                      f"{ra[k]:.3f}" for k in ('mean', 'sd', 'amp_mean', 'amp_sd')])]
+    return '\n'.join(lines)
 
 
 # ── Plotly MH Recruitment Curve Helpers ──────────────────────────────────────
@@ -16115,49 +17063,371 @@ def _write_mh_trial_block_full(fid: BinaryIO, trial: MhRecTrial) -> None:
     hrs_write_val(fid, trial.digital_onset_channel,              'int32')
 
 
+# ── Failed-trial classification + recording-level trial exclusion / filtering ─
+# Category key → (label, part of the offline "All offline" union?).
+# Shared by make_failed_trials_viewer and exclude_failed_trials so the viewer
+# and the exclusion step always flag exactly the same trials.
+FAILED_TRIAL_CATEGORIES = {
+    'no_sync':      ('No sync', True),
+    'align_miss':   ('Alignment miss', True),
+    'recalc_stim':  ('Recalculated bad stim ADC', True),
+    'off_stim':     ('Frozen stim ADC (offline)', True),
+    'off_sync':     ('Frozen sync (offline)', True),
+    'onset_mm':     ('Onset mismatch', True),
+    'app_stim':     ('App flag 1: stim ADC', False),
+    'app_sync':     ('App flag 2: sync', False),
+    'app_both':     ('App flag 3: both', False),
+    'app_vns':      ('App flag 4: VNS ADC', False),
+}
+FAILED_TRIAL_OFFLINE_CATEGORIES = tuple(
+    k for k, (_lbl, _off) in FAILED_TRIAL_CATEGORIES.items() if _off)
+
+
+def classify_failed_trials(trials, header, sample_rate: float,
+                           stim_adc_threshold_v: float = 0.1,
+                           stim_adc_window_ms: tuple = (-1.0, 1.0)):
+    """Flag every trial of one stage against all failed-trial checks.
+
+    Returns a list parallel to *trials*: ``(categories: set, reasons: list[str])``
+    per trial, using the keys of :data:`FAILED_TRIAL_CATEGORIES`. A clean trial
+    gets ``(set(), [])``. See :func:`make_failed_trials_viewer` for what each
+    check means.
+    """
+    _corrupt_by_idx = {f['idx']: f for f in detect_corrupted_trials(trials, header)}
+    out = []
+    for _i, _t in enumerate(trials):
+        _cats, _reasons = set(), []
+        if int(getattr(_t, 'onset_detected', 1)) == 0:
+            _cats.add('no_sync'); _reasons.append('NO SYNC')
+        if getattr(_t, '_alignment_miss', False):
+            _cats.add('align_miss'); _reasons.append('ALIGNMENT MISS — stored data')
+        _bad, _pk, _ = detect_bad_stim_adc_window(
+            _t, sample_rate, threshold_v=stim_adc_threshold_v,
+            window_ms=stim_adc_window_ms)
+        if _bad:
+            _cats.add('recalc_stim')
+            _reasons.append(f'Recalc bad stim ADC (peak {_pk:.3f} V)')
+        _cf = _corrupt_by_idx.get(_i)
+        if _cf is not None:
+            if _cf['integrity_flags'] & 1:
+                _cats.add('off_stim'); _reasons.append('Stim ADC frozen')
+            if _cf['integrity_flags'] & 2:
+                _cats.add('off_sync'); _reasons.append('Sync frozen')
+            if _cf['cross_check_ok'] is False:
+                _cats.add('onset_mm')
+                _reasons.append(f"onset mismatch ({_cf['cross_check_disagreement']} samp)")
+        # App's live frozen-run bitmask (threshold 20 samples in the app).
+        _af = int(getattr(_t, 'data_integrity_flags', 0) or 0)
+        if (_af & 3) == 1:
+            _cats.add('app_stim')
+        elif (_af & 3) == 2:
+            _cats.add('app_sync')
+        elif (_af & 3) == 3:
+            _cats.add('app_both')
+        if _af & 4:
+            _cats.add('app_vns')
+        if _af:
+            _reasons.append(f'app flag={_af}')
+        out.append((_cats, _reasons))
+    return out
+
+
+def _rec_sample_rate(rec, header) -> float:
+    return float(rec.get('sample_rate') or getattr(header, 'sample_rate', None)
+                 or SAMPLE_RATE)
+
+
+def _subset_recordings(all_recordings, keep_by_stage):
+    """Build a new all_recordings dict holding only the kept trials.
+
+    *keep_by_stage* maps ``(rec_label, stage_key)`` → set of ``id(trial)`` to
+    keep; stages missing from it are kept whole. Trial objects, headers and
+    EMG blocks are shared with the input (not copied); only the lists are new,
+    so the input dict is left untouched. ``ft_trials`` / ``ft_trial_hz`` (kept
+    parallel) and ``ft_files`` are filtered by the ``frequency_test`` stage's
+    keep set so the FT viewers see the same subset.
+    """
+    out = {}
+    for _rl, _rec in all_recordings.items():
+        _sm = {}
+        for _sk, (_tr, _h, _e, _sl) in _rec.get('stage_map', {}).items():
+            _keep = keep_by_stage.get((_rl, _sk))
+            _sm[_sk] = (list(_tr) if _keep is None else
+                        [t for t in _tr if id(t) in _keep], _h, _e, _sl)
+        _new = {**_rec, 'stage_map': _sm}
+        _ft_keep = keep_by_stage.get((_rl, 'frequency_test'))
+        if _ft_keep is not None:
+            _ft_t  = _rec.get('ft_trials') or []
+            _ft_hz = _rec.get('ft_trial_hz') or []
+            _pairs = [(t, hz) for t, hz in zip(_ft_t, _ft_hz) if id(t) in _ft_keep]
+            _new['ft_trials']   = [t for t, _ in _pairs]
+            _new['ft_trial_hz'] = [hz for _, hz in _pairs]
+            _new['ft_files'] = {
+                _k: (_fh, [t for t in _ft if id(t) in _ft_keep], _fe)
+                for _k, (_fh, _ft, _fe) in (_rec.get('ft_files') or {}).items()}
+        out[_rl] = _new
+    return out
+
+
+def _print_subset_counts(counts):
+    _tot_o = _tot_k = 0
+    for _rl, _sl, _o, _k in counts:
+        _tot_o += _o; _tot_k += _k
+        print(f'  {_rl}  [{_sl}]:  kept {_k}/{_o}  (removed {_o - _k})')
+    if _tot_o:
+        print(f'  Total: kept {_tot_k}/{_tot_o}  ({100 * _tot_k / _tot_o:.1f}%),'
+              f'  removed {_tot_o - _tot_k}')
+
+
+def exclude_failed_trials(all_recordings, categories='all', stages=None,
+                          stim_adc_threshold_v: float = 0.1,
+                          stim_adc_window_ms: tuple = (-1.0, 1.0),
+                          verbose: bool = True):
+    """Remove failed trials from every recording/stage before any analysis.
+
+    Parameters
+    ----------
+    categories : 'all' or iterable of str
+        Which :data:`FAILED_TRIAL_CATEGORIES` keys cause exclusion. ``'all'`` =
+        the offline union (:data:`FAILED_TRIAL_OFFLINE_CATEGORIES`) — exactly the
+        "All offline" group of :func:`make_failed_trials_viewer`. The ``app_*``
+        keys (app's live frozen-run flag, known to over-flag) can be added
+        explicitly.
+    stages : None or iterable of stage keys
+        Restrict exclusion to these stage_map keys; ``None`` = all stages.
+    stim_adc_threshold_v, stim_adc_window_ms
+        Passed to :func:`detect_bad_stim_adc_window` — keep these equal to the
+        values given to :func:`make_failed_trials_viewer`.
+
+    Returns
+    -------
+    (clean_recordings, excluded_df)
+        *clean_recordings* has the same structure as *all_recordings* (which is
+        not modified). *excluded_df* has one row per removed trial: recording,
+        stage, trial_idx (0-based index in the original stage list — matches the
+        failed viewer's ``trial [i]``), amp_ma, categories, reasons.
+    """
+    if isinstance(categories, str) and categories == 'all':
+        _excl = set(FAILED_TRIAL_OFFLINE_CATEGORIES)
+    else:
+        _excl = set(categories)
+        _unknown = _excl - set(FAILED_TRIAL_CATEGORIES)
+        if _unknown:
+            raise ValueError(f'Unknown failed-trial categories: {sorted(_unknown)}. '
+                             f'Valid: {list(FAILED_TRIAL_CATEGORIES)}')
+    _stages = None if stages is None else set(stages)
+
+    keep_by_stage, rows, counts = {}, [], []
+    for _rl, _rec in all_recordings.items():
+        for _sk, (_tr, _h, _e, _sl) in _rec.get('stage_map', {}).items():
+            if not _tr or (_stages is not None and _sk not in _stages):
+                continue
+            _sr = _rec_sample_rate(_rec, _h)
+            _flags = classify_failed_trials(
+                _tr, _h, _sr, stim_adc_threshold_v=stim_adc_threshold_v,
+                stim_adc_window_ms=stim_adc_window_ms)
+            _keep = set()
+            for _i, (_t, (_cats, _reasons)) in enumerate(zip(_tr, _flags)):
+                _hit = _cats & _excl
+                if _hit:
+                    rows.append({
+                        'recording':  _rl,
+                        'stage':      _sl,
+                        'trial_idx':  _i,
+                        'amp_ma':     getattr(_t, 'stimulation_amplitude_ma', float('nan')),
+                        'categories': ', '.join(sorted(_hit)),
+                        'reasons':    ' + '.join(_reasons),
+                    })
+                else:
+                    _keep.add(id(_t))
+            keep_by_stage[(_rl, _sk)] = _keep
+            counts.append((_rl, _sl, len(_tr), len(_keep)))
+
+    clean = _subset_recordings(all_recordings, keep_by_stage)
+    excluded_df = pd.DataFrame(rows, columns=['recording', 'stage', 'trial_idx',
+                                              'amp_ma', 'categories', 'reasons'])
+    if verbose:
+        _cat_str = ('all offline' if isinstance(categories, str)
+                    else ', '.join(sorted(_excl)))
+        print(f'Failed-trial exclusion  (categories: {_cat_str})')
+        _print_subset_counts(counts)
+        if len(excluded_df):
+            _per_cat = defaultdict(int)
+            for _c in excluded_df['categories']:
+                for _k in _c.split(', '):
+                    _per_cat[_k] += 1
+            print('  Removed per category (a trial can hit several): ' +
+                  ', '.join(f'{FAILED_TRIAL_CATEGORIES[k][0]}={n}'
+                            for k, n in sorted(_per_cat.items())))
+    return clean, excluded_df
+
+
+def compute_trial_size_metrics(trial, sample_rate: float, pre_ms: float, post_ms: float,
+                               m_start_ms: float, m_end_ms: float,
+                               h_start_ms: float, h_end_ms: float) -> dict:
+    """Per-trial rectified-EMG sizes: ``{'m_size_uv', 'h_size_uv', 'bg_mra_uv',
+    'hm_ratio'}``.
+
+    Same calculation as the notebooks' per-trial ``xr_df``: window MRA minus
+    the standardized peri-stim background (:func:`compute_peri_stim_bg`,
+    NaN background → 0). All NaN if the trial window can't be extracted.
+    """
+    _nan = float('nan')
+    try:
+        _tm, _et, *_ = get_trial_window(
+            trial, pre_ms, post_ms, ms_per_sample=1000.0 / sample_rate,
+            record_samples=int(TRIAL_RECORD_MS * sample_rate / 1000))
+        _bg = compute_peri_stim_bg(trial, sample_rate)
+        if np.isnan(_bg):
+            _bg = 0.0
+        _mm = (_tm >= m_start_ms) & (_tm <= m_end_ms)
+        _hm = (_tm >= h_start_ms) & (_tm <= h_end_ms)
+        _mv = float(np.nanmean(np.abs(_et[_mm]))) - _bg if _mm.any() else _nan
+        _hv = float(np.nanmean(np.abs(_et[_hm]))) - _bg if _hm.any() else _nan
+    except Exception:
+        return {'m_size_uv': _nan, 'h_size_uv': _nan, 'bg_mra_uv': _nan, 'hm_ratio': _nan}
+    return {
+        'm_size_uv': _mv,
+        'h_size_uv': _hv,
+        'bg_mra_uv': _bg,
+        'hm_ratio':  _hv / _mv if (_mv and not np.isnan(_mv) and _mv > 0) else _nan,
+    }
+
+
+# Filter metric name → compute_trial_size_metrics key.
+TRIAL_FILTER_METRICS = {
+    'M_WAVE':     'm_size_uv',
+    'H_WAVE':     'h_size_uv',
+    'HM_RATIO':   'hm_ratio',
+    'BACKGROUND': 'bg_mra_uv',
+}
+
+
+def filter_recordings_by_metric(all_recordings, metric: str, lo: float, hi: float,
+                                pre_ms: float, post_ms: float,
+                                m_start_ms: float, m_end_ms: float,
+                                h_start_ms: float, h_end_ms: float,
+                                stages=None, verbose: bool = True):
+    """Keep only trials whose *metric* lies in ``[lo, hi]`` (NaN → dropped).
+
+    *metric* is one of :data:`TRIAL_FILTER_METRICS` ('M_WAVE', 'H_WAVE',
+    'HM_RATIO', 'BACKGROUND'), computed per trial by
+    :func:`compute_trial_size_metrics`. *stages* restricts filtering to those
+    stage_map keys (``None`` = all stages); other stages pass through whole.
+
+    Returns ``(filtered_recordings, metrics_df)``; *metrics_df* has one row per
+    trial considered (recording, stage, trial_idx, the four metrics, ``kept``).
+    *all_recordings* is not modified.
+    """
+    if metric not in TRIAL_FILTER_METRICS:
+        raise ValueError(f'Unknown metric {metric!r}. Valid: {list(TRIAL_FILTER_METRICS)}')
+    _col = TRIAL_FILTER_METRICS[metric]
+    _stages = None if stages is None else set(stages)
+
+    keep_by_stage, rows, counts = {}, [], []
+    for _rl, _rec in all_recordings.items():
+        for _sk, (_tr, _h, _e, _sl) in _rec.get('stage_map', {}).items():
+            if not _tr or (_stages is not None and _sk not in _stages):
+                continue
+            _sr = _rec_sample_rate(_rec, _h)
+            _keep = set()
+            for _i, _t in enumerate(_tr):
+                _m = compute_trial_size_metrics(
+                    _t, _sr, pre_ms, post_ms, m_start_ms, m_end_ms, h_start_ms, h_end_ms)
+                _v = _m[_col]
+                _ok = bool(not np.isnan(_v) and lo <= _v <= hi)
+                if _ok:
+                    _keep.add(id(_t))
+                rows.append({'recording': _rl, 'stage': _sl, 'trial_idx': _i,
+                             **_m, 'kept': _ok})
+            keep_by_stage[(_rl, _sk)] = _keep
+            counts.append((_rl, _sl, len(_tr), len(_keep)))
+
+    filtered = _subset_recordings(all_recordings, keep_by_stage)
+    metrics_df = pd.DataFrame(rows)
+    if verbose:
+        print(f'Metric filter: {metric}  in  [{lo:.3f}, {hi:.3f}]')
+        _print_subset_counts(counts)
+    return filtered, metrics_df
+
+
 def make_failed_trials_viewer(all_recordings,
                                pre_ms: float = 100.0,
                                post_ms: float = 100.0,
                                m_start_ms: float = 2.0,
                                m_end_ms:   float = 4.0,
                                h_start_ms: float = 6.0,
-                               h_end_ms:   float = 9.0):
-    """Interactive viewer for alignment-miss trials, styled identically to make_ft_viewer.
+                               h_end_ms:   float = 9.0,
+                               stim_adc_threshold_v: float = 0.1,
+                               stim_adc_window_ms: tuple = (-1.0, 1.0)):
+    """Interactive viewer for failed/suspect trials, styled identically to make_ft_viewer.
 
-    Scans all stages in *all_recordings* for trials where ``_alignment_miss`` was set
-    to ``True`` by ``_reconstruct_offline_trial_data``.
+    Scans all stages in *all_recordings* for trials flagged by either of two
+    independent checks:
+      - ``_alignment_miss`` (set by ``_reconstruct_offline_trial_data`` when
+        the offline raw-channel xcorr reconstruction failed for that trial,
+        so its app-stored data was kept as-is).
+      - :func:`detect_corrupted_trials` — stim_adc_data/sync_data corruption
+        (visible saturation/frozen runs) or onset-vs-digital-event
+        cross-check mismatches, from the app's own BackgroundWorker
+        channel-length-mismatch bug. This catches trials the app's own live
+        detector never flagged at all, including ``onset_detected == 0``
+        ("no sync") trials.
+      - No sync (``onset_detected == 0``).
+      - "Recalculated bad stim ADC" (:func:`detect_bad_stim_adc_window`) —
+        stim ADC never deflects ``±stim_adc_threshold_v`` from its pre-stim
+        baseline within ``stim_adc_window_ms`` of onset.
+      - The app's own stored ``data_integrity_flags`` (live frozen-run check,
+        20-sample threshold — known to over-flag clean trials; shown for
+        comparison only, NOT part of the "All offline" group).
+    A trial flagged by several checks appears once; the reason(s) are shown
+    in its title. The Category toggle restricts Prev/Next to one group.
 
     Controls (same layout as make_ft_viewer):
 
-    - Prev / Next       — navigate between missed trials
+    - Category          — which detection group to browse (counts in labels)
+    - Prev / Next       — navigate between trials in that group
     - Auto Y / Y min / Y max — manual EMG y-axis limits
     - Fig W / Fig H     — figure dimensions
     - Pre ms / Post ms  — window around stored onset
     - Show Stim ADC     — adds Stim ADC subplot row below EMG (steelblue)
     - Show Sync         — adds Sync analog-in subplot row below EMG (darkgreen)
     - Show Sync DIG IN  — overlays red axvspan shading on all subplots for DIG-IN "On" periods
-    - Show ±10 s context — optional wider EMG-block context figure
     """
-    from ipywidgets import (Button, Checkbox, FloatText, Output, HBox, VBox, Label)
+    from ipywidgets import (Button, Checkbox, FloatText, Output, HBox, VBox, Label,
+                            ToggleButtons)
 
-    # ── Collect alignment-miss trials ──────────────────────────────────────────
+    # ── Collect flagged trials, tagging each with every category it falls in ──
+    # Category key → (button label, part of the offline "All" union?)
+    _CATS = FAILED_TRIAL_CATEGORIES
     _items = []
     for _rl, _rec in all_recordings.items():
         for _sk, (_trials, _hdr, _emg_bl, _slbl) in _rec.get('stage_map', {}).items():
-            _sr = float(_rec.get('sample_rate') or
-                        getattr(_hdr, 'sample_rate', None) or SAMPLE_RATE)
-            for _i, _t in enumerate(_trials):
-                if getattr(_t, '_alignment_miss', False):
-                    _items.append((_rl, _sk, _slbl, _i, _t, _sr, _emg_bl, _hdr))
+            if not _trials:
+                continue
+            _sr = _rec_sample_rate(_rec, _hdr)
+            _flags = classify_failed_trials(
+                _trials, _hdr, _sr, stim_adc_threshold_v=stim_adc_threshold_v,
+                stim_adc_window_ms=stim_adc_window_ms)
+            for _i, (_t, (_cats, _reasons)) in enumerate(zip(_trials, _flags)):
+                if _cats:
+                    _items.append((_rl, _sk, _slbl, _i, _t, _sr, _emg_bl, _hdr,
+                                   ' + '.join(_reasons), _cats))
 
     if not _items:
-        return Label('No alignment-miss trials found.  '
-                     'Run load_all_recordings with OFFLINE recordings to flag failed trials.')
+        return Label('No flagged trials found.')
 
-    _n = len(_items)
+    # Per-category index lists into _items; 'all' = union of offline checks.
+    _cat_idx = {'all': [k for k, it in enumerate(_items)
+                        if any(_CATS[c][1] for c in it[9])]}
+    for _c in _CATS:
+        _cat_idx[_c] = [k for k, it in enumerate(_items) if _c in it[9]]
+    _cat_opts = [(f"All offline ({len(_cat_idx['all'])})", 'all')] + [
+        (f'{_CATS[c][0]} ({len(_cat_idx[c])})', c) for c in _CATS]
 
     # ── State ─────────────────────────────────────────────────────────────────
     _st = {
+        'cat':           'all',
         'idx':           0,
         'y_auto':        True,
         'y_min':        -1000.0,
@@ -16169,13 +17439,14 @@ def make_failed_trials_viewer(all_recordings,
         'show_stim_adc':  False,
         'show_sync':      False,
         'show_dig_in':    False,
-        'show_ctx':       False,
     }
 
     # ── Widgets (mirroring make_ft_viewer layout exactly) ──────────────────────
     _prev_btn     = Button(description='Prev', button_style='')
     _next_btn     = Button(description='Next', button_style='primary')
     _trial_lbl    = Label(value='')
+    _cat_tb       = ToggleButtons(options=_cat_opts, value='all',
+                                  style={'button_width': 'auto'})
     _yauto_chk    = Checkbox(value=True,    description='Auto Y',          indent=False)
     _ymin_txt     = FloatText(value=-1000.0, description='Y min:', step=50,
                               layout={'width': '165px'}, disabled=True)
@@ -16192,20 +17463,31 @@ def make_failed_trials_viewer(all_recordings,
     _stim_adc_chk = Checkbox(value=False, description='Show Stim ADC',    indent=False)
     _sync_chk     = Checkbox(value=False, description='Show Sync',         indent=False)
     _dig_in_chk   = Checkbox(value=False, description='Show DIG IN spans',  indent=False)
-    _ctx_chk      = Checkbox(value=False, description='Show ±10 s context', indent=False)
     _out     = Output()
-    _ctx_out = Output()
 
     # ── Label updater ──────────────────────────────────────────────────────────
+    def _cur():
+        return _cat_idx[_st['cat']]
+
     def _update_lbl():
-        _rl, _sk, _slbl, _i, _t, *_ = _items[_st['idx']]
+        _lst = _cur()
+        if not _lst:
+            _trial_lbl.value = 'No trials in this category.'
+            return
+        _rl, _sk, _slbl, _i, _t, _sr, _emg_bl, _hdr, _reason, _ = _items[_lst[_st['idx']]]
         amp = getattr(_t, 'stimulation_amplitude_ma', float('nan'))
-        _trial_lbl.value = (f"Miss {_st['idx'] + 1} / {_n}  —  {_rl}  |  {_slbl}  "
-                            f"|  trial [{_i}]  |  {amp:.3f} mA")
+        _trial_lbl.value = (f"{_st['idx'] + 1} / {len(_lst)}  —  {_rl}  |  {_slbl}  "
+                            f"|  trial [{_i}]  |  {amp:.3f} mA  |  {_reason}")
 
     # ── Main draw ─────────────────────────────────────────────────────────────
     def _draw(idx):
-        _rl, _sk, _slbl, _i, _t, _sr, _emg_bl, _hdr = _items[idx]
+        _lst = _cur()
+        if not _lst:
+            with _out:
+                _out.clear_output(wait=True)
+                print('No trials in this category.')
+            return
+        _rl, _sk, _slbl, _i, _t, _sr, _emg_bl, _hdr, _reason, _cats = _items[_lst[idx]]
         _ms    = 1000.0 / _sr
         _bin_s = int(BIN_DURATION_MS * _sr / 1000)
         _rec_s = int(TRIAL_RECORD_MS  * _sr / 1000)
@@ -16217,11 +17499,10 @@ def make_failed_trials_viewer(all_recordings,
             _t, _st['pre_ms'], _st['post_ms'],
             ms_per_sample=_ms, bin_samples=_bin_s, record_samples=_rec_s)
 
-        # M/H size — same convention as plot_hrs2_trials' _draw_trial_panel,
-        # so the M/H size annotations match exactly.
-        _pre_mask = t_ms < 0
-        _pre_emg  = (float(np.nanmean(np.abs(emg_w[_pre_mask])))
-                    if emg_w is not None and _pre_mask.sum() >= 2 else float('nan'))
+        # M/H size — standardized -55->-5 ms background (compute_peri_stim_bg),
+        # same calculation as plot_hrs2_trials/plot_hrs2_analysis/
+        # compute_h_comparison_data, independent of this viewer's pre_ms window.
+        _pre_emg  = compute_peri_stim_bg(_t, _sr)
         _bg_for_size = _pre_emg if not np.isnan(_pre_emg) else 0.0
         _mm = (t_ms >= m_start_ms) & (t_ms <= m_end_ms)
         _hm = (t_ms >= h_start_ms) & (t_ms <= h_end_ms)
@@ -16242,7 +17523,7 @@ def make_failed_trials_viewer(all_recordings,
 
         amp   = getattr(_t, 'stimulation_amplitude_ma', float('nan'))
         title = (f'{_rl}  |  {_slbl}  |  trial [{_i}]  |  {amp:.3f} mA'
-                 f'  [ALIGNMENT MISS — stored data]')
+                 f'  [{_reason}]')
 
         with _out:
             _out.clear_output(wait=True)
@@ -16301,7 +17582,22 @@ def make_failed_trials_viewer(all_recordings,
                     eax.axvline(0, color='red', linestyle='--', linewidth=1.0)
                     eax.axvline(_end_ms_eff, color='darkorange',
                                 linestyle=':', linewidth=1.0)
-                    if has_thresh:
+                    if ch_name == 'Stim ADC':
+                        # Recalculated-bad-stim-ADC detector: window + ±thr band
+                        # around the pre-stim baseline it measured.
+                        _bad, _pk, _base = detect_bad_stim_adc_window(
+                            _t, _sr, threshold_v=stim_adc_threshold_v,
+                            window_ms=stim_adc_window_ms)
+                        eax.axvspan(stim_adc_window_ms[0], stim_adc_window_ms[1],
+                                    color='gold', alpha=0.25)
+                        if not np.isnan(_base):
+                            eax.axhspan(_base - stim_adc_threshold_v,
+                                        _base + stim_adc_threshold_v,
+                                        color='red' if _bad else 'gray', alpha=0.15,
+                                        label=(f'baseline ±{stim_adc_threshold_v} V  '
+                                               f'(peak {_pk:.3f} V → '
+                                               f"{'BAD' if _bad else 'ok'})"))
+                    elif has_thresh:
                         eax.axhline(STIM_ONSET_THRESHOLD, color='red',
                                     linestyle=':', linewidth=0.8, alpha=0.7,
                                     label=f'Thresh ({STIM_ONSET_THRESHOLD} V)')
@@ -16318,49 +17614,18 @@ def make_failed_trials_viewer(all_recordings,
             except Exception as _ex:
                 print(f'  [viewer] plot error: {_ex}')
 
-        # ── Optional ±10 s EMG-block context (separate Output widget) ─────────
-        with _ctx_out:
-            _ctx_out.clear_output(wait=True)
-            if _st['show_ctx'] and _emg_bl:
-                _bin_s = int(round(BIN_DURATION_MS / _ms))
-                ctx = get_trial_context_window(
-                    _t, _emg_bl, pre_s=10.0, post_s=10.0,
-                    sample_rate=_sr, bin_samples=_bin_s)
-                if ctx is not None:
-                    _t_s, _emg_c, _, _adc_c = ctx
-                    fig2, (ax2a, ax2b) = plt.subplots(
-                        2, 1, figsize=(_st['fig_w'] + 3, 5), sharex=True,
-                        gridspec_kw={'height_ratios': [2, 1], 'hspace': 0.35})
-                    ax2a.plot(_t_s, _emg_c, color='black', linewidth=0.4,
-                              label='EMG context (raw diff)')
-                    ax2a.axvline(0, color='red', linestyle='--', linewidth=1.2,
-                                 label='Sensed onset')
-                    ax2a.set_ylabel('EMG (µV)')
-                    ax2a.set_title(
-                        f'±10 s context  —  {_rl}  trial [{_i}]'
-                        f'  (xcorr failed → stored data kept)', fontsize=8)
-                    ax2a.legend(fontsize=8); ax2a.grid(True, alpha=0.25)
-                    if _adc_c is not None:
-                        ax2b.plot(_t_s, np.abs(_adc_c), color='green',
-                                  linewidth=0.5, label='|ADC sync| (V)')
-                        ax2b.axhline(STIM_ONSET_THRESHOLD, color='red',
-                                     linestyle='--', linewidth=0.8)
-                        ax2b.axvline(0, color='red', linestyle='--', linewidth=1.0)
-                        ax2b.set_ylabel('|ADC| (V)')
-                        ax2b.legend(fontsize=8); ax2b.grid(True, alpha=0.25)
-                    ax2b.set_xlabel('Time re: sensed onset (s)')
-                    plt.tight_layout(); plt.show()
-                else:
-                    print('  [context] EMG-block window unavailable for this trial.')
-
     # ── Callbacks ─────────────────────────────────────────────────────────────
     def _on_prev(b):
         if _st['idx'] > 0:
             _st['idx'] -= 1; _update_lbl(); _draw(_st['idx'])
 
     def _on_next(b):
-        if _st['idx'] < _n - 1:
+        if _st['idx'] < len(_cur()) - 1:
             _st['idx'] += 1; _update_lbl(); _draw(_st['idx'])
+
+    def _on_cat(c):
+        _st['cat'] = c['new']; _st['idx'] = 0
+        _update_lbl(); _draw(0)
 
     def _on_yauto(c):
         _st['y_auto'] = bool(c['new'])
@@ -16377,8 +17642,8 @@ def make_failed_trials_viewer(all_recordings,
     def _on_stim_adc(c):     _st['show_stim_adc'] = bool(c['new']);  _draw(_st['idx'])
     def _on_sync(c):         _st['show_sync']      = bool(c['new']);  _draw(_st['idx'])
     def _on_dig_in(c):       _st['show_dig_in']    = bool(c['new']);  _draw(_st['idx'])
-    def _on_ctx(c):          _st['show_ctx']        = bool(c['new']);  _draw(_st['idx'])
 
+    _cat_tb.observe(_on_cat, names='value')
     _prev_btn.on_click(_on_prev)
     _next_btn.on_click(_on_next)
     _yauto_chk.observe(_on_yauto,       names='value')
@@ -16391,18 +17656,17 @@ def make_failed_trials_viewer(all_recordings,
     _stim_adc_chk.observe(_on_stim_adc, names='value')
     _sync_chk.observe(_on_sync,         names='value')
     _dig_in_chk.observe(_on_dig_in,     names='value')
-    _ctx_chk.observe(_on_ctx,           names='value')
 
     # Populate immediately (same pattern as make_ft_viewer calling _ft_render_all)
     _update_lbl()
     _draw(0)
     return VBox([
+        _cat_tb,
         HBox([_prev_btn, _next_btn, _trial_lbl]),
         HBox([_yauto_chk, _ymin_txt, _ymax_txt,
               _figw_txt, _figh_txt, _prems_txt, _postms_txt]),
-        HBox([_stim_adc_chk, _sync_chk, _dig_in_chk, _ctx_chk]),
+        HBox([_stim_adc_chk, _sync_chk, _dig_in_chk]),
         _out,
-        _ctx_out,
     ])
 
 

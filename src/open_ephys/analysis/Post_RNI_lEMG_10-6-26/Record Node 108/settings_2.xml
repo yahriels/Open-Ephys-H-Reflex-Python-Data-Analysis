@@ -1,0 +1,331 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<SETTINGS>
+  <INFO>
+    <VERSION>1.1.0</VERSION>
+    <PLUGIN_API_VERSION>10</PLUGIN_API_VERSION>
+    <DATE>6 Oct 2026 15:54:31</DATE>
+    <OS>Windows 11</OS>
+    <MACHINE name="TxBDC262270" cpu_model="Intel(R) Core(TM) i5-10500 CPU @ 3.10GHz"
+             cpu_num_cores="12"/>
+  </INFO>
+  <SIGNALCHAIN>
+    <PROCESSOR name="Acquisition Board" insertionPoint="0" pluginName="Acquisition Board"
+               type="4" index="0" libraryName="Acquisition Board" libraryVersion="2.0.0"
+               processorType="2" nodeId="101">
+      <PROCESSOR_PARAMETERS/>
+      <STREAM name="acquisition_board" description="Continuous and event data from an Open Ephys Acquisition Board"
+              sample_rate="10000.0" channel_count="24">
+        <PARAMETERS/>
+      </STREAM>
+      <STREAM name="memory_usage" description="Hardware buffer usage on an acquisition board"
+              sample_rate="100.0" channel_count="1">
+        <PARAMETERS/>
+      </STREAM>
+      <CUSTOM_PARAMETERS/>
+      <EDITOR isCollapsed="0" isDrawerOpen="0" displayName="Acquisition Board"
+              activeStream="0" Type="Visualizer" tabText="Acq Board" SampleRate="10000"
+              LowCut="1.09766971131144" LowCutDac1="44" LowCutDac2="6" LowCutDac3="0"
+              HighCut="7603.76512183337" AUXsOn="0" ADCsOn="1" AnalogOutput1="-1"
+              AnalogOutput2="-1" AnalogOutput3="-1" AnalogOutput4="-1" AnalogOutput5="-1"
+              AnalogOutput6="-1" AnalogOutput7="-1" AnalogOutput8="-1" NoiseSlicer="0"
+              TTLFastSettle="1" DAC_TTL="0" DAC_HPF="1" DSPOffset="1" DSPCutoffFreq="0.5828783859716251"
+              LEDs="1" ClockDivideRatio="1" Channel_Naming_Scheme="1">
+        <TAB Active="1"/>
+        <WINDOW Active="0"/>
+        <HSOPTIONS index="0" hs1_full_channels="0" hs2_full_channels="0" cable_delay_adjustment="0"/>
+        <HSOPTIONS index="1" hs1_full_channels="0" hs2_full_channels="0" cable_delay_adjustment="0"/>
+        <HSOPTIONS index="2" hs1_full_channels="0" hs2_full_channels="0" cable_delay_adjustment="0"/>
+        <HSOPTIONS index="3" hs1_full_channels="0" hs2_full_channels="0" cable_delay_adjustment="0"/>
+        <VISUALIZER_PARAMETERS/>
+        <CUSTOM_PARAMETERS/>
+      </EDITOR>
+    </PROCESSOR>
+    <PROCESSOR name="Channel Map" insertionPoint="1" pluginName="Channel Map"
+               type="1" index="2" libraryName="Channel Mapper" libraryVersion="1.1.0"
+               processorType="1" nodeId="102">
+      <PROCESSOR_PARAMETERS/>
+      <STREAM name="acquisition_board" description="Continuous and event data from an Open Ephys Acquisition Board"
+              sample_rate="10000.0" channel_count="6">
+        <PARAMETERS enable_stream="1"/>
+      </STREAM>
+      <STREAM name="memory_usage" description="Hardware buffer usage on an acquisition board"
+              sample_rate="100.0" channel_count="1">
+        <PARAMETERS enable_stream="1"/>
+      </STREAM>
+      <CUSTOM_PARAMETERS>
+        <STREAM>
+          <CH index="0" enabled="1"/>
+          <CH index="1" enabled="0"/>
+          <CH index="2" enabled="0"/>
+          <CH index="3" enabled="0"/>
+          <CH index="4" enabled="0"/>
+          <CH index="5" enabled="0"/>
+          <CH index="6" enabled="1"/>
+          <CH index="7" enabled="0"/>
+          <CH index="8" enabled="0"/>
+          <CH index="9" enabled="0"/>
+          <CH index="10" enabled="1"/>
+          <CH index="11" enabled="1"/>
+          <CH index="12" enabled="0"/>
+          <CH index="13" enabled="0"/>
+          <CH index="14" enabled="0"/>
+          <CH index="15" enabled="0"/>
+          <CH index="16" enabled="1"/>
+          <CH index="17" enabled="1"/>
+          <CH index="18" enabled="0"/>
+          <CH index="19" enabled="0"/>
+          <CH index="20" enabled="0"/>
+          <CH index="21" enabled="0"/>
+          <CH index="22" enabled="0"/>
+          <CH index="23" enabled="0"/>
+        </STREAM>
+        <STREAM>
+          <CH index="0" enabled="1"/>
+        </STREAM>
+      </CUSTOM_PARAMETERS>
+      <EDITOR isCollapsed="0" isDrawerOpen="0" displayName="Channel Map" activeStream="0"/>
+    </PROCESSOR>
+    <PROCESSOR name="Record Node" insertionPoint="1" pluginName="Record Node"
+               type="0" index="3" libraryName="" libraryVersion="" processorType="8"
+               nodeId="107">
+      <PROCESSOR_PARAMETERS directory="None" engine="0" events="1" spikes="1" main_sync="-1"/>
+      <STREAM name="acquisition_board" description="Continuous and event data from an Open Ephys Acquisition Board"
+              sample_rate="10000.0" channel_count="6">
+        <PARAMETERS channels="" sync_line="-1"/>
+      </STREAM>
+      <STREAM name="memory_usage" description="Hardware buffer usage on an acquisition board"
+              sample_rate="100.0" channel_count="1">
+        <PARAMETERS channels="" sync_line="-1"/>
+      </STREAM>
+      <CUSTOM_PARAMETERS fifoMonitorsVisible="1">
+        <SYNC_STATUS streamKey="101|acquisition_board" status="HARDWARE_SYNCED"/>
+        <SYNC_STATUS streamKey="101|memory_usage" status="HARDWARE_SYNCED"/>
+      </CUSTOM_PARAMETERS>
+      <EDITOR isCollapsed="0" isDrawerOpen="0" displayName="Record Node" activeStream="0"/>
+    </PROCESSOR>
+    <PROCESSOR name="LFP Viewer" insertionPoint="1" pluginName="LFP Viewer"
+               type="1" index="4" libraryName="LFP viewer" libraryVersion="1.1.0"
+               processorType="3" nodeId="103">
+      <PROCESSOR_PARAMETERS/>
+      <STREAM name="acquisition_board" description="Continuous and event data from an Open Ephys Acquisition Board"
+              sample_rate="10000.0" channel_count="6">
+        <PARAMETERS/>
+      </STREAM>
+      <STREAM name="memory_usage" description="Hardware buffer usage on an acquisition board"
+              sample_rate="100.0" channel_count="1">
+        <PARAMETERS/>
+      </STREAM>
+      <CUSTOM_PARAMETERS/>
+      <EDITOR isCollapsed="0" isDrawerOpen="0" displayName="LFP Viewer" activeStream="0"
+              Type="LfpDisplayEditor" tabText="LFP">
+        <TAB Active="1"/>
+        <WINDOW Active="0" x="146" y="220" width="1675" height="873"/>
+        <VALUES SelectedLayout="2"/>
+        <VISUALIZER_PARAMETERS/>
+        <CUSTOM_PARAMETERS>
+          <LFPDISPLAY0 stream_key="101|acquisition_board" Range="15000,Auto,10.0" Timebase="2.0"
+                       Spread="100" colourScheme="1" colourGrouping="1" spikeRaster="OFF"
+                       clipWarning="1" satWarning="1" reverseOrder="0" sortByDepth="0"
+                       channelSkip="1" channelLabelMode="0" subtractOffset="0" isInverted="0"
+                       highPassEnabled="0" carEnabled="0" triggerSource="2" trialAvg="0"
+                       singleChannelView="-1" EventButtonState="255" ChannelDisplayState="011111"
+                       selectedChannelType="0" ScrollX="0" ScrollY="0"/>
+          <LFPDISPLAY1 stream_key="101|acquisition_board" Range="15000,Auto,10.0" Timebase="10.0"
+                       Spread="100" colourScheme="1" colourGrouping="1" spikeRaster="OFF"
+                       clipWarning="1" satWarning="1" reverseOrder="0" sortByDepth="0"
+                       channelSkip="1" channelLabelMode="0" subtractOffset="0" isInverted="0"
+                       highPassEnabled="0" carEnabled="0" triggerSource="1" trialAvg="0"
+                       singleChannelView="-1" EventButtonState="255" ChannelDisplayState="011111"
+                       selectedChannelType="0" ScrollX="0" ScrollY="0"/>
+          <LFPDISPLAY2 stream_key="101|acquisition_board" Range="250,Auto,10.0" Timebase="2.0"
+                       Spread="40" colourScheme="1" colourGrouping="1" spikeRaster="OFF"
+                       clipWarning="1" satWarning="1" reverseOrder="0" sortByDepth="0"
+                       channelSkip="1" channelLabelMode="0" subtractOffset="0" isInverted="0"
+                       highPassEnabled="0" carEnabled="0" triggerSource="1" trialAvg="0"
+                       singleChannelView="-1" EventButtonState="255" ChannelDisplayState="111111"
+                       selectedChannelType="0" ScrollX="0" ScrollY="0"/>
+          <CANVAS doubleVerticalSplitRatio="0.5" doubleHorizontalSplitRatio="0.5"
+                  tripleHorizontalSplitRatio="0.33,0.66" tripleVerticalSplitRatio="0.33,0.66"
+                  showAllOptions="0"/>
+        </CUSTOM_PARAMETERS>
+      </EDITOR>
+    </PROCESSOR>
+    <PROCESSOR name="Common Avg Ref" insertionPoint="1" pluginName="Common Avg Ref"
+               type="1" index="3" libraryName="Common Average Reference" libraryVersion="1.1.0"
+               processorType="1" nodeId="105">
+      <PROCESSOR_PARAMETERS/>
+      <STREAM name="acquisition_board" description="Continuous and event data from an Open Ephys Acquisition Board"
+              sample_rate="10000.0" channel_count="6">
+        <PARAMETERS enable_stream="1" affected="1,2,4,5,6" reference="1,3,4,5,6"
+                    gain="100.0"/>
+      </STREAM>
+      <STREAM name="memory_usage" description="Hardware buffer usage on an acquisition board"
+              sample_rate="100.0" channel_count="1">
+        <PARAMETERS enable_stream="1" affected="" reference="" gain="100.0"/>
+      </STREAM>
+      <CUSTOM_PARAMETERS/>
+      <EDITOR isCollapsed="0" isDrawerOpen="0" displayName="Common Avg Ref"
+              activeStream="0"/>
+    </PROCESSOR>
+    <PROCESSOR name="Bandpass Filter" insertionPoint="1" pluginName="Bandpass Filter"
+               type="1" index="1" libraryName="Bandpass Filter" libraryVersion="1.1.0"
+               processorType="1" nodeId="104">
+      <PROCESSOR_PARAMETERS threads="1"/>
+      <STREAM name="acquisition_board" description="Continuous and event data from an Open Ephys Acquisition Board"
+              sample_rate="10000.0" channel_count="6">
+        <PARAMETERS enable_stream="1" low_cut="100.0" high_cut="1000.0" channels="5,6"/>
+      </STREAM>
+      <STREAM name="memory_usage" description="Hardware buffer usage on an acquisition board"
+              sample_rate="100.0" channel_count="1">
+        <PARAMETERS enable_stream="1" low_cut="300.0" high_cut="6000.0" channels=""/>
+      </STREAM>
+      <CUSTOM_PARAMETERS/>
+      <EDITOR isCollapsed="0" isDrawerOpen="0" displayName="Bandpass Filter"
+              activeStream="0"/>
+    </PROCESSOR>
+    <PROCESSOR name="LFP Viewer" insertionPoint="1" pluginName="LFP Viewer"
+               type="1" index="4" libraryName="LFP viewer" libraryVersion="1.1.0"
+               processorType="3" nodeId="106">
+      <PROCESSOR_PARAMETERS/>
+      <STREAM name="acquisition_board" description="Continuous and event data from an Open Ephys Acquisition Board"
+              sample_rate="10000.0" channel_count="6">
+        <PARAMETERS/>
+      </STREAM>
+      <STREAM name="memory_usage" description="Hardware buffer usage on an acquisition board"
+              sample_rate="100.0" channel_count="1">
+        <PARAMETERS/>
+      </STREAM>
+      <CUSTOM_PARAMETERS/>
+      <EDITOR isCollapsed="0" isDrawerOpen="0" displayName="LFP Viewer" activeStream="0"
+              Type="LfpDisplayEditor" tabText="LFP">
+        <TAB Active="1"/>
+        <WINDOW Active="0"/>
+        <VALUES SelectedLayout="2"/>
+        <VISUALIZER_PARAMETERS/>
+        <CUSTOM_PARAMETERS>
+          <LFPDISPLAY0 stream_key="101|acquisition_board" Range="15000,Auto,10.0" Timebase="0.050"
+                       Spread="100" colourScheme="1" colourGrouping="1" spikeRaster="OFF"
+                       clipWarning="1" satWarning="1" reverseOrder="0" sortByDepth="0"
+                       channelSkip="1" channelLabelMode="0" subtractOffset="0" isInverted="0"
+                       highPassEnabled="0" carEnabled="0" triggerSource="2" trialAvg="0"
+                       singleChannelView="2" EventButtonState="255" ChannelDisplayState="011111"
+                       selectedChannelType="0" ScrollX="0" ScrollY="0"/>
+          <LFPDISPLAY1 stream_key="101|acquisition_board" Range="2000,Auto,10.0" Timebase="10.0"
+                       Spread="100" colourScheme="1" colourGrouping="1" spikeRaster="OFF"
+                       clipWarning="1" satWarning="1" reverseOrder="0" sortByDepth="0"
+                       channelSkip="1" channelLabelMode="0" subtractOffset="0" isInverted="0"
+                       highPassEnabled="0" carEnabled="0" triggerSource="1" trialAvg="0"
+                       singleChannelView="-1" EventButtonState="255" ChannelDisplayState="011011"
+                       selectedChannelType="2" ScrollX="0" ScrollY="0"/>
+          <LFPDISPLAY2 stream_key="101|acquisition_board" Range="250,Auto,10.0" Timebase="2.0"
+                       Spread="40" colourScheme="1" colourGrouping="1" spikeRaster="OFF"
+                       clipWarning="1" satWarning="1" reverseOrder="0" sortByDepth="0"
+                       channelSkip="1" channelLabelMode="0" subtractOffset="0" isInverted="0"
+                       highPassEnabled="0" carEnabled="0" triggerSource="1" trialAvg="0"
+                       singleChannelView="-1" EventButtonState="255" ChannelDisplayState="111111"
+                       selectedChannelType="0" ScrollX="0" ScrollY="0"/>
+          <CANVAS doubleVerticalSplitRatio="0.5" doubleHorizontalSplitRatio="0.5"
+                  tripleHorizontalSplitRatio="0.33,0.66" tripleVerticalSplitRatio="0.33,0.66"
+                  showAllOptions="0"/>
+        </CUSTOM_PARAMETERS>
+      </EDITOR>
+    </PROCESSOR>
+    <PROCESSOR name="Record Node" insertionPoint="1" pluginName="Record Node"
+               type="0" index="3" libraryName="" libraryVersion="" processorType="8"
+               nodeId="108">
+      <PROCESSOR_PARAMETERS directory="None" engine="0" events="1" spikes="1" main_sync="-1"/>
+      <STREAM name="acquisition_board" description="Continuous and event data from an Open Ephys Acquisition Board"
+              sample_rate="10000.0" channel_count="6">
+        <PARAMETERS channels="" sync_line="-1"/>
+      </STREAM>
+      <STREAM name="memory_usage" description="Hardware buffer usage on an acquisition board"
+              sample_rate="100.0" channel_count="1">
+        <PARAMETERS channels="" sync_line="-1"/>
+      </STREAM>
+      <CUSTOM_PARAMETERS fifoMonitorsVisible="1">
+        <SYNC_STATUS streamKey="101|acquisition_board" status="HARDWARE_SYNCED"/>
+        <SYNC_STATUS streamKey="101|memory_usage" status="HARDWARE_SYNCED"/>
+      </CUSTOM_PARAMETERS>
+      <EDITOR isCollapsed="0" isDrawerOpen="0" displayName="Record Node" activeStream="0"/>
+    </PROCESSOR>
+  </SIGNALCHAIN>
+  <CONTROLPANEL isOpen="1" recordPath="C:\Users\labadmin\Documents\Open Ephys"
+                recordEngine="BINARY" clockMode="0" clockReferenceTime="0" forceNewDirectory="0"/>
+  <AUDIOEDITOR isMuted="0" volume="50.0" noiseGate="0.0"/>
+  <FILENAMECONFIG>
+    <PREPEND state="0" value=""/>
+    <MAIN state="2" value="Post_RNI_lEMG_10-6-26"/>
+    <APPEND state="0" value=""/>
+  </FILENAMECONFIG>
+  <EDITORVIEWPORT selectedTab="0" scroll="201"/>
+  <GRAPHVIEWER>
+    <NODE id="101" isProcessorInfoVisible="0">
+      <STREAM key="101|acquisition_board" isStreamVisible="0" isParamsVisible="0"/>
+      <STREAM key="101|memory_usage" isStreamVisible="0" isParamsVisible="0"/>
+    </NODE>
+    <NODE id="102" isProcessorInfoVisible="0">
+      <STREAM key="101|acquisition_board" isStreamVisible="0" isParamsVisible="0"/>
+      <STREAM key="101|memory_usage" isStreamVisible="0" isParamsVisible="0"/>
+    </NODE>
+    <NODE id="103" isProcessorInfoVisible="0">
+      <STREAM key="101|acquisition_board" isStreamVisible="0" isParamsVisible="0"/>
+      <STREAM key="101|memory_usage" isStreamVisible="0" isParamsVisible="0"/>
+    </NODE>
+    <NODE id="104" isProcessorInfoVisible="0">
+      <STREAM key="101|acquisition_board" isStreamVisible="0" isParamsVisible="0"/>
+      <STREAM key="101|memory_usage" isStreamVisible="0" isParamsVisible="0"/>
+    </NODE>
+    <NODE id="105" isProcessorInfoVisible="0">
+      <STREAM key="101|acquisition_board" isStreamVisible="0" isParamsVisible="0"/>
+      <STREAM key="101|memory_usage" isStreamVisible="0" isParamsVisible="0"/>
+    </NODE>
+    <NODE id="106" isProcessorInfoVisible="0">
+      <STREAM key="101|acquisition_board" isStreamVisible="0" isParamsVisible="0"/>
+      <STREAM key="101|memory_usage" isStreamVisible="0" isParamsVisible="0"/>
+    </NODE>
+    <NODE id="107" isProcessorInfoVisible="0">
+      <STREAM key="101|acquisition_board" isStreamVisible="0" isParamsVisible="0"/>
+      <STREAM key="101|memory_usage" isStreamVisible="0" isParamsVisible="0"/>
+    </NODE>
+    <NODE id="108" isProcessorInfoVisible="0">
+      <STREAM key="101|acquisition_board" isStreamVisible="0" isParamsVisible="0"/>
+      <STREAM key="101|memory_usage" isStreamVisible="0" isParamsVisible="0"/>
+    </NODE>
+  </GRAPHVIEWER>
+  <DATAVIEWPORT splitOrientation="horizontal">
+    <TABBEDCOMPONENT index="0" selectedTabNodeId="106">
+      <TAB nodeId="0"/>
+      <TAB nodeId="1"/>
+      <TAB nodeId="2"/>
+      <TAB nodeId="101"/>
+      <TAB nodeId="103"/>
+      <TAB nodeId="106"/>
+    </TABBEDCOMPONENT>
+  </DATAVIEWPORT>
+  <PROCESSORLIST>
+    <COLOUR ID="801" R="50" G="50" B="50"/>
+    <COLOUR ID="804" R="241" G="90" B="41"/>
+    <COLOUR ID="802" R="0" G="160" B="225"/>
+    <COLOUR ID="803" R="0" G="166" B="81"/>
+    <COLOUR ID="805" R="90" G="110" B="110"/>
+    <COLOUR ID="806" R="255" G="0" B="0"/>
+    <COLOUR ID="807" R="0" G="0" B="0"/>
+  </PROCESSORLIST>
+  <UICOMPONENT isProcessorListOpen="1" isEditorViewportOpen="1" consoleOpenInWindow="0"/>
+  <AUDIO sampleRate="48000.0" bufferSize="1024" deviceType="Windows Audio"/>
+  <MESSAGES>
+    <MSG String="Starting at 0.20 mA"/>
+    <MSG String="recording 2 the real one"/>
+    <MSG String="Starting at 0.30 mA"/>
+    <MSG String="Starting at 0.40 mA"/>
+    <MSG String="Starting at 0.50 mA"/>
+    <MSG String="Starting at 0.60 mA"/>
+    <MSG String="Starting at 0.70 mA"/>
+    <MSG String="Starting at 0.80 mA"/>
+    <MSG String="Starting at 0.90 mA"/>
+    <MSG String="Starting at 1.00 mA"/>
+    <MSG String="Starting at 1.10 mA"/>
+    <MSG String="Starting at 1.20 mA"/>
+  </MESSAGES>
+</SETTINGS>
