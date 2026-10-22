@@ -29,6 +29,12 @@ build
 *.hrs5
 *.hrs6
 *.hrsft
+*.hrft
+*.hrscm
+# Anything that starts with an .hrs extension: .hrs2.settings.json, .hrs2.part, _cleaned.hrs2 …
+*.hrs*
+# Settings sidecars written next to each binary file (foo.hrs2.settings.json, foo.hrft.settings.json)
+*.settings.json
 
 # Open Ephys continuous recording files
 *.dat

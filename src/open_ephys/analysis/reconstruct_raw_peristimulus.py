@@ -126,7 +126,7 @@ from __future__ import annotations
 
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -211,26 +211,46 @@ def _parse_channel_index_from_name(channel_name: str) -> int | None:
 class ChannelRoleMap:
     """Absolute (1-based) channel index for each role, read from the file's
     own booth_snapshot header field (added partway through each stage's file-
-    format history) -- no live app/booth config needed."""
+    format history) -- no live app/booth config needed.
+
+    analog_in/digital_in/digital_out hold the booth's COMPLETE role ->
+    line assignment for each plane, exactly as recorded at session start
+    (every role, including ones this module doesn't otherwise use) -- the
+    full booth configuration that applied to this file."""
+    booth_name: str = ""
     unipolar_emg: int = 0
     bipolar_emg: int = 0
     sync_analog: int = 0
     stim_adc: int = 0
-    sync_digital: int = 0   # a DIGIN line number, not an ADC channel index
+    sync_digital: int = 0         # a DIGIN line number, not an ADC channel index
+    delay_sync_analog: int = 0    # ANALOGIN "Delay Sync" -- an ADC channel index
+    delay_sync_digital: int = 0   # DIGIN "Delay Sync" -- a DIGIN line number
+    analog_in: dict = field(default_factory=dict)
+    digital_in: dict = field(default_factory=dict)
+    digital_out: dict = field(default_factory=dict)
 
     @staticmethod
     def from_snapshot(snap: HReflexBoothConfigSnapshot) -> "ChannelRoleMap":
-        def _role(role_list, role_name) -> int:
+        def _role(role_list, *role_names) -> int:
             for role, idx in role_list:
-                if role == role_name:
+                if role in role_names:
                     return idx
             return 0
         return ChannelRoleMap(
+            booth_name=snap.booth_name,
             unipolar_emg=snap.ch_emg_data_1,
             bipolar_emg=snap.ch_emg_data_2,
             sync_analog=_role(snap.analog_in_roles, "Sync (analog)"),
             stim_adc=_role(snap.analog_in_roles, "Stim ADC"),
-            sync_digital=_role(snap.digital_in_roles, "Sync (digital)"),
+            #The tibial DIGIN sync role was renamed from "Sync (digital)" to
+            #"Tibial Sync" (Booth.ROLE_SYNC_DIGITAL) -- files recorded after
+            #the rename store the new name, older ones the old one.
+            sync_digital=_role(snap.digital_in_roles, "Tibial Sync", "Sync (digital)"),
+            delay_sync_analog=_role(snap.analog_in_roles, "Delay Sync"),
+            delay_sync_digital=_role(snap.digital_in_roles, "Delay Sync"),
+            analog_in=dict(snap.analog_in_roles),
+            digital_in=dict(snap.digital_in_roles),
+            digital_out=dict(snap.digital_out_roles),
         )
 
 
@@ -280,7 +300,14 @@ class ReconstructedTrialSession:
                       "Ephys, depending on your signal chain -- see the ZMQ Interface plugin "
                       "placement.")
 
+        #The booth configuration recorded with this file (name, EMG channels,
+        #every ANALOGIN/DIGIN/DIGOUT role) -- self.roles has it pre-parsed.
+        self.booth_snapshot: HReflexBoothConfigSnapshot = booth_snapshot
         self.roles = ChannelRoleMap.from_snapshot(booth_snapshot)
+        self._log(f"[INFO] Booth configuration (from booth_snapshot): booth='{self.roles.booth_name}' "
+                  f"EMG ch {self.roles.unipolar_emg}/{self.roles.bipolar_emg} | "
+                  f"ANALOGIN {self.roles.analog_in} | DIGIN {self.roles.digital_in} | "
+                  f"DIGOUT {self.roles.digital_out}")
 
         #Only Frequency Test trials carry their own sample_rate (added
         #partway through that stage's file-format history). Every other
@@ -337,13 +364,16 @@ class ReconstructedTrialSession:
         self._log(f"[INFO] Role -> channel index (from booth_snapshot): "
                   f"unipolar_emg={self.roles.unipolar_emg} bipolar_emg={self.roles.bipolar_emg} "
                   f"sync_analog={self.roles.sync_analog} stim_adc={self.roles.stim_adc} "
-                  f"sync_digital(DIGIN)={self.roles.sync_digital}")
+                  f"sync_digital(DIGIN)={self.roles.sync_digital} "
+                  f"delay_sync={self.roles.delay_sync_analog} "
+                  f"delay_sync_digital(DIGIN)={self.roles.delay_sync_digital}")
 
         wanted_index = {
             'unipolar':    self.roles.unipolar_emg,
             'bipolar':     self.roles.bipolar_emg,
             'stim_adc':    self.roles.stim_adc,
             'sync_analog': self.roles.sync_analog,
+            'delay_sync':  self.roles.delay_sync_analog,
         }
         index_to_name = {v: k for k, v in name_to_index.items()}
         position_by_name = {name: i for i, name in enumerate(names)}
@@ -374,7 +404,8 @@ class ReconstructedTrialSession:
                   f"samples (~{duration_s:.1f}s) from {len(blocks)} continuous blocks.")
 
     def raw(self, role: str) -> np.ndarray:
-        """role is one of 'unipolar', 'bipolar', 'stim_adc', 'sync_analog'."""
+        """role is one of 'unipolar', 'bipolar', 'stim_adc', 'sync_analog',
+        'delay_sync' (the ANALOGIN Delay Sync channel, when one was assigned)."""
         if role not in self._channels:
             raise KeyError(
                 f"Role '{role}' wasn't reconstructed -- either not wired for this booth, or its "
