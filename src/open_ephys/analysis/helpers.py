@@ -1411,6 +1411,26 @@ def read_hrs2(filepath: str):
     return header, trials, emg_blocks
 
 
+def _read_hrs3_header(fid: BinaryIO, header: MhRecHeader) -> None:
+    """Fill *header* from the start of a .hrs3 file; leaves *fid* at the first block."""
+    header.file_version       = hrs_read_val(fid, 'int32')
+    header.subject_id         = hrs_read_string(fid)
+    header.session_start_time = hrs_read_datetime(fid)
+    header.stage_name         = hrs_read_string(fid)
+    header.stage_description  = hrs_read_string(fid)
+    header.stage_type         = hrs_read_val(fid, 'int32')
+    if header.file_version >= 9:
+        header.app_version = hrs_read_string(fid)
+    if header.file_version >= 12:
+        header.filtering_protocol = hrs_read_string(fid)
+    if header.file_version >= 13:
+        header.booth_snapshot = _read_booth_snapshot(fid)
+    if header.file_version >= 15:
+        header.filter_config = _read_filter_config(fid)
+    if header.file_version >= 20:
+        _read_tibial_stim_snapshot(fid, header)
+
+
 def read_hrs3(filepath: str):
     """Read an .hrs3 (Down Condition Pellet) data file (hreflex_txbdc V2).
 
@@ -1424,22 +1444,7 @@ def read_hrs3(filepath: str):
     trials, emg_blocks = [], []
 
     with open(filepath, 'rb') as fid:
-        header.file_version       = hrs_read_val(fid, 'int32')
-        header.subject_id         = hrs_read_string(fid)
-        header.session_start_time = hrs_read_datetime(fid)
-        header.stage_name         = hrs_read_string(fid)
-        header.stage_description  = hrs_read_string(fid)
-        header.stage_type         = hrs_read_val(fid, 'int32')
-        if header.file_version >= 9:
-            header.app_version = hrs_read_string(fid)
-        if header.file_version >= 12:
-            header.filtering_protocol = hrs_read_string(fid)
-        if header.file_version >= 13:
-            header.booth_snapshot = _read_booth_snapshot(fid)
-        if header.file_version >= 15:
-            header.filter_config = _read_filter_config(fid)
-        if header.file_version >= 20:
-            _read_tibial_stim_snapshot(fid, header)
+        _read_hrs3_header(fid, header)
 
         while True:
             chunk = fid.read(4)
@@ -1498,6 +1503,36 @@ def read_hrs3(filepath: str):
     return header, trials, emg_blocks
 
 
+def _read_v3_header(fid: BinaryIO, header: MhRecHeader, booth_snapshot_fv=None,
+                    filter_config_fv=None, filtering_protocol_fv=None,
+                    tibial_stim_fv=None) -> None:
+    """Fill *header* from the start of a V3 stage file (.hrs4/.hrs5/.hrs6);
+    leaves *fid* at the first block. Gates as in :func:`_make_v3_block_loop`."""
+    header.file_version       = hrs_read_val(fid, 'int32')
+    header.subject_id         = hrs_read_string(fid)
+    header.session_start_time = hrs_read_datetime(fid)
+    header.stage_name         = hrs_read_string(fid)
+    header.stage_description  = hrs_read_string(fid)
+    header.stage_type         = hrs_read_val(fid, 'int32')
+    header.app_version        = hrs_read_string(fid)
+    if header.file_version >= 3:
+        # Rolling-window seed values the app sampled from the upstream S2
+        # (.hrs2) file at initialize(): H, M and background EMG (float32
+        # arrays, in push order). All three are empty when no .hrs2 was in
+        # the session folder (12 bytes of zero counts).
+        header.seed_h_wave_values         = _read_f32_array(fid)
+        header.seed_m_wave_values         = _read_f32_array(fid)
+        header.seed_background_emg_values = _read_f32_array(fid)
+    if filtering_protocol_fv is not None and header.file_version >= filtering_protocol_fv:
+        header.filtering_protocol = hrs_read_string(fid)
+    if booth_snapshot_fv is not None and header.file_version >= booth_snapshot_fv:
+        header.booth_snapshot = _read_booth_snapshot(fid)
+    if filter_config_fv is not None and header.file_version >= filter_config_fv:
+        header.filter_config = _read_filter_config(fid)
+    if tibial_stim_fv is not None and header.file_version >= tibial_stim_fv:
+        _read_tibial_stim_snapshot(fid, header)
+
+
 def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn,
                         booth_snapshot_fv=None, filter_config_fv=None,
                         filtering_protocol_fv=None, tibial_stim_fv=None):
@@ -1510,29 +1545,8 @@ def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn,
     """
     trials, emg_blocks = [], []
     with open(filepath, 'rb') as fid:
-        header.file_version       = hrs_read_val(fid, 'int32')
-        header.subject_id         = hrs_read_string(fid)
-        header.session_start_time = hrs_read_datetime(fid)
-        header.stage_name         = hrs_read_string(fid)
-        header.stage_description  = hrs_read_string(fid)
-        header.stage_type         = hrs_read_val(fid, 'int32')
-        header.app_version        = hrs_read_string(fid)
-        if header.file_version >= 3:
-            # Rolling-window seed values the app sampled from the upstream S2
-            # (.hrs2) file at initialize(): H, M and background EMG (float32
-            # arrays, in push order). All three are empty when no .hrs2 was in
-            # the session folder (12 bytes of zero counts).
-            header.seed_h_wave_values         = _read_f32_array(fid)
-            header.seed_m_wave_values         = _read_f32_array(fid)
-            header.seed_background_emg_values = _read_f32_array(fid)
-        if filtering_protocol_fv is not None and header.file_version >= filtering_protocol_fv:
-            header.filtering_protocol = hrs_read_string(fid)
-        if booth_snapshot_fv is not None and header.file_version >= booth_snapshot_fv:
-            header.booth_snapshot = _read_booth_snapshot(fid)
-        if filter_config_fv is not None and header.file_version >= filter_config_fv:
-            header.filter_config = _read_filter_config(fid)
-        if tibial_stim_fv is not None and header.file_version >= tibial_stim_fv:
-            _read_tibial_stim_snapshot(fid, header)
+        _read_v3_header(fid, header, booth_snapshot_fv, filter_config_fv,
+                        filtering_protocol_fv, tibial_stim_fv)
 
         _UNIX_MS_LO = 5e11
         _UNIX_MS_HI = 3e12
@@ -1629,16 +1643,29 @@ def _make_v3_block_loop(filepath, header, block_id_expected, reader_fn,
     return trials, emg_blocks
 
 
+# Per-stage trial block_id, trial reader and header version gates for the V3
+# conditioning files, shared by read_hrs4/5/6 and index_hrs_trial_blocks.
+_V3_STAGE_LAYOUT = {
+    '.hrs4': (BLOCK_UP_COND_PELLET_TRIAL, _read_up_cond_pellet_trial_block,
+              dict(booth_snapshot_fv=6, filter_config_fv=8, filtering_protocol_fv=5,
+                   tibial_stim_fv=13)),
+    '.hrs5': (BLOCK_DOWN_COND_VNS_TRIAL, _read_down_cond_vns_trial_block,
+              dict(booth_snapshot_fv=5, filter_config_fv=7, filtering_protocol_fv=4,
+                   tibial_stim_fv=14)),
+    '.hrs6': (BLOCK_UP_COND_VNS_TRIAL, _read_up_cond_vns_trial_block,
+              dict(booth_snapshot_fv=5, filter_config_fv=7, filtering_protocol_fv=4,
+                   tibial_stim_fv=14)),
+}
+
+
 def read_hrs4(filepath: str):
     """Read a .hrs4 (Up Condition Pellet) data file (hreflex_txbdc V3).
 
     Returns (header, trials, emg_blocks).
     """
     header = MhRecHeader()
-    trials, emg_blocks = _make_v3_block_loop(
-        filepath, header, BLOCK_UP_COND_PELLET_TRIAL, _read_up_cond_pellet_trial_block,
-        booth_snapshot_fv=6, filter_config_fv=8, filtering_protocol_fv=5,
-        tibial_stim_fv=13)
+    _bid, _fn, _gates = _V3_STAGE_LAYOUT['.hrs4']
+    trials, emg_blocks = _make_v3_block_loop(filepath, header, _bid, _fn, **_gates)
     if trials:
         header.sample_rate = 10000.0
     header.settings = _load_settings_json(filepath)
@@ -1651,10 +1678,8 @@ def read_hrs5(filepath: str):
     Returns (header, trials, emg_blocks).
     """
     header = MhRecHeader()
-    trials, emg_blocks = _make_v3_block_loop(
-        filepath, header, BLOCK_DOWN_COND_VNS_TRIAL, _read_down_cond_vns_trial_block,
-        booth_snapshot_fv=5, filter_config_fv=7, filtering_protocol_fv=4,
-        tibial_stim_fv=14)
+    _bid, _fn, _gates = _V3_STAGE_LAYOUT['.hrs5']
+    trials, emg_blocks = _make_v3_block_loop(filepath, header, _bid, _fn, **_gates)
     if trials:
         header.sample_rate = 10000.0
     header.settings = _load_settings_json(filepath)
@@ -1667,10 +1692,8 @@ def read_hrs6(filepath: str):
     Returns (header, trials, emg_blocks).
     """
     header = MhRecHeader()
-    trials, emg_blocks = _make_v3_block_loop(
-        filepath, header, BLOCK_UP_COND_VNS_TRIAL, _read_up_cond_vns_trial_block,
-        booth_snapshot_fv=5, filter_config_fv=7, filtering_protocol_fv=4,
-        tibial_stim_fv=14)
+    _bid, _fn, _gates = _V3_STAGE_LAYOUT['.hrs6']
+    trials, emg_blocks = _make_v3_block_loop(filepath, header, _bid, _fn, **_gates)
     if trials:
         header.sample_rate = 10000.0
     header.settings = _load_settings_json(filepath)
@@ -5866,7 +5889,7 @@ def make_vns_peristim_viewer(trials, header, sample_rate=None,
         ax.axhline(thr_v, color='purple', lw=0.6, ls=':')
         ax.axhline(-thr_v, color='purple', lw=0.6, ls=':')
         ax.set_xlim(-pre_ms, post_ms)
-        ax.set_xlabel('Time from stim onset (ms)')
+        ax.set_xlabel('Time (ms)')
         ax.set_ylabel('VNS ADC − baseline (V)')
         ax.grid(alpha=0.3)
         ax.set_title(f'VNS ADC, {len(idx)} trials aligned to stim onset  ·  '
@@ -6445,7 +6468,7 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
                           ncol=max(1, len(handles) // 8), framealpha=0.7)
 
     # ── Shared axis formatting ─────────────────────────────────────────────────
-    ax.set_xlabel('Time relative to pulse onset (ms)', fontsize=11)
+    ax.set_xlabel('Time (ms)', fontsize=11)
     ax.set_ylabel('EMG (µV)', fontsize=11)
     ax.set_xlim(-pre_pulse_ms, post_pulse_ms)
     if y_min is not None and y_max is not None:
@@ -6457,7 +6480,7 @@ def plot_ft_averaged_waveforms(trial, header, pre_pulse_ms=2.0, post_pulse_ms=20
     # ── Extra channel subplot formatting ───────────────────────────────────────
     for eax, (label, _, ylabel) in zip(extra_axes, extra_channels):
         _shade(eax)
-        eax.set_xlabel('Time relative to pulse onset (ms)', fontsize=9)
+        eax.set_xlabel('Time (ms)', fontsize=9)
         eax.set_ylabel(ylabel, fontsize=9)
         eax.set_xlim(-pre_pulse_ms, post_pulse_ms)
         eax.tick_params(labelsize=8)
@@ -8201,7 +8224,7 @@ def plot_hrs2_analysis(trials, header,
                 ax.legend(loc='upper right', fontsize=8)
                 ax.set_xlim(-pre_avg_ms, post_avg_ms)
                 ax.set_ylim(*_get_ylim())
-                ax.set_xlabel('Time from stim onset (ms)')
+                ax.set_xlabel('Time (ms)')
                 fig.suptitle(f'Trial-group averages — {header.subject_id}{_pl}', fontsize=12)
                 plt.tight_layout()
                 plt.show()
@@ -10384,7 +10407,7 @@ def view_variability_bin(variability_results, marker_hws, trials, header,
 
             extra = f' (showing first {max_overlay} of {len(indices)})' \
                     if len(indices) > max_overlay else ''
-            ax.set_xlabel('Time re: stim onset (ms)')
+            ax.set_xlabel('Time (ms)')
             ax.tick_params(axis='x', width=2.0)
             ax.spines['bottom'].set_linewidth(2.5)
             ax.set_ylabel('Bipolar EMG (µV)')
@@ -10656,7 +10679,7 @@ def plot_quartile_window_comparison(
                       label=f'Group avg (n={len(stim_stack)})', zorder=4)
             ax_s.set_xlim(-pre_ms, post_ms)
             ax_s.set_ylim(ylim)
-            ax_s.set_xlabel('Time re: stim onset (ms)')
+            ax_s.set_xlabel('Time (ms)')
             ax_s.set_ylabel('Bipolar EMG (µV)')
             ax_s.set_title('Peri-stimulus')
             ax_s.set_xticks(np.arange(int(np.floor(-pre_ms)),
@@ -11330,7 +11353,7 @@ def view_mh_bin(variability_sweep, marker_hws, trials, metrics, header,
             x_lo = float(t_plot[0]) if _has_bg else -pre_ms
             ax.set_xlim(x_lo, post_ms)
             ax.set_ylim(ylim)
-            ax.set_xlabel('Time re: stim onset (ms)', fontsize=10)
+            ax.set_xlabel('Time (ms)', fontsize=10)
             ax.set_ylabel('Bipolar EMG (µV)', fontsize=10)
             ax.set_title(f'{header.subject_id} — Centre={centre}, '
                          f'hw=±{row["hw"]} µV, n={row["n"]}{extra}', fontsize=11)
@@ -12285,7 +12308,7 @@ def detect_and_correct_failed_trials(hrs2_trials, hrs2_header, hrs2_emg_blocks,
         ax.axvline(0, color='red', linestyle='--', linewidth=1.0, label='True onset')
         delay_str = (f'{d["delay_ms"]:+.1f} ms' if d['delay_ms'] is not None else 'no pulse')
         ax.set_title(f'Trial {d["trial_num"]} | {d["amp_ma"]:.2f} mA | {delay_str}', fontsize=8)
-        ax.set_xlabel('Time re: true onset (ms)', fontsize=7)
+        ax.set_xlabel('Time (ms)', fontsize=7)
         ax.set_ylabel('EMG (µV)', fontsize=7)
         ax.tick_params(labelsize=6)
         ax.grid(True, alpha=0.3)
@@ -14914,6 +14937,22 @@ def compute_reward_groups(trials, state):
     return groups, group_labels, group_colors, trial_bg_dict, pol_labels, trials_by_pol
 
 
+_BIN_COLORS = ['steelblue', 'darkorange', 'forestgreen', 'crimson', 'mediumpurple',
+               'saddlebrown', 'hotpink', 'gray', 'olive', 'teal', 'gold', 'navy']
+
+
+def _normalize_bin_mode(bin_mode: str) -> str:
+    """Map BIN_MODE spellings ('H-Wave', 'h wave', 'M_WAVE', 'emg', …) onto
+    'EMG' / 'M_WAVE' / 'H_WAVE'."""
+    key = str(bin_mode).strip().upper().replace('-', '_').replace(' ', '_')
+    key = {'H': 'H_WAVE', 'M': 'M_WAVE', 'HWAVE': 'H_WAVE', 'MWAVE': 'M_WAVE'}.get(key, key)
+    if key in ('EMG', 'M_WAVE', 'H_WAVE'):
+        return key
+    if key in ('H:M', 'H_M', 'HM', 'H/M'):
+        raise ValueError("bin_mode 'H:M' is not implemented — choose 'EMG', 'M_WAVE' or 'H_WAVE'.")
+    raise ValueError(f"Unknown bin_mode {bin_mode!r}. Choose 'EMG', 'M_WAVE', or 'H_WAVE'.")
+
+
 def compute_equal_bin_ranges(
     trials, bin_mode, n_bins, state, sample_rate,
     pre_avg_ms, post_avg_ms, m_start_ms, m_end_ms, h_start_ms, h_end_ms,
@@ -14930,6 +14969,7 @@ def compute_equal_bin_ranges(
     The last bin's upper bound is float('inf') to capture all remaining trials.
     """
     ms_per_sample = 1000.0 / sample_rate
+    bin_mode = _normalize_bin_mode(bin_mode)
 
     if bin_mode == 'EMG':
         metrics = np.array(state['trial_bg_gm'], dtype=float)
@@ -14995,6 +15035,7 @@ def compute_trial_bins(
     binned_trials, bin_labels, bin_colors, trial_bg_dict, bin_unit, pol_labels, trials_by_pol
     """
     ms_per_sample = 1000.0 / sample_rate
+    bin_mode      = _normalize_bin_mode(bin_mode)
     trial_bg_gm   = state['trial_bg_gm']
     trial_bg_dict = {id(t): trial_bg_gm[i] for i, t in enumerate(hrs2_trials)}
 
@@ -15023,7 +15064,7 @@ def compute_trial_bins(
         + (f'  [c={(lo + hi) / 2:.4g}, Δ{hi - lo:.4g}]' if hi != float('inf') else '')
         for i, (lo, hi) in enumerate(bin_ranges)
     ]
-    bin_colors = ['steelblue', 'darkorange', 'forestgreen', 'crimson', 'mediumpurple'][:len(bin_ranges)]
+    bin_colors = [_BIN_COLORS[i % len(_BIN_COLORS)] for i in range(len(bin_ranges))]
 
     trials_by_pol = split_trials_by_polarity(hrs2_trials)
     pol_labels    = list(trials_by_pol.keys())
@@ -15055,10 +15096,12 @@ def plot_bin_overview(
 ):
     """Interactive EMG bin overview with Global and per-panel zoom views.
 
-    A View selector switches between the full 5-panel layout and enlarged
-    single-panel views for Waveforms, M-wave, H-wave, H:M Ratio, and Stats.
+    A View selector switches between the full 5-panel layout (Waveforms,
+    H-wave, M-wave, H:M Ratio, Stats) and enlarged single-panel views of each.
     Legend component checkboxes let you toggle bin range, center, width, and
-    n= independently.
+    n= independently. Display checkboxes: "Compact" cuts the plot height ~30%
+    (same width), "Large text" makes every label bold and much larger with
+    thicker lines and dots, for posters / slides read from a distance.
 
     Extra keyword arguments
     -----------------------
@@ -15077,7 +15120,7 @@ def plot_bin_overview(
     ov_out        = Output()
 
     # ── View selector ─────────────────────────────────────────────────
-    VIEW_OPTIONS = ['Global', 'Waveforms', 'M-wave', 'H-wave', 'H:M Ratio', 'Stats']
+    VIEW_OPTIONS = ['Global', 'Waveforms', 'H-wave', 'M-wave', 'H:M Ratio', 'Stats']
     view_tgl = ToggleButtons(
         options=VIEW_OPTIONS, value='Global',
         button_style='', description='View:',
@@ -15099,6 +15142,34 @@ def plot_bin_overview(
         HTML('&nbsp;&nbsp;<b style="line-height:32px">Bars:</b>&nbsp;'),
         cb_means, cb_dots,
     ])
+    cb_compact = Checkbox(value=False, description='Compact',    indent=False, layout=_cw)
+    cb_large   = Checkbox(value=False, description='Large text', indent=False, layout=_cw)
+    display_row = HBox([HTML('<b style="line-height:32px">Display:</b>&nbsp;'),
+                        cb_compact, cb_large])
+
+    def _fh(h):
+        """Figure height: ~30% shorter in Compact (width unchanged, since the
+        notebook scales images to the cell width — only the shape shows)."""
+        return h * 0.7 if cb_compact.value else h
+
+    def _finish(fig, axes):
+        """Large text: enlarge every axes' text / lines (figure size is kept,
+        so the text really reads larger once the image is fit to the cell)."""
+        if cb_large.value:
+            from matplotlib.ticker import FixedLocator, MaxNLocator
+            for _a in np.atleast_1d(axes):
+                if isinstance(_a.xaxis.get_major_locator(), FixedLocator):
+                    # Bar panels: wrap group names onto lines so neighbors don't collide.
+                    _a.set_xticklabels([t.get_text().replace(' (', '\n(').replace('Not ', 'Not\n')
+                                        for t in _a.get_xticklabels()])
+                else:
+                    _a.xaxis.set_major_locator(MaxNLocator(5))   # fewer, bigger time ticks
+                _enlarge_axes(_a, k=1.8)
+                if _a.get_legend() is not None:
+                    _a.get_legend().set_loc('best')
+            if fig._suptitle is not None:
+                fig._suptitle.set_fontsize(fig._suptitle.get_fontsize() * 2.0)
+                fig._suptitle.set_fontweight('bold')
 
     def _trial_dots(ax, xi, v, col, spread=0.18, size=14):
         """One semi-transparent dot per trial over bar *xi*, jittered horizontally.
@@ -15204,9 +15275,9 @@ def plot_bin_overview(
 
             # ── GLOBAL ─────────────────────────────────────────────────
             if view == 'Global':
-                fig, axes = plt.subplots(1, 5, figsize=(22, 5),
+                fig, axes = plt.subplots(1, 5, figsize=(22, _fh(5.5 if cb_large.value else 5)),
                                          gridspec_kw={'width_ratios': [5, 3, 3, 3, 2.5]})
-                ax_w, ax_m, ax_h, ax_hm, ax_txt = axes
+                ax_w, ax_h, ax_m, ax_hm, ax_txt = axes
 
                 for lbl, col in zip(present, cols):
                     if avgs[lbl] is not None:
@@ -15215,7 +15286,7 @@ def plot_bin_overview(
                 ax_w.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.12, zorder=0)
                 ax_w.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.12, zorder=0)
                 ax_w.axvline(0, color='red', linestyle='--', linewidth=1.0, label='Stim onset')
-                ax_w.set_xlabel('Time re: stim onset (ms)')
+                ax_w.set_xlabel('Time (ms)')
                 ax_w.set_ylabel('EMG (µV)')
                 ax_w.set_title(f'Avg Waveforms — {pol_lbl}')
                 ax_w.legend(fontsize=8, loc='upper right')
@@ -15245,15 +15316,15 @@ def plot_bin_overview(
                     ax.set_title(title, fontsize=10, fontweight='bold')
                     ax.grid(True, axis='y', alpha=0.3)
 
-                _bar(ax_m,  m_mra,  'Size (µV)', 'M-wave',    fmt='.1f')
                 _bar(ax_h,  h_mra,  'Size (µV)', 'H-wave',    fmt='.1f')
+                _bar(ax_m,  m_mra,  'Size (µV)', 'M-wave',    fmt='.1f')
                 _bar(ax_hm, hm_mra, 'H:M',           'H:M Ratio', fmt='.3f')
 
                 ax_txt.axis('off')
                 stat_lines = [f'Stats — {pol_lbl}', '']
                 for lbl, slbl in zip(present, short_lbls):
                     stat_lines.append(slbl)
-                    for key, vd in [('M', m_mra), ('H', h_mra), ('H:M', hm_mra)]:
+                    for key, vd in [('H', h_mra), ('M', m_mra), ('H:M', hm_mra)]:
                         v = np.array([x for x in vd[lbl] if np.isfinite(x)])
                         if len(v):
                             mu = float(np.mean(v))
@@ -15266,12 +15337,13 @@ def plot_bin_overview(
                             bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#cccccc'))
 
                 plt.suptitle(f'Combined EMG Bin Overview  —  {hrs2_header.subject_id}', fontsize=11)
+                _finish(fig, axes)
                 plt.tight_layout()
                 plt.show()
 
             # ── WAVEFORMS (zoomed) ─────────────────────────────────────
             elif view == 'Waveforms':
-                fig, ax = plt.subplots(figsize=(14, 7))
+                fig, ax = plt.subplots(figsize=(14, _fh(7)))
                 for lbl, col in zip(present, cols):
                     if avgs[lbl] is None:
                         continue
@@ -15283,7 +15355,7 @@ def plot_bin_overview(
                 ax.axvspan(m_start_ms, m_end_ms, color='blue',  alpha=0.12, zorder=0, label='M window')
                 ax.axvspan(h_start_ms, h_end_ms, color='green', alpha=0.12, zorder=0, label='H window')
                 ax.axvline(0, color='red', linestyle='--', linewidth=1.2, label='Stim onset')
-                ax.set_xlabel('Time re: stim onset (ms)', fontsize=12)
+                ax.set_xlabel('Time (ms)', fontsize=12)
                 ax.set_ylabel('EMG (µV)', fontsize=12)
                 ax.set_title(
                     f'Averaged Waveforms per Bin  —  {pol_lbl}  —  {hrs2_header.subject_id}',
@@ -15292,6 +15364,7 @@ def plot_bin_overview(
                 ax.grid(True, alpha=0.3)
                 ax.text(0.01, 0.99, 'Shading = ±SEM', transform=ax.transAxes,
                         va='top', fontsize=8, color='gray')
+                _finish(fig, ax)
                 plt.tight_layout()
                 plt.show()
 
@@ -15303,7 +15376,7 @@ def plot_bin_overview(
                 val_dict = val_map[view]
                 fmt      = fmt_map[view]
 
-                fig, ax = plt.subplots(figsize=(max(8, len(present) * 2.8), 7))
+                fig, ax = plt.subplots(figsize=(max(8, len(present) * 2.8), _fh(7)))
                 mus, sds, all_vals = [], [], []
                 for xi, (b_lbl, col) in enumerate(zip(present, cols)):
                     v  = np.array([x for x in val_dict[b_lbl] if np.isfinite(x)])
@@ -15355,6 +15428,7 @@ def plot_bin_overview(
                     Line2D([0], [0], color='black', linewidth=2.5, label='Median'),
                 ]
                 ax.legend(handles=leg_handles, fontsize=9, loc='upper right')
+                _finish(fig, ax)
                 plt.tight_layout()
                 plt.show()
 
@@ -15369,8 +15443,8 @@ def plot_bin_overview(
                 ]
                 for lbl, slbl in zip(present, short_lbls):
                     stat_lines.append(f'{slbl}   (n={ns[lbl]})')
-                    for key, vd in [('M-wave Size (µV)', m_mra),
-                                    ('H-wave Size (µV)', h_mra),
+                    for key, vd in [('H-wave Size (µV)', h_mra),
+                                    ('M-wave Size (µV)', m_mra),
                                     ('H:M Ratio',        hm_mra)]:
                         v = np.array([x for x in vd[lbl] if np.isfinite(x)])
                         if len(v):
@@ -15390,13 +15464,14 @@ def plot_bin_overview(
                 ax.text(0.03, 0.97, '\n'.join(stat_lines), transform=ax.transAxes,
                         va='top', ha='left', fontsize=10, family='monospace',
                         bbox=dict(boxstyle='round,pad=0.6', fc='#f9f9f9', ec='#aaaaaa'))
+                _finish(fig, ax)
                 plt.tight_layout()
                 plt.show()
 
     # ── Reactivity wiring ─────────────────────────────────────────────
     def _on_cb(change):
         _draw(current_pol[0], current_view[0])
-    for cb in [cb_range, cb_center, cb_width, cb_n, cb_means, cb_dots]:
+    for cb in [cb_range, cb_center, cb_width, cb_n, cb_means, cb_dots, cb_compact, cb_large]:
         cb.observe(_on_cb, names='value')
 
     def _on_view(change):
@@ -15412,9 +15487,9 @@ def plot_bin_overview(
                 current_pol[0] = change['new']
                 _draw(change['new'], current_view[0])
         pol_tgl.observe(_on_pol, names='value')
-        _display(VBox([HBox([pol_tgl]), HBox([view_tgl]), legend_row, ov_out]))
+        _display(VBox([HBox([pol_tgl]), HBox([view_tgl]), legend_row, display_row, ov_out]))
     else:
-        _display(VBox([HBox([view_tgl]), legend_row, ov_out]))
+        _display(VBox([HBox([view_tgl]), legend_row, display_row, ov_out]))
     _draw(pol_labels[0])
 
 
@@ -15831,7 +15906,8 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
                              metric='h_reflex', avg_range=None,
                              compact=False, show_box_text=True,
                              ax=None, x_order=None, show_xticklabels=True,
-                             title=None, show_legend=True, bar_colors=None):
+                             title=None, show_legend=True, bar_colors=None,
+                             large_text=False):
     """
     Render a cross-recording comparison box-and-whisker plot (or a bar plot,
     see *bar_colors*).
@@ -15866,6 +15942,9 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
         bars (no IQR box / median / trend line) in its color; labels not in
         the dict are light gray. Used for pooled days (e.g. days −5…−1 blue,
         days 1…5 red).
+    large_text : bool — poster / slide mode: every label bold and
+        ~1.6× larger, thicker lines and markers, and a larger figure with
+        wider recording columns so the box text still fits.
 
     ``stage_key`` may also be a list/tuple of stage keys (e.g.
     ``['control_mode', 'up_cond_vns']``) to show several stages side by side:
@@ -15935,8 +16014,13 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
     n_x  = len(x_order) if x_order else n
     own_fig = ax is None
     if own_fig:
-        fig, ax = plt.subplots(figsize=(max(6, n_x * 0.6 + 1.5), 3.5) if compact
-                               else (max(6, n_x * 2.0), 5))
+        # Large text: wider recording columns so the bigger box text doesn't collide.
+        if compact:
+            _cw, _h = (_LARGE_COMPACT_COL_W, 3.5 * _LARGE_TEXT_SCALE) if large_text else (0.6, 3.5)
+        else:
+            _cw, _h = (2.5, 5 * _LARGE_TEXT_SCALE) if large_text else (2.0, 5)
+        fig, ax = plt.subplots(figsize=(max(6, n_x * _cw + 1.5), _h) if compact
+                               else (max(6, n_x * _cw), _h))
 
     all_flat = np.concatenate([v[1] for v in valid])
     y_span   = float(all_flat.max() - all_flat.min()) or 1.0
@@ -15979,9 +16063,10 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
             ax.plot(i, mn, 'D', color='#1e3a5f', ms=6 if compact else 8, zorder=5)
 
         top = (mn + sd) if n_trials >= 2 else mn
-        if show_box_text and compact:
+        if show_box_text and (compact or large_text):
             # Short horizontal 3-liner that fits a ~0.6 in column without
             # eating the panel height (full precision is in the summary table).
+            # Also used for large text, where the long form overlaps its neighbors.
             _texts.append(ax.text(i, top + y_span * 0.03,
                     f'{_fmt_compact(mn)}±{_fmt_compact(sd)}\nn={n_trials}\n{mean_amp:.3f} mA',
                     ha='center', va='bottom', fontsize=6.5, linespacing=1.0,
@@ -16040,9 +16125,14 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
                     'n': int(len(pooled_sizes)), 'mean': rng_mean, 'sd': rng_sd,
                     'amp_mean': amp_mean, 'amp_sd': amp_sd}
                 range_desc = lo_lbl if lo_lbl == hi_lbl else f'{lo_lbl} … {hi_lbl}'
+                # Stacked lines in compact mode: on one line it is wider than a
+                # narrow axes and runs off the left edge.
+                _sep = '\n' if compact else '  |  '
+                _amp = amp_txt.replace('  |  ', _sep, 1)
                 _texts.append(ax.text(
-                        n_x - 0.5 if compact else n_x - 0.35, rng_mean, f' Range avg ({range_desc}, n={len(pooled_sizes)}): '
-                        f'μ = {rng_mean:.3f} ± {rng_sd:.3f} µV{amp_txt}',
+                        n_x - 0.5 if compact else n_x - 0.35, rng_mean,
+                        f' Range avg ({range_desc}, n={len(pooled_sizes)}):{_sep if compact else " "}'
+                        f'μ = {rng_mean:.3f} ± {rng_sd:.3f} µV{_amp}',
                         ha='right', va='bottom', fontsize=8.5, color='darkorange',
                         fontweight='bold', zorder=8,
                         bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='darkorange', alpha=0.85)))
@@ -16076,6 +16166,8 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
     ax.grid(axis='y', alpha=0.3, ls='--')
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
+    if large_text:
+        _enlarge_axes(ax)
     if own_fig:
         plt.tight_layout()
         _fit_texts_in_axes(ax, _texts)
@@ -16087,6 +16179,36 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
     return summary
 
 
+_LARGE_TEXT_SCALE = 1.6
+_LARGE_COMPACT_COL_W = 1.15   # inches per recording column, compact + large text
+
+
+def _enlarge_axes(ax, k: float = _LARGE_TEXT_SCALE):
+    """Poster mode for an already-drawn axes: every text (title, labels, ticks,
+    data annotations, legend) bold and *k*× larger — title and axis labels
+    a further 1.25× so they stand out; lines, markers, bar edges, line
+    collections (hlines / vlines / error bars), spines and ticks *k*×
+    thicker. Call once, after drawing and before layout."""
+    _leg = ax.get_legend()
+    heads = [ax.title, ax._left_title, ax._right_title, ax.xaxis.label, ax.yaxis.label]
+    texts = (list(ax.texts) + ax.get_xticklabels() + ax.get_yticklabels()
+             + (list(_leg.get_texts()) if _leg else []))
+    for t in texts + heads:
+        t.set_fontsize(t.get_fontsize() * k * (1.25 if t in heads else 1))
+        t.set_fontweight('bold')
+    for ln in ax.lines:
+        ln.set_linewidth(ln.get_linewidth() * k)
+        ln.set_markersize(ln.get_markersize() * k)
+        ln.set_markeredgewidth(ln.get_markeredgewidth() * k)
+    for c in ax.collections:
+        c.set_linewidths([w * k for w in np.atleast_1d(c.get_linewidths())])
+    for p in ax.patches:
+        p.set_linewidth(p.get_linewidth() * k)
+    for sp in ax.spines.values():
+        sp.set_linewidth(sp.get_linewidth() * k)
+    ax.tick_params(width=k, length=3.5 * k)
+
+
 def _fmt_compact(v):
     """Short number for compact box text: 0 dp >= 100, 1 dp >= 10, else 2 dp."""
     a = abs(v)
@@ -16096,13 +16218,15 @@ def _fmt_compact(v):
 def plot_h_reflex_comparison_stacked(h_cache, recording_dirs, stage_key, stage_labels,
                                      metrics=('h_reflex', 'm_wave', 'background'),
                                      avg_range=None, show_box_text=True,
-                                     panel_height=2.6, bar_colors=None):
+                                     panel_height=2.6, bar_colors=None,
+                                     large_text=False):
     """Compact comparison plots for several *metrics*, stacked vertically on a
     shared x-axis (one panel each, recordings aligned column-for-column; a
     recording with no valid reading for a metric leaves a gap in that panel).
 
     Same arguments as :func:`plot_h_reflex_comparison` (always ``compact``);
-    *avg_range* and *bar_colors* apply to every panel. *panel_height* is inches per panel.
+    *avg_range*, *bar_colors* and *large_text* apply to every panel. *panel_height*
+    is inches per panel (scaled up with *large_text*).
     Returns a list of summary dicts, one per metric (``None`` for a metric with
     no data) — pass each to :func:`format_h_comparison_summary`.
     """
@@ -16119,9 +16243,11 @@ def plot_h_reflex_comparison_stacked(h_cache, recording_dirs, stage_key, stage_l
                'background': 'Background MRA'}
 
     k = len(metrics)
+    _g = _LARGE_TEXT_SCALE if large_text else 1.0
     fig, axes = plt.subplots(k, 1, sharex=True, squeeze=False,
-                             figsize=(max(6, len(x_order) * 0.6 + 1.5),
-                                      panel_height * k + 1.0))
+                             figsize=(max(6, len(x_order) * (_LARGE_COMPACT_COL_W if large_text
+                                                             else 0.6) + 1.5),
+                                      (panel_height * k + 1.0) * _g))
     axes = axes[:, 0]
     summaries = []
     for j, (mt, ax) in enumerate(zip(metrics, axes)):
@@ -16129,16 +16255,19 @@ def plot_h_reflex_comparison_stacked(h_cache, recording_dirs, stage_key, stage_l
             h_cache, recording_dirs, stage_key, stage_labels, metric=mt,
             avg_range=avg_range, compact=True, show_box_text=show_box_text,
             ax=ax, x_order=x_order, show_xticklabels=(j == k - 1),
-            title=_titles.get(mt, mt), show_legend=(j == 0), bar_colors=bar_colors)
+            title=_titles.get(mt, mt), show_legend=(j == 0), bar_colors=bar_colors,
+            large_text=large_text)
         if s is None:
             ax.text(0.5, 0.5, 'No data', transform=ax.transAxes,
-                    ha='center', va='center', color='#888')
+                    ha='center', va='center', color='#888',
+                    fontsize=10 * _g, fontweight='bold' if large_text else 'normal')
         summaries.append(s)
     _legend_txt = ('bar = mean  ·  whiskers = mean ± 1σ' if bar_colors is not None else
                    'box = IQR  ·  — = median  ·  ◆ = mean  ·  whiskers = mean ± 1σ')
     fig.suptitle(f'Across Recordings  ·  {stage_lbl}\n'
                  f'{_legend_txt}  ·  text = mean±σ µV / n / amp',
-                 fontsize=10)
+                 fontsize=10 * _g * (1.25 if large_text else 1),
+                 fontweight='bold' if large_text else 'normal')
     plt.tight_layout()
     for ax in axes:
         _fit_texts_in_axes(ax, getattr(ax, '_hcmp_texts', []))
@@ -16225,6 +16354,200 @@ def format_h_comparison_summary(summary) -> str:
                              'Amp mean (mA)', 'Amp SD (mA)']),
                   '\t'.join([desc, str(ra['n'])] + [
                       f"{ra[k]:.3f}" for k in ('mean', 'sd', 'amp_mean', 'amp_sd')])]
+    return '\n'.join(lines)
+
+
+# ── Multi-subject daily H-reflex plot ─────────────────────────────────────────
+_XR_METRIC_KEYS = {'h_reflex': ('h_sizes', 'H-Reflex Size'),
+                   'm_wave': ('m_sizes', 'M-Wave Size'),
+                   'background': ('bg_sizes', 'Background MRA')}
+
+
+def load_subject_caches(subject_pickles: dict) -> dict:
+    """``{subject: {'xr_cache', 'recording_dirs', 'config'}}`` from each
+    subject's :func:`save_analysis_pickle` file (*subject_pickles* maps
+    subject name → .pkl path). Only the comparison cache and config are kept;
+    the recordings are dropped so several subjects fit in memory. Each
+    subject keeps its own pipeline (windows, exclusion, pre-filter) as saved."""
+    import gc
+    out = {}
+    for subj, path in subject_pickles.items():
+        b = load_analysis_pickle(path)
+        if not b.get('xr_cache'):
+            raise ValueError(f'{path} has no xr_cache — re-save it from a Read notebook.')
+        cfg = b.get('config', {})
+        out[subj] = {'xr_cache': b['xr_cache'],
+                     'recording_dirs': cfg.get('RECORDING_DIRS') or
+                                       [(l, '', None) for l in b['xr_cache']],
+                     'config': cfg}
+        del b
+        gc.collect()
+        print(f"  {subj}: {len(out[subj]['xr_cache'])} recordings · "
+              f"H {cfg.get('H_WAVE_START_MS')}–{cfg.get('H_WAVE_END_MS')} ms · "
+              f"M {cfg.get('M_WAVE_START_MS')}–{cfg.get('M_WAVE_END_MS')} ms")
+    return out
+
+
+def multi_subject_daily_table(subjects: dict, metric: str = 'h_reflex',
+                              stages=('control_mode', 'up_cond_vns'),
+                              normalize: bool = False, min_subjects: int = 2):
+    """Per-subject daily means and the across-subject pooled mean ± SEM.
+
+    *subjects* is :func:`load_subject_caches` output. A recording's label in
+    RECORDING_DIRS is its day number (``'-5'``, ``'3'``, …); labels that aren't
+    numbers are skipped with a warning. A subject's day value is the mean over
+    every trial of the *stages* in that recording (trials of several stages on
+    one day are pooled). With *normalize*, each subject's values are % of that
+    subject's baseline (mean of its day < 0 values).
+
+    Pooled per day: mean of the subject values, SEM = SD(ddof=1)/√n over
+    subjects. Days with fewer than *min_subjects* subjects get NaN pooled values.
+
+    Returns ``(per_subject_df, pooled_df)``.
+    """
+    col = _XR_METRIC_KEYS[metric][0]
+    rows = []
+    for subj, s in subjects.items():
+        for lbl, _p, _sr in s['recording_dirs']:
+            st = s['xr_cache'].get(lbl)
+            if not st:
+                continue
+            try:
+                day = float(lbl)
+            except (TypeError, ValueError):
+                print(f'Warning: {subj} recording {lbl!r} is not a day number — skipped.')
+                continue
+            vals = np.concatenate([np.asarray(st[sk][col], float)
+                                   for sk in stages if st.get(sk) is not None] or [np.array([])])
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                rows.append({'subject': subj, 'day': day, 'n_trials': int(vals.size),
+                             'value': float(vals.mean())})
+    per = pd.DataFrame(rows, columns=['subject', 'day', 'n_trials', 'value'])
+    if normalize and not per.empty:
+        base = per[per['day'] < 0].groupby('subject')['value'].mean()
+        missing = sorted(set(per['subject']) - set(base.index))
+        if missing:
+            print(f'Warning: no baseline (day < 0) for {missing} — left out of the normalized plot.')
+        per = per[per['subject'].isin(base.index)].copy()
+        per['value'] = per['value'] / per['subject'].map(base) * 100.0
+    pooled = []
+    for day, g in per.groupby('day'):
+        v = g['value'].to_numpy()
+        ok = len(v) >= max(min_subjects, 1)
+        pooled.append({'day': day, 'n_subjects': len(v),
+                       'mean': float(v.mean()) if ok else np.nan,
+                       'sem': float(v.std(ddof=1) / np.sqrt(len(v))) if ok and len(v) > 1 else np.nan})
+    return per, pd.DataFrame(pooled, columns=['day', 'n_subjects', 'mean', 'sem'])
+
+
+def plot_multi_subject_daily(per_subject, pooled, metric: str = 'h_reflex',
+                             normalize: bool = False, color: str = '#d62728',
+                             group_label: str = 'VNS', title: str = None, ax=None,
+                             compact: bool = False, large_text: bool = False):
+    """Thin line per subject + thick pooled mean ± SEM line, by day
+    (:func:`multi_subject_daily_table` output). Days ≥ 1 get a *group_label*
+    bar above the plot; a dotted line separates baseline from conditioning.
+
+    *compact* keeps the width but cuts the height ~35% (legend moves outside
+    on the right) — notebooks scale images to the cell width, so a change in
+    shape, not size, is what shows. *large_text* makes every label bold and
+    ~1.7× larger with thicker lines and markers, for posters / slides read
+    from a distance. The two combine.
+    """
+    name = _XR_METRIC_KEYS[metric][1]
+    k = 1.7 if large_text else 1.0                  # text / line scale
+    fw = 'bold' if large_text else 'normal'
+    if ax is None:
+        w, h = (10, 3.6) if compact else (10, 5.5)
+        fig, ax = plt.subplots(figsize=(w * (1.35 if large_text else 1),
+                                        h * (1.35 if large_text else 1)))
+    else:
+        fig = ax.figure
+    for subj, g in per_subject.groupby('subject', sort=False):
+        g = g.sort_values('day')
+        ax.plot(g['day'], g['value'], color=color, lw=1.0 * k, alpha=0.45,
+                marker='o', ms=3 * k, zorder=2)
+        ax.annotate(subj, (g['day'].iloc[-1], g['value'].iloc[-1]), xytext=(6, 0),
+                    textcoords='offset points', va='center', fontsize=10 * k,
+                    fontweight=fw, color='0.35')
+    p = pooled.dropna(subset=['mean']).sort_values('day')
+    if not p.empty:
+        ax.errorbar(p['day'], p['mean'], yerr=p['sem'].fillna(0), color=color, lw=3.5 * k,
+                    elinewidth=2.5 * k, capsize=6 * k, capthick=2.5 * k, marker='o', ms=7 * k,
+                    zorder=4, label='Mean ± SEM across subjects')
+    days = sorted(per_subject['day'].unique())
+    ax.set_xticks(days)
+    ax.set_xticklabels([f'{d:g}' for d in days])
+    if any(d < 0 for d in days) and any(d > 0 for d in days):
+        ax.axvline(0, color='0.5', ls=':', lw=1.2 * k, zorder=1)
+    if normalize:
+        ax.axhline(100, color='0.6', ls='--', lw=1 * k, zorder=1)
+    vns = [d for d in days if d >= 1] if group_label else []
+    bar_pt = 22 * k                                  # VNS bar height in points
+    unit = '% of baseline' if normalize else 'µV'
+    # Two-line y label when the axes is short or the text is big, so it fits.
+    ax.set_ylabel(f'{name}\n({unit})' if compact or large_text else f'{name} ({unit})',
+                  fontsize=14 * k, fontweight=fw)
+    ax.set_xlabel('Day', fontsize=14 * k, fontweight=fw)
+    ax.set_title(title or f'{name} across days · {per_subject["subject"].nunique()} subjects',
+                 fontsize=16 * k, fontweight=fw, pad=(bar_pt + 10 * k) if vns else 8)
+    ax.tick_params(labelsize=11 * k, width=1 * k, length=4 * k)
+    for _t in ax.get_xticklabels() + ax.get_yticklabels():
+        _t.set_fontweight(fw)
+    for sp in ('top', 'right'):
+        ax.spines[sp].set_visible(False)
+    for sp in ('left', 'bottom'):
+        ax.spines[sp].set_linewidth(1 * k)
+    ax.grid(axis='y', color='0.9', lw=0.8)
+    ax.set_axisbelow(True)
+    _lp = {'size': 11 * k, 'weight': fw}
+    if compact:   # a short axes has no free corner — short legend outside on the right
+        _hs, _ls = ax.get_legend_handles_labels()
+        ax.legend(_hs, [l.replace(' across subjects', '') for l in _ls], loc='upper left', bbox_to_anchor=(1.02, 1.0), frameon=False, prop=_lp)
+    else:
+        ax.legend(loc='upper left', frameon=False, prop=_lp)
+    fig.tight_layout()
+    # Widen the x-axis until the subject names at the line ends fit inside it.
+    names = [t for t in ax.texts if t.get_text() in set(per_subject['subject'])]
+    for _ in range(3):
+        fig.canvas.draw()
+        _r = fig.canvas.get_renderer()
+        _right = max((ax.transData.inverted().transform((t.get_window_extent(_r).x1, 0))[0]
+                      for t in names), default=None)
+        x0, x1 = ax.get_xlim()
+        if _right is None or _right <= x1:
+            break
+        ax.set_xlim(x0, _right + 0.2)
+    if vns:
+        # Drawn after layout so its height can be fixed in points (an axes
+        # fraction would stretch with the figure shape).
+        _ax_pt = ax.get_window_extent().height * 72.0 / fig.dpi
+        _tr = ax.get_xaxis_transform()
+        _y0, _hh = 1 + 4 / _ax_pt, bar_pt / _ax_pt
+        ax.add_patch(plt.Rectangle((min(vns) - 0.4, _y0), max(vns) - min(vns) + 0.8, _hh,
+                                   transform=_tr, clip_on=False, facecolor='#f2e85c',
+                                   edgecolor='black', lw=1 * k))
+        ax.text((min(vns) + max(vns)) / 2, _y0 + _hh / 2, group_label, transform=_tr,
+                ha='center', va='center', fontsize=13 * k, fontweight=fw)
+    return fig
+
+
+def format_multi_subject_summary(per_subject, pooled, unit: str = 'µV') -> str:
+    """Tab-separated day × subject table plus pooled mean / SEM / n columns —
+    pastes into Excel/Sheets as columns."""
+    if per_subject.empty:
+        return ''
+    wide = per_subject.pivot(index='day', columns='subject', values='value')
+    subs = list(dict.fromkeys(per_subject['subject']))
+    pl = pooled.set_index('day')
+    lines = ['\t'.join(['Day'] + [f'{s} ({unit})' for s in subs] +
+                       [f'Pooled mean ({unit})', f'SEM ({unit})', 'n subjects'])]
+    _f = lambda v: '' if pd.isna(v) else f'{v:.3f}'
+    for day in wide.index:
+        lines.append('\t'.join([f'{day:g}'] + [_f(wide.at[day, s]) for s in subs] +
+                               [_f(pl.at[day, 'mean']), _f(pl.at[day, 'sem']),
+                                str(int(pl.at[day, 'n_subjects']))]))
     return '\n'.join(lines)
 
 
@@ -16654,7 +16977,7 @@ def plot_plotly_amplitude_grid(amp_data, subject_id, n_per_page=6,
     xax = dict(range=[-pre_ms, post_ms], tickmode='linear', dtick=1,
                showgrid=True, gridcolor='rgba(0,0,0,0.08)',
                zeroline=True, zerolinecolor='rgba(0,0,0,0.35)', zerolinewidth=1,
-               title_text='ms')
+               title_text='Time (ms)')
     yax = dict(range=[y_lo, y_hi], showgrid=True,
                gridcolor='rgba(0,0,0,0.08)', title_text='µV')
     ax_upd = {}
@@ -16816,7 +17139,7 @@ def plot_plotly_amplitude_detail(amp_data, subject_id,
                  pad=dict(t=5), x=1.02, xanchor='left', y=0.38, yanchor='top',
                  bgcolor='white', bordercolor='#bbb', font=dict(size=10)),
         ],
-        xaxis=dict(title='Time re: stim onset (ms)', range=[-pre_ms, post_ms],
+        xaxis=dict(title='Time (ms)', range=[-pre_ms, post_ms],
                    tickmode='linear', dtick=1,
                    showgrid=True, gridcolor='rgba(0,0,0,0.08)',
                    zeroline=True, zerolinecolor='rgba(0,0,0,0.4)', zerolinewidth=1),
@@ -17220,6 +17543,14 @@ def compute_ft_trial_hz(trial, header, sr: float, snap_list=None) -> float:
     return ft_snap_hz(hz, snap_list)
 
 
+class _SampleRateStub:
+    """Stands in for ``hrs1_header`` when a recording has no .hrs1/.hrs2 (e.g. a
+    conditioning-only folder); only ``sample_rate`` is read. Module-level so
+    save_analysis_pickle can pickle it."""
+    def __init__(self, sample_rate):
+        self.sample_rate = sample_rate
+
+
 def load_all_recordings(recording_dirs, ft_snap_hz_list=None, verbose: bool = True) -> dict:
     """Load all recordings from *recording_dirs* and return a dict keyed by label.
 
@@ -17313,10 +17644,7 @@ def load_all_recordings(recording_dirs, ft_snap_hz_list=None, verbose: bool = Tr
                             5000.0)
 
         if _r_h1h is None:
-            _r_sr_val = _r_detect_sr
-            class _SampleRateStub:
-                sample_rate = _r_sr_val
-            _r_h1h = _SampleRateStub()
+            _r_h1h = _SampleRateStub(_r_detect_sr)
 
         _r_ft_hz = [compute_ft_trial_hz(tr, _r_ft_h, _r_detect_sr, snap_list)
                     for tr in (_r_ft_t or [])]
@@ -17366,8 +17694,16 @@ def load_all_recordings(recording_dirs, ft_snap_hz_list=None, verbose: bool = Tr
             for _i, _t in enumerate(_st):
                 _t.session_trial_index = _i
 
+        # Source file of each single-file stage (for writers such as
+        # write_hrs_excluding_bins). Control Mode aliased as the primary stage
+        # keeps only its 'control_mode' key, so this mapping holds.
+        _r_paths = {'mh_recruitment': _rp1, 'control_mode': _rp2, 'dcp': _rp3,
+                    'up_cond_pellet': _rp4, 'down_cond_vns': _rp5, 'up_cond_vns': _rp6}
+        _r_stage_paths = {_sk: _r_paths[_sk] for _sk in _r_sm if _r_paths.get(_sk)}
+
         all_recordings[_rlabel] = {
             'stage_map':    _r_sm,
+            'stage_paths':  _r_stage_paths,
             'sample_rate':  _r_detect_sr,
             'hrs1_header':  _r_h1h,
             'ft_trials':    _r_ft_t,
@@ -17427,6 +17763,214 @@ def build_settings_dataframe(all_recordings: dict):
             rows.append(_row)
 
     return pd.DataFrame(rows)
+
+
+_TRIAL_METRIC_COLS = ('h_size_uv', 'm_size_uv', 'bg_mra_uv', 'hm_ratio')
+
+
+def build_trial_dataframe(all_recordings_raw: dict, all_recordings: dict = None,
+                          pre_ms: float = 50.0, post_ms: float = 100.0,
+                          h_start_ms: float = 6.0, h_end_ms: float = 12.0,
+                          m_start_ms: float = 2.0, m_end_ms: float = 4.0):
+    """One row per trial of every stage in *all_recordings_raw*.
+
+    Columns: recording, stage, stage_key, trial (1-based session trial number),
+    included (the trial survived exclusion / pre-filtering, i.e. it is in
+    *all_recordings*; True for all when that is None), the computed metrics
+    h_size_uv, m_size_uv, bg_mra_uv, hm_ratio, then every scalar field the
+    trial carries — so stage-specific fields (.hrs6 vns_delivered,
+    reward_threshold_used, decision_*, onset_to_vns_*, …) and fields added by
+    future app versions are included without code changes. Trial fields that
+    clash with a computed column get an ``app_`` prefix (e.g. app_hm_ratio,
+    the app's own online value).
+
+    The metrics match :func:`compute_h_comparison_data` (the comparison plot):
+    rectified window mean minus the standard peri-stim background
+    (:func:`compute_peri_stim_bg`); a trial whose background can't be measured
+    gets NaN metrics.
+    """
+    import datetime as _dtm
+    _scalar = (bool, int, float, str, np.generic, _dtm.datetime)
+    kept = set()
+    if all_recordings is not None:
+        for _rec in all_recordings.values():
+            for _tr, *_ in _rec['stage_map'].values():
+                kept.update(id(t) for t in _tr)
+
+    rows = []
+    for _rl, _rec in all_recordings_raw.items():
+        sr = _rec['sample_rate'] or getattr(_rec['hrs1_header'], 'sample_rate', SAMPLE_RATE)
+        ms_ps, rec_s = 1000.0 / sr, int(TRIAL_RECORD_MS * sr / 1000)
+        for _sk, (_trials, _h, _e, _sl) in _rec['stage_map'].items():
+            for _i, t in enumerate(_trials or []):
+                hv = mv = bg = float('nan')
+                try:
+                    tm, emg, *_ = get_trial_window(t, pre_ms, post_ms, ms_per_sample=ms_ps,
+                                                   record_samples=rec_s)
+                    bg = compute_peri_stim_bg(t, sr)
+                    if not np.isnan(bg):
+                        hmask = (tm >= h_start_ms) & (tm <= h_end_ms)
+                        mmask = (tm >= m_start_ms) & (tm <= m_end_ms)
+                        if hmask.any():
+                            hv = float(np.mean(np.abs(emg[hmask]))) - bg
+                        if mmask.any():
+                            mv = float(np.mean(np.abs(emg[mmask]))) - bg
+                except Exception:
+                    pass
+                row = {'recording': _rl, 'stage': _sl, 'stage_key': _sk,
+                       'trial': int(getattr(t, 'session_trial_index', _i)) + 1,
+                       'included': all_recordings is None or id(t) in kept,
+                       'h_size_uv': hv, 'm_size_uv': mv, 'bg_mra_uv': bg,
+                       'hm_ratio': hv / mv if mv > 0 else float('nan')}
+                for k, v in vars(t).items():
+                    if isinstance(v, _scalar) and k != 'session_trial_index':
+                        row[('app_' + k) if k in row else k] = v.item() if isinstance(v, np.generic) else v
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def collect_notebook_config(namespace: dict) -> dict:
+    """The UPPER_CASE settings in a notebook namespace (pass ``globals()``):
+    windows, RECORDING_DIRS, exclusion / pre-filter / pool settings, … —
+    anything made of plain numbers, strings, lists, tuples, dicts and None."""
+    def _plain(v):
+        if v is None or isinstance(v, (bool, int, float, str)):
+            return True
+        if isinstance(v, (list, tuple, set)):
+            return all(_plain(x) for x in v)
+        if isinstance(v, dict):
+            return all(_plain(k) and _plain(x) for k, x in v.items())
+        return False
+    return {k: v for k, v in namespace.items()
+            if k.isupper() and not k.startswith('_') and _plain(v)}
+
+
+def _strip_recordings(all_recordings: dict, keep_emg: bool) -> dict:
+    """Shallow copies of the recording dicts with each stage's EMG blocks (and
+    the FT files' EMG) replaced by [] unless *keep_emg*. Trial and header
+    objects are shared, so raw and cleaned dicts pickled together store each
+    trial once."""
+    if keep_emg:
+        return all_recordings
+    out = {}
+    for _rl, _rec in all_recordings.items():
+        _new = {**_rec, 'stage_map': {sk: (tr, h, [], lbl)
+                                      for sk, (tr, h, _e, lbl) in _rec['stage_map'].items()}}
+        if _rec.get('ft_files'):
+            _new['ft_files'] = {k: (fh, ft, []) for k, (fh, ft, _fe) in _rec['ft_files'].items()}
+        out[_rl] = _new
+    return out
+
+
+ANALYSIS_PICKLE_FORMAT = 1
+
+
+def save_analysis_pickle(path: str = None, *, config: dict = None,
+                         all_recordings_raw: dict = None, all_recordings: dict = None,
+                         include_recordings: bool = True, include_emg_blocks: bool = False,
+                         **objects) -> str:
+    """Save an analysis snapshot that :func:`load_analysis_pickle` can restore.
+
+    Stores *config* (see :func:`collect_notebook_config`), every keyword in
+    *objects* (DataFrames, caches, …) and, with *include_recordings*, the loaded
+    recordings — raw and cleaned — so a notebook can rebuild every viewer
+    without reading the binaries. Raw continuous EMG blocks are left out unless
+    *include_emg_blocks* (they're most of a recording's size); without them the
+    BG-EMG monitoring window, filtering viewer and session-filter features have
+    no data, but trial_data already holds the OFFLINE reconstruction.
+
+    Unpickling needs ``helpers`` importable (the trial and header classes).
+    *path* None → ``h_reflex_analysis_<timestamp>.pkl`` in the working
+    directory. Written to ``<path>.part`` then renamed. Returns the path.
+    """
+    import pickle
+    import platform
+    from datetime import datetime as _dt
+    path = path or f'h_reflex_analysis_{_dt.now():%Y%m%d_%H%M%S}.pkl'
+    bundle = {
+        'format': ANALYSIS_PICKLE_FORMAT,
+        'meta': {'saved_at': _dt.now().isoformat(timespec='seconds'),
+                 'python': platform.python_version(), 'pandas': pd.__version__,
+                 'numpy': np.__version__, 'cwd': os.getcwd(),
+                 'include_emg_blocks': include_emg_blocks},
+        'config': dict(config or {}),
+        **objects,
+    }
+    if include_recordings:
+        bundle['recordings_raw'] = (None if all_recordings_raw is None
+                                    else _strip_recordings(all_recordings_raw, include_emg_blocks))
+        bundle['recordings'] = (None if all_recordings is None
+                                else _strip_recordings(all_recordings, include_emg_blocks))
+    _part = path + '.part'
+    try:
+        with open(_part, 'wb') as f:
+            pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(_part, path)
+    except BaseException:
+        if os.path.isfile(_part):
+            os.remove(_part)
+        raise
+    print(f'Saved {os.path.getsize(path) / 1e6:.1f} MB → {path}')
+    print(f'  contents: {[k for k in bundle if bundle[k] is not None]}')
+    return path
+
+
+def load_analysis_pickle(path: str, config_now: dict = None) -> dict:
+    """Load a :func:`save_analysis_pickle` file and return its dict.
+
+    FT ``ft_files`` dicts are re-keyed by the new ``id(header)`` (ids change on
+    unpickling). With *config_now* (e.g. ``collect_notebook_config(globals())``)
+    prints every saved setting that differs from it, so you can see whether
+    re-running the analysis would match the snapshot.
+    """
+    import pickle
+    with open(path, 'rb') as f:
+        bundle = pickle.load(f)
+    if not isinstance(bundle, dict) or 'format' not in bundle:
+        # Pickles from the old notebook-cell save_analysis_pickle: frames only.
+        bundle = {'format': 0, 'meta': {}, 'config': {}, **(bundle if isinstance(bundle, dict) else {})}
+    for key in ('recordings_raw', 'recordings'):
+        for _rec in (bundle.get(key) or {}).values():
+            if _rec.get('ft_files'):
+                _rec['ft_files'] = {id(v[0]): v for v in _rec['ft_files'].values()}
+    meta = bundle.get('meta', {})
+    print(f"Loaded {path}  (format {bundle['format']}, saved {meta.get('saved_at', '?')})")
+    print(f"  contents: {[k for k in bundle if k not in ('format', 'meta') and bundle[k] is not None]}")
+    if bundle.get('recordings_raw'):
+        print(f"  recordings: {list(bundle['recordings_raw'])}"
+              + ('' if meta.get('include_emg_blocks') else '  (no raw EMG blocks)'))
+    if config_now is not None:
+        diff_analysis_config(bundle.get('config', {}), config_now)
+    return bundle
+
+
+def merge_recording_sets(*sets) -> tuple:
+    """Join several (all_recordings, recording_dirs) pairs — e.g. recordings
+    restored from analysis pickles plus ones freshly loaded from RECORDING_DIRS
+    — into one all_recordings dict and one RECORDING_DIRS list, in the order
+    given. Raises on a duplicate label (rename it in RECORDING_DIRS)."""
+    merged, dirs = {}, []
+    for recs, rdirs in sets:
+        dup = sorted(set(recs) & set(merged))
+        if dup:
+            raise ValueError(f'recording label(s) {dup} appear twice — give one of them a '
+                             f'different label in RECORDING_DIRS')
+        merged.update(recs)
+        known = {d[0] for d in rdirs}
+        dirs += [d for d in rdirs if d[0] in recs] + [
+            (l, '', r['sample_rate']) for l, r in recs.items() if l not in known]
+    return merged, dirs
+
+
+def diff_analysis_config(saved: dict, now: dict) -> list:
+    """Print and return the settings present in both *saved* and *now* whose
+    values differ (a saved snapshot vs ``collect_notebook_config(globals())``)."""
+    diff = sorted(k for k in saved if k in now and saved[k] != now[k])
+    for k in diff:
+        print(f'  config differs: {k}  saved={saved[k]!r}  now={now[k]!r}')
+    if saved and not diff:
+        print('  config: every saved setting matches the current one')
+    return diff
 
 
 def make_ft_viewer(all_recordings: dict,
@@ -18671,7 +19215,7 @@ def plot_ft_trial_average(trials, header,
             cb.set_ticklabels(['1', str(n_pulses)])
 
     n_used = len(sel)
-    ax.set_xlabel('Time from pulse onset (ms)', fontsize=11)
+    ax.set_xlabel('Time (ms)', fontsize=11)
     ax.set_ylabel('EMG (µV)', fontsize=11)
     if y_min is not None and y_max is not None:
         ax.set_ylim(y_min, y_max)
@@ -18681,7 +19225,7 @@ def plot_ft_trial_average(trials, header,
 
     if stim_ax is not None:
         _shade(stim_ax)
-        stim_ax.set_xlabel('Time from pulse onset (ms)', fontsize=9)
+        stim_ax.set_xlabel('Time (ms)', fontsize=9)
         stim_ax.set_ylabel('Stim ADC (V)', fontsize=9)
         stim_ax.tick_params(labelsize=8)
         stim_ax.spines['top'].set_visible(False)
@@ -20035,55 +20579,377 @@ def convert_conditioning_to_hrs2(source_path: str, output_path: str = None,
                 sample_rate=hdr.sample_rate)
 
 
-def combine_hrs2_recordings(source_paths: list, output_path: str) -> dict:
-    """Concatenate several .hrs1/.hrs2 files of the same stage into one file.
+_UNIX_MS_LO, _UNIX_MS_HI = 5e11, 3e12   # wall-clock Unix-ms range (~1985–2065)
 
-    Byte-level: the first file is copied whole, then each later file is
-    appended from the end of its header (all its trial + EMG blocks). Nothing
-    is decoded and re-encoded, so fv>=15 Control Mode trials keep their
-    undocumented tail, which :func:`write_hrs2` (fv<=14) can't reproduce.
-    The output header is the first file's; later headers are dropped.
 
-    All sources must share file_version, stage type (MH Recruitment vs Control
-    Mode) and filtering_protocol. The output is written to ``<output>.part``
-    and renamed when complete. The first source's ``.settings.json`` sidecar
-    is copied next to the output.
+def _emg_signature_offset(peek: bytes, max_prefix: int):
+    """Offset (0, 4, … max_prefix) in *peek* — the bytes right after an int32
+    ``1`` block_id — where the EMG block's three ascending Unix-ms timestamps
+    start, or None. V3 files may put int32 metadata before them (max_prefix=32);
+    .hrs1/2/3 never do (max_prefix=0). Same test as the readers."""
+    for off in range(0, max_prefix + 1, 4):
+        if off + 24 > len(peek):
+            break
+        t0, t1, t2 = struct.unpack_from('<QQQ', peek, off)
+        if (_UNIX_MS_LO < t0 < _UNIX_MS_HI and t1 >= t0 and t2 >= t1
+                and t2 < _UNIX_MS_HI and (t2 - t0) < 3_600_000):
+            return off
+    return None
 
-    Returns dict(output, n_bytes, sources=[dict(path, file_version,
-    subject_id, session_start_time, header_bytes)]).
+
+def _skip_emg_data_block(fid: BinaryIO) -> None:
+    """Step over one EMG data block (*fid* after its block_id and any prefix)
+    without decoding it. Layout as in :func:`_read_emg_data_block`."""
+    fid.seek(24, 1)
+    for _ in range(hrs_read_val(fid, 'uint8')):
+        n = hrs_read_val(fid, 'int32')
+        if n < 0:
+            raise ValueError('negative string length')
+        fid.seek(n, 1)
+    # raw channels, then diff, filtered, abs_val
+    for _ in range(hrs_read_val(fid, 'uint8') + 3):
+        n = hrs_read_val(fid, 'int32')
+        if n < 0:
+            raise ValueError('negative array length')
+        fid.seek(4 * n, 1)
+
+
+def _find_next_block_start(fid: BinaryIO, start: int, file_size: int,
+                           trial_ids: tuple, max_prefix: int) -> int:
+    """First offset >= *start* that begins a recognisable block: an EMG block
+    (int32 1 + timestamp signature) or a trial block (trial block_id + a
+    plausible start_time, MATLAB datenum or Unix ms). *file_size* if none.
+    Used to step past trial tails the readers can't decode (fv>=15 Control
+    Mode) and other unknown bytes, the same way the readers resync."""
+    CHUNK, OVERLAP = 8 * 1024 * 1024, 64
+    pos = start
+    while pos < file_size:
+        fid.seek(pos)
+        data = fid.read(CHUNK + OVERLAP)
+        if len(data) < 12:
+            break
+        arr = np.frombuffer(data, dtype=np.uint8)
+        b0 = arr[:-11]
+        zero3 = (arr[1:-10] == 0) & (arr[2:-9] == 0) & (arr[3:-8] == 0)
+        mask = zero3 & ((b0 == BLOCK_EMG_DATA) | np.isin(b0, trial_ids))
+        for i in np.flatnonzero(mask).tolist():
+            if i >= CHUNK and len(data) > CHUNK:
+                break   # left for the next chunk (overlap)
+            if data[i] == BLOCK_EMG_DATA:
+                if _emg_signature_offset(data[i + 4:i + 4 + max_prefix + 24],
+                                         max_prefix) is not None:
+                    return pos + i
+            else:
+                f64 = struct.unpack_from('<d', data, i + 4)[0]
+                u64 = struct.unpack_from('<Q', data, i + 4)[0]
+                if 700000.0 < f64 < 800000.0 or _UNIX_MS_LO < u64 < _UNIX_MS_HI:
+                    return pos + i
+        pos += CHUNK
+    return file_size
+
+
+def index_hrs_trial_blocks(filepath: str) -> dict:
+    """Walk an .hrs1–.hrs6 file block by block and record each trial block's
+    byte span, without decoding EMG blocks (they're stepped over).
+
+    Block handling mirrors the readers: the .hrs1/2/3 block_id=1 MH-trial app
+    bug, the V3 EMG metadata prefix and checkpoint blocks, and the fv>=15
+    Control Mode trial tail (resynced onto the next block, like read_hrs2's
+    pre-scan). A trial's span runs from its block_id to the next block, so it
+    includes any undecoded tail. A truncated final block (recording closed
+    mid-write) is left out of ``data_end``.
+
+    Returns dict(path, ext, header, is_mh, header_bytes, trial_spans=[(start,
+    end)], trial_start_times, data_end, file_size).
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    file_size = os.path.getsize(filepath)
+    with open(filepath, 'rb', buffering=1024 * 1024) as fid:
+        is_mh, always_resync, v3 = None, False, ext in _V3_STAGE_LAYOUT
+        if ext in ('.hrs1', '.hrs2'):
+            header, is_mh = _read_hrs2_header(fid)
+            trial_ids = (BLOCK_MH_TRIAL, BLOCK_CONTROL_MODE_TRIAL)
+            fv = header.file_version
+            read_trial = lambda bid: _read_mh_trial_block(
+                fid, fv, BLOCK_MH_TRIAL if bid == BLOCK_EMG_DATA else bid)
+            always_resync = (not is_mh) and fv >= 15
+        elif ext == '.hrs3':
+            header = MhRecHeader()
+            _read_hrs3_header(fid, header)
+            trial_ids = (BLOCK_MH_TRIAL, BLOCK_DCP_TRIAL)
+            read_trial = lambda bid: _read_dcp_trial_block(fid, header.file_version)
+        elif v3:
+            header = MhRecHeader()
+            _bid, _fn, _gates = _V3_STAGE_LAYOUT[ext]
+            _read_v3_header(fid, header, **_gates)
+            trial_ids = (_bid,)
+            read_trial = lambda bid: _fn(fid, header.file_version)
+        else:
+            raise ValueError(f'unsupported extension {ext!r}; supported: '
+                             f"['.hrs1', '.hrs2', '.hrs3'] + {list(_V3_STAGE_LAYOUT)}")
+        max_prefix = 32 if v3 else 0
+        header_bytes = data_end = fid.tell()
+        spans, start_times = [], []
+        _decode_errors = (struct.error, EOFError, ValueError, MemoryError,
+                          OverflowError, UnicodeDecodeError)
+        while True:
+            pos = fid.tell()
+            raw = fid.read(4)
+            if len(raw) < 4:
+                break
+            bid = struct.unpack('<i', raw)[0]
+            try:
+                is_trial = bid in trial_ids
+                if bid == BLOCK_EMG_DATA:
+                    peek = fid.read(max_prefix + 24)
+                    fid.seek(pos + 4)
+                    if len(peek) < 24:
+                        break
+                    off = _emg_signature_offset(peek, max_prefix)
+                    if not v3 and struct.unpack_from('<d', peek)[0] > 1.0:
+                        is_trial = True         # MH trial written with block_id=1
+                    elif off is not None:
+                        fid.seek(off, 1)
+                        _skip_emg_data_block(fid)
+                    elif v3:
+                        # Checkpoint block: resume at the next trial block_id
+                        # found within 128 bytes, as _make_v3_block_loop does.
+                        ckpt = fid.read(128)
+                        fid.seek(pos + 4)
+                        for soff in range(4, len(ckpt) - 3, 4):
+                            if struct.unpack_from('<i', ckpt, soff)[0] == trial_ids[0]:
+                                fid.seek(pos + 4 + soff)
+                                break
+                        else:
+                            is_trial = True
+                    else:
+                        is_trial = True
+                elif not is_trial:
+                    # Unknown bytes: resync. Right after a trial they're its
+                    # undecoded tail, so they go with that trial's span.
+                    nxt = _find_next_block_start(fid, pos + 1, file_size,
+                                                 trial_ids, max_prefix)
+                    print(f'[index_hrs_trial_blocks] {os.path.basename(filepath)}: '
+                          f'unknown block_id={bid} at {pos}, resynced to {nxt}')
+                    if nxt >= file_size:
+                        break
+                    if spans and spans[-1][1] == pos:
+                        spans[-1] = (spans[-1][0], nxt)
+                    fid.seek(nxt)
+                if is_trial:
+                    t = read_trial(bid)
+                    end = fid.tell()
+                    if end > file_size:
+                        break
+                    if always_resync:
+                        end = _find_next_block_start(fid, end, file_size,
+                                                     trial_ids, max_prefix)
+                        fid.seek(end)
+                    spans.append((pos, end))
+                    start_times.append(t.start_time)
+            except _decode_errors:
+                break
+            if fid.tell() > file_size:
+                break
+            data_end = fid.tell()
+    return dict(path=filepath, ext=ext, header=header, is_mh=is_mh,
+                header_bytes=header_bytes, trial_spans=spans,
+                trial_start_times=start_times, data_end=data_end,
+                file_size=file_size)
+
+
+def _parse_trial_selection(spec, n: int) -> list:
+    """0-based kept-trial indices for one source of :func:`select_combine_trials`
+    'manual' mode. *spec*: None / 'all'; a (start, end) pair of floats in [0, 1]
+    = that fraction of the session (``(0.0, 0.5)`` = first half); or 1-based
+    inclusive trial numbers / (first, last) ranges, as in Section 7 —
+    ``[(1, 150), 200, (210, 260)]`` (a bare ``(1, 150)`` is one range)."""
+    if spec is None or (isinstance(spec, str) and spec.lower() == 'all'):
+        return list(range(n))
+    if (isinstance(spec, tuple) and len(spec) == 2
+            and all(isinstance(v, (int, float)) for v in spec)
+            and any(isinstance(v, float) for v in spec)):
+        a, b = float(spec[0]), float(spec[1])
+        if not 0.0 <= a < b <= 1.0:
+            raise ValueError(f'fraction range {spec} must satisfy 0 <= start < end <= 1')
+        return list(range(int(round(a * n)), int(round(b * n))))
+    if isinstance(spec, tuple) and len(spec) == 2 and all(isinstance(v, int) for v in spec):
+        spec = [spec]
+    if isinstance(spec, int):
+        spec = [spec]
+    kept = set()
+    for item in spec:
+        if not (isinstance(item, int) or (isinstance(item, tuple) and len(item) == 2
+                                          and all(isinstance(v, int) for v in item))):
+            raise ValueError(f'bad trial selection item {item!r}: use a trial number, '
+                             f'a (first, last) pair of trial numbers, or a fraction '
+                             f'pair with a float such as (0.5, 1.0)')
+        lo, hi = (item, item) if isinstance(item, int) else item
+        if not 1 <= lo <= hi <= n:
+            raise ValueError(f'trial range {item} outside 1..{n} (trial numbers are '
+                             f'1-based; for a fraction of the session write floats, '
+                             f'e.g. (0.0, 1.0))')
+        kept.update(range(lo - 1, hi))
+    return sorted(kept)
+
+
+def _pick_spread(n_total: int, n_keep: int, spacing: str, rng) -> list:
+    """*n_keep* of range(n_total): evenly spaced (first and last included) or
+    a sorted random sample."""
+    if n_keep >= n_total:
+        return list(range(n_total))
+    if n_keep <= 0:
+        return []
+    if spacing == 'even':
+        return np.unique(np.round(np.linspace(0, n_total - 1, n_keep)).astype(int)).tolist()
+    if spacing == 'random':
+        return sorted(rng.choice(n_total, n_keep, replace=False).tolist())
+    raise ValueError(f"spacing must be 'even' or 'random', not {spacing!r}")
+
+
+def select_combine_trials(n_trials: list, method=None, n_target: int = None,
+                          manual: list = None, spacing: str = 'even',
+                          seed: int = None) -> list:
+    """Choose which trials of each source :func:`combine_hrs_recordings` keeps.
+
+    *n_trials*: trial count per source, in order. Returns one sorted list of
+    0-based trial indices per source.
+
+    method
+      None / 'all'  keep everything.
+      'balanced'    every source keeps the same number of trials — the smallest
+                    source's count — spread across its session (*spacing*).
+                    Stops a longer session from dominating pooled statistics
+                    while keeping each session's early→late time course.
+      'count'       *n_target* trials in total, spread over the concatenated
+                    trial order, so each source contributes in proportion to
+                    its length.
+      'manual'      *manual*: one spec per source (see
+                    :func:`_parse_trial_selection`).
+
+    spacing: 'even' (deterministic, every k-th trial) or 'random' (sorted
+    sample without replacement; pass *seed* for a reproducible draw).
+    """
+    rng = np.random.default_rng(seed)
+    if method in (None, 'all'):
+        return [list(range(n)) for n in n_trials]
+    if method == 'balanced':
+        n_each = min(n_trials)
+        return [_pick_spread(n, n_each, spacing, rng) for n in n_trials]
+    if method == 'count':
+        if n_target is None or n_target < 1:
+            raise ValueError("method='count' needs n_target >= 1")
+        flat = _pick_spread(sum(n_trials), n_target, spacing, rng)
+        bounds = np.cumsum([0] + list(n_trials)).tolist()
+        return [[i - bounds[k] for i in flat if bounds[k] <= i < bounds[k + 1]]
+                for k in range(len(n_trials))]
+    if method == 'manual':
+        if manual is None or len(manual) != len(n_trials):
+            raise ValueError("method='manual' needs one spec per source in manual")
+        return [_parse_trial_selection(s, n) for s, n in zip(manual, n_trials)]
+    raise ValueError(f"method must be None, 'balanced', 'count' or 'manual', not {method!r}")
+
+
+def combine_hrs_recordings(source_paths: list, output_path: str, method=None,
+                           n_target: int = None, manual: list = None,
+                           spacing: str = 'even', seed: int = None,
+                           dry_run: bool = False, keep: list = None,
+                           note: str = None) -> dict:
+    """Concatenate .hrs1–.hrs6 files of the same stage into one file,
+    optionally keeping only some trials (see :func:`select_combine_trials` for
+    *method* / *n_target* / *manual* / *spacing* / *seed*). One source is
+    allowed, to downsample a single recording.
+
+    Byte-level: the first file's header is kept, then every source's blocks are
+    copied in order. Nothing is decoded and re-encoded, so fv>=15 Control Mode
+    trials keep their undocumented tail, which :func:`write_hrs2` (fv<=14)
+    can't reproduce. A dropped trial loses only its trial block: all EMG data
+    blocks are kept, so the continuous EMG stream (OFFLINE reconstruction,
+    background EMG) is unchanged for the trials that remain. A source's
+    truncated final block is not copied.
+
+    All sources must share extension, file_version, stage type and
+    filtering_protocol. The output is written to ``<output>.part`` and renamed
+    when complete. The first source's ``.settings.json`` sidecar is copied next
+    to the output, and ``<output>.combine.json`` records the sources and the
+    1-based trial numbers kept from each. *dry_run* = True only indexes and
+    selects. *keep* (one sorted list of 0-based trial indices per source)
+    overrides the selection arguments; *note* is stored in the .combine.json.
+
+    Returns dict(output, n_bytes, n_trials, n_kept, method, sources=[dict(path,
+    file_version, subject_id, session_start_time, header_bytes, n_trials,
+    n_kept, kept_trial_nums, truncated_bytes)]).
     """
     import shutil
-    if len(source_paths) < 2:
-        raise ValueError('need at least 2 source files')
+    if not source_paths:
+        raise ValueError('need at least 1 source file')
     _abs_out = os.path.abspath(output_path)
     if any(os.path.abspath(p) == _abs_out for p in source_paths):
         raise ValueError('output_path is one of the source files')
+    exts = {os.path.splitext(p)[1].lower() for p in source_paths}
+    out_ext = os.path.splitext(output_path)[1].lower()
+    if len(exts) > 1 or out_ext not in exts:
+        raise ValueError(f'source and output extensions must all match: '
+                         f'sources {sorted(exts)}, output {out_ext!r}')
 
-    info = []
-    for p in source_paths:
-        with open(p, 'rb') as fid:
-            hdr, is_mh = _read_hrs2_header(fid)
-            info.append(dict(path=p, file_version=hdr.file_version, is_mh=is_mh,
-                             filtering_protocol=hdr.filtering_protocol,
-                             subject_id=hdr.subject_id,
-                             session_start_time=hdr.session_start_time,
-                             header_bytes=fid.tell()))
-    for key in ('file_version', 'is_mh', 'filtering_protocol'):
-        vals = {i[key] for i in info}
+    idx = [index_hrs_trial_blocks(p) for p in source_paths]
+    for key, get in (('file_version', lambda i: i['header'].file_version),
+                     ('stage type', lambda i: i['is_mh']),
+                     ('filtering_protocol', lambda i: i['header'].filtering_protocol)):
+        vals = {get(i) for i in idx}
         if len(vals) > 1:
             raise ValueError(f'sources differ in {key}: '
-                             + ', '.join(f"{os.path.basename(i['path'])}={i[key]!r}"
-                                         for i in info))
+                             + ', '.join(f"{os.path.basename(i['path'])}={get(i)!r}"
+                                         for i in idx))
+
+    if keep is None:
+        keep = select_combine_trials([len(i['trial_spans']) for i in idx], method=method,
+                                     n_target=n_target, manual=manual, spacing=spacing,
+                                     seed=seed)
+    elif len(keep) != len(idx):
+        raise ValueError('keep needs one index list per source')
+    sources = [dict(path=i['path'], file_version=i['header'].file_version,
+                    subject_id=i['header'].subject_id,
+                    session_start_time=i['header'].session_start_time,
+                    header_bytes=i['header_bytes'], n_trials=len(i['trial_spans']),
+                    n_kept=len(k), kept_trial_nums=[j + 1 for j in k],
+                    truncated_bytes=i['file_size'] - i['data_end'])
+               for i, k in zip(idx, keep)]
+    result = dict(output=output_path, n_bytes=0,
+                  n_trials=sum(s['n_trials'] for s in sources),
+                  n_kept=sum(s['n_kept'] for s in sources),
+                  method=method, sources=sources)
+    if dry_run:
+        return result
+
+    # Byte ranges to copy per source: everything up to data_end except dropped
+    # trial spans.
+    ranges = []
+    for k, (i, kept) in enumerate(zip(idx, keep)):
+        cur = 0 if k == 0 else i['header_bytes']
+        kept, rk = set(kept), []
+        for j, (s, e) in enumerate(i['trial_spans']):
+            if j not in kept:
+                rk.append((cur, s))
+                cur = e
+        rk.append((cur, i['data_end']))
+        ranges.append(rk)
 
     _part = output_path + '.part'
     _buf = 64 * 1024 * 1024
     try:
         with open(_part, 'wb') as out:
-            for k, i in enumerate(info):
-                with open(i['path'], 'rb') as src:
-                    if k > 0:
-                        src.seek(i['header_bytes'])
-                    shutil.copyfileobj(src, out, _buf)
+            for path, rk in zip(source_paths, ranges):
+                with open(path, 'rb') as src:
+                    for s, e in rk:
+                        src.seek(s)
+                        left = e - s
+                        while left > 0:
+                            chunk = src.read(min(_buf, left))
+                            if not chunk:
+                                raise EOFError(f'{path} ended early at {src.tell()}')
+                            out.write(chunk)
+                            left -= len(chunk)
         os.replace(_part, output_path)
     except BaseException:
         if os.path.isfile(_part):
@@ -20093,6 +20959,87 @@ def combine_hrs2_recordings(source_paths: list, output_path: str) -> dict:
     _sidecar = source_paths[0] + '.settings.json'
     if os.path.isfile(_sidecar):
         shutil.copy2(_sidecar, output_path + '.settings.json')
-    for i in info:
-        del i['is_mh'], i['filtering_protocol']
-    return dict(output=output_path, n_bytes=os.path.getsize(output_path), sources=info)
+    with open(output_path + '.combine.json', 'w', encoding='utf-8') as f:
+        json.dump(dict(note=note, method=method, n_target=n_target, spacing=spacing, seed=seed,
+                       manual=None if manual is None else [repr(m) for m in manual],
+                       sources=[dict(s, session_start_time=str(s['session_start_time']))
+                                for s in sources]), f, indent=1)
+    result['n_bytes'] = os.path.getsize(output_path)
+    return result
+
+
+def write_hrs_excluding_bins(rec: dict, stage_key: str, binned_trials: dict,
+                             bin_labels: list, exclude_bins: list, output_path: str,
+                             keep_unbinned: bool = True, dry_run: bool = False) -> dict:
+    """Write a copy of a stage's source file without the trials in some bins.
+
+    *rec* is one ``load_all_recordings()`` entry (``_all_recordings[label]``),
+    *stage_key* its stage_map key; *binned_trials* / *bin_labels* come from
+    :func:`compute_trial_bins` and *exclude_bins* lists 1-based bin numbers
+    (``[8]`` drops "Bin 8"), pooled over every polarity.
+
+    keep_unbinned=True writes every trial of the file except those in the
+    excluded bins — so trials that were never binned (failed-trial exclusion,
+    FILTER_* subsets, metric NaN / outside every range) stay in. False keeps
+    only the trials sitting in the remaining bins.
+
+    Trials map back to the file through ``trial.session_trial_index`` (set by
+    load_all_recordings) and are checked against the file's own trial start
+    times. Written byte-for-byte by :func:`combine_hrs_recordings`, so every
+    kept trial and every EMG block is unchanged. Returns its result dict plus
+    ``excluded_trial_nums`` (1-based).
+    """
+    path = (rec.get('stage_paths') or {}).get(stage_key)
+    if not path:
+        raise ValueError(f'no source file recorded for stage {stage_key!r} — re-run '
+                         f'load_all_recordings with the current helpers.py '
+                         f'(stages with a path: {list(rec.get("stage_paths") or {})})')
+    n_bins = len(bin_labels)
+    bad = [b for b in exclude_bins if not 1 <= b <= n_bins]
+    if bad:
+        raise ValueError(f'bin numbers {bad} outside 1..{n_bins}')
+
+    def _trials_in(bin_nums):
+        lbls = {bin_labels[b - 1] for b in bin_nums}
+        return [t for bins in binned_trials.values() for lbl, trs in bins.items()
+                if lbl in lbls for t in trs]
+
+    def _file_idx(trials):
+        out = set()
+        for t in trials:
+            i = getattr(t, 'session_trial_index', None)
+            if i is None:
+                raise ValueError('trial has no session_trial_index — re-run load_all_recordings')
+            out.add(int(i))
+        return out
+
+    ix = index_hrs_trial_blocks(path)
+    n_file = len(ix['trial_spans'])
+    drop = _file_idx(_trials_in(exclude_bins))
+    if keep_unbinned:
+        kept = [i for i in range(n_file) if i not in drop]
+    else:
+        others = [b for b in range(1, n_bins + 1) if b not in exclude_bins]
+        kept = sorted(_file_idx(_trials_in(others)) - drop)
+
+    # Every binned trial must be the file's trial at that position.
+    check = _trials_in(range(1, n_bins + 1))
+    wrong = [int(t.session_trial_index) + 1 for t in check
+             if not (int(t.session_trial_index) < n_file and
+                     ix['trial_start_times'][int(t.session_trial_index)] == t.start_time)]
+    if wrong:
+        raise ValueError(f'{len(wrong)} binned trial(s) do not match {os.path.basename(path)} '
+                         f'(e.g. trial #{wrong[:5]}) — was the file changed after loading?')
+
+    excluded_nums = sorted(i + 1 for i in drop)
+    note = (f'excluded bins {sorted(exclude_bins)} '
+            f'({", ".join(bin_labels[b - 1] for b in sorted(exclude_bins))}); '
+            f'keep_unbinned={keep_unbinned}; excluded trial #s {excluded_nums}')
+    r = combine_hrs_recordings([path], output_path, keep=[kept], note=note,
+                               method='exclude_bins', dry_run=dry_run)
+    r['excluded_trial_nums'] = excluded_nums
+    return r
+
+
+# Old name, from when only .hrs1/.hrs2 could be combined.
+combine_hrs2_recordings = combine_hrs_recordings
