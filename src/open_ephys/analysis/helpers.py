@@ -5236,13 +5236,14 @@ def plot_h_wave_reward_timeline(sessions, source: str = 'in_session',
                                 h_start_ms: float = 6.0, h_end_ms: float = 10.0,
                                 pre_ms: float = 15.0, post_ms: float = 20.0,
                                 skip_first_n: int = 100, poster: bool = True,
-                                save_path: str = None):
+                                save_path: str = None, compact: bool = False):
     """H-wave size vs trial number for conditioning stages, with rewarded trials
     in red and the app's success threshold as a solid green step line
     (matplotlib, same style as :func:`plot_mwave_stabilization_groups`).
 
     poster : True (default) → large bold text and markers for a poster; False →
         the normal notebook sizes used by the other matplotlib plots.
+    compact : True → figure height × ``_COMPACT_HEIGHT_SCALE`` (width kept).
     save_path : optional file path (e.g. ``'h_reward.png'`` / ``.pdf`` / ``.svg``)
         — saved at 300 dpi.
 
@@ -5356,12 +5357,14 @@ def plot_h_wave_reward_timeline(sessions, source: str = 'in_session',
     # Same visual vocabulary as plot_mwave_stabilization_groups (grey / red dots,
     # dashed y grid, no top/right spines); poster=True scales it up and bolds it.
     if poster:
-        _fs = dict(title=22, sub=17, label=20, tick=16, legend=16, sess=16)
-        _ms_g, _ms_r, _lw_thr, _lw_ax, _fig = 30, 42, 3.5, 2.0, (16, 7.5)
+        _fs = dict(title=32, sub=28, label=34, tick=30, legend=32, sess=26)
+        _ms_g, _ms_r, _lw_thr, _lw_ax, _fig = 40, 56, 4.5, 2.8, (16, 9.5)
     else:
         _fs = dict(title=11, sub=9, label=10, tick=9, legend=8, sess=9)
         _ms_g, _ms_r, _lw_thr, _lw_ax, _fig = 12, 16, 1.8, 0.8, (11, 4.8)
     _w = 'bold' if poster else 'normal'
+    if compact:
+        _fig = (_fig[0], _fig[1] * _COMPACT_HEIGHT_SCALE)
 
     fig, ax = plt.subplots(figsize=_fig)
     ax.scatter(gx, gy, color='#9e9e9e', s=_ms_g, alpha=0.65, edgecolors='none',
@@ -5381,21 +5384,22 @@ def plot_h_wave_reward_timeline(sessions, source: str = 'in_session',
                     ha='center', va='top', fontsize=_fs['sess'], fontweight=_w, zorder=7,
                     bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='none', alpha=0.85))
 
-    src_lbl = ('in-session' if source != 'offline'
-               else f'offline, {h_start_ms}–{h_end_ms} ms')
+    # y label stacked on two lines so the larger text fits; in-session (the
+    # default) gets no source tag, offline notes its window on a 3rd line.
+    src_lbl = '' if source != 'offline' else f'\n[offline, {h_start_ms}–{h_end_ms} ms]'
     subj = getattr(sessions[0][2], 'subject_id', '')
     n_tot = sum(s['n'] for s in summary)
     n_rew = sum(s['n_rewarded'] for s in summary)
     _sess_lbl = summary[0]['session'] if not _multi else f'{len(summary)} sessions'
-    _sub = (f'{n_tot} trials  ·  {n_rew} {reward_kind} ({100 * n_rew / max(n_tot, 1):.1f}%)'
-            + (f'  ·  trials 1–{skip_first_n} excluded' if n_skipped_total else ''))
+    _sub = f'{n_tot} trials  ·  {n_rew} {reward_kind} ({100 * n_rew / max(n_tot, 1):.1f}%)'
     ax.set_title(f'H-wave Size per Trial — {subj}  ·  {_sess_lbl}',
-                 fontsize=_fs['title'], fontweight=_w, pad=26 if poster else 18)
+                 fontsize=_fs['title'], fontweight=_w, pad=46 if poster else 18)
     fig.text(0.5, 1.0, _sub, transform=ax.transAxes, ha='center', va='bottom',
              fontsize=_fs['sub'], fontweight=_w, color='#333')
     ax.set_xlabel('Trial number' + (' (sessions concatenated)' if _multi else ''),
                   fontsize=_fs['label'], fontweight=_w)
-    ax.set_ylabel(f'H-wave Size (µV)  [{src_lbl}]', fontsize=_fs['label'], fontweight=_w)
+    ax.set_ylabel(f'H-wave\nSize (µV){src_lbl}', fontsize=_fs['label'], fontweight=_w,
+                  linespacing=1.1)
     ax.tick_params(labelsize=_fs['tick'], width=_lw_ax, length=6 if poster else 3.5)
     for _tl in ax.get_xticklabels() + ax.get_yticklabels():
         _tl.set_fontweight(_w)
@@ -5404,10 +5408,18 @@ def plot_h_wave_reward_timeline(sessions, source: str = 'in_session',
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.grid(axis='y', alpha=0.3, ls='--')
-    _leg = ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.13 if poster else -0.15),
-                     ncol=3, frameon=False, markerscale=1.6 if poster else 1.2,
-                     prop={'size': _fs['legend'], 'weight': _w})
-    plt.tight_layout()
+    # Legend centered along the bottom of the FIGURE (not the axes), then the
+    # axes are laid out in the space above its measured height — so it never
+    # collides with the x label or gets clipped, whatever the font / Compact.
+    _h, _l = ax.get_legend_handles_labels()
+    _leg = fig.legend(_h, _l, loc='lower center', bbox_to_anchor=(0.5, 0.01),
+                      ncol=3, frameon=False, markerscale=2.0 if poster else 1.2,
+                      handlelength=1.8 if poster else 2.0, handletextpad=0.5,
+                      columnspacing=1.6 if poster else 2.0,
+                      prop={'size': _fs['legend'], 'weight': _w})
+    fig.canvas.draw()
+    _leg_h = _leg.get_window_extent().height / fig.bbox.height
+    plt.tight_layout(rect=(0, _leg_h + 0.02, 1, 1))
     if save_path:
         fig.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f'Saved {save_path} (300 dpi)')
@@ -7915,7 +7927,7 @@ def plot_hrs2_analysis(trials, header,
             if _amp_drop.options:
                 _amp_drop.value = _amp_drop.options[0][1]
 
-            fig, axs  = plt.subplots(2, 3, figsize=(_figsize['w'], _figsize['h']))
+            fig, axs  = plt.subplots(2, 3, figsize=(_figsize['w'], _fig_h(_figsize['h'], _dmode)))
             _axs_flat = axs.flatten()
 
             for j in range(n_per_page):
@@ -7939,6 +7951,7 @@ def plot_hrs2_analysis(trials, header,
                 + (f"  [{_pol_lbl}]" if _dual_pol else ""),
                 fontsize=11
             )
+            _enlarge_figure(fig, _dmode)
             plt.tight_layout()
             plt.show()
 
@@ -7963,7 +7976,8 @@ def plot_hrs2_analysis(trials, header,
         d = _vst['amp_data'][amp_idx]
         with _out:
             _out.clear_output(wait=True)
-            fig, ax = plt.subplots(figsize=(_figsize['w'] * 13/15, _figsize['h'] * 5/7))
+            fig, ax = plt.subplots(figsize=(_figsize['w'] * 13/15,
+                                            _fig_h(_figsize['h'] * 5/7, _dmode)))
             _draw_avg_panel(ax, d, small=False)
             _zoom_lbl = (
                 f"Averaged Waveforms (n={d['n']}) | "
@@ -7977,6 +7991,7 @@ def plot_hrs2_analysis(trials, header,
             if _show_bg['val'] and np.isfinite(_blo) and np.isfinite(_bhi):
                 _zoom_lbl += f"\nBG: {_blo:.0f}–{_bhi:.0f} µV"
             ax.set_title(_zoom_lbl, fontsize=12)
+            _enlarge_figure(fig, _dmode)
             plt.tight_layout()
             plt.show()
 
@@ -8150,13 +8165,20 @@ def plot_hrs2_analysis(trials, header,
         VBox([HTML('<b>Figure size:</b>'), _figw_box, _figh_box]),
     ])
 
+    # ── Display mode: Compact / Large text (redraws grid/zoom + the plot below) ──
+    def _on_display_mode():
+        _refresh()
+        for _hook in _pol_change_hooks:
+            _hook(_active_pol['val'])
+    _dmode, _dmode_row = _display_mode_controls(_on_display_mode, 'hrs2_analysis')
+
     _pol_note = (f"  — dual-polarity session: {len(_pol_split[0])} normal, "
                  f"{len(_pol_split[1])} reversed" if _dual_pol else "")
     print(f"Loaded {len(_vst['amp_data'])} {_unit}s across "
           f"{len(_vst['pages'])} page(s){_pol_note}.")
     print("Double-click a subplot to zoom in. Ctrl-click to select multiple signals.")
 
-    display(VBox(_top_rows + [_nav_row, _sig_row, _out]))
+    display(VBox(_top_rows + [_nav_row, _sig_row, _dmode_row, _out]))
     _plot_page(0)
 
     # ---- Trial-group mode: overlay of group averages instead of recruitment curve ----
@@ -8177,7 +8199,7 @@ def plot_hrs2_analysis(trials, header,
                 _n_ax = len(_gd) + 1
                 fig, axes = plt.subplots(
                     _n_ax, 1, sharex=True, sharey=True,
-                    figsize=(_figsize['w'] * 13/15, _figsize['h'] * 0.5 * _n_ax))
+                    figsize=(_figsize['w'] * 13/15, _fig_h(_figsize['h'] * 0.5 * _n_ax, _dmode)))
                 _pl = (f"  [{_pol_labels.get(_active_pol['val'], '')}]" if _dual_pol else "")
                 _blank = {}   # group index → (median rise ms, median fall ms, n spans)
 
@@ -8226,6 +8248,7 @@ def plot_hrs2_analysis(trials, header,
                 ax.set_ylim(*_get_ylim())
                 ax.set_xlabel('Time (ms)')
                 fig.suptitle(f'Trial-group averages — {header.subject_id}{_pl}', fontsize=12)
+                _enlarge_figure(fig, _dmode)
                 plt.tight_layout()
                 plt.show()
                 print('Size = MRA in window − standardized pre-stim BG (same as the panels).')
@@ -8376,6 +8399,7 @@ def plot_hrs2_analysis(trials, header,
             fig.update_xaxes(showgrid=True, gridcolor='rgba(0,0,0,0.08)',
                              rangeslider_visible=(_rc_view['val'] == 'raw'))
             fig.update_yaxes(showgrid=True, gridcolor='rgba(0,0,0,0.08)')
+            _plotly_display_mode(fig, _dmode, 520)
             fig.show()
 
             _h_norm_k    = (_d['h_means'] / M_max_k) * 100
@@ -8778,11 +8802,13 @@ def plot_hrs2_trials(trials, header,
 
             _nv = _n_vns_rows()
             if _nv == 0:
-                fig, axs  = plt.subplots(2, 3, figsize=(_figsize['w'], _figsize['h']))
+                fig, axs  = plt.subplots(2, 3, figsize=(_figsize['w'],
+                                                        _fig_h(_figsize['h'], _dmode_t)))
                 _axs_flat = axs.flatten()
                 _vns_axs  = [[] for _ in range(n_per_page)]
             else:
-                fig = plt.figure(figsize=(_figsize['w'], _figsize['h'] * (1.0 + 0.35 * _nv)))
+                fig = plt.figure(figsize=(_figsize['w'],
+                                          _fig_h(_figsize['h'] * (1.0 + 0.35 * _nv), _dmode_t)))
                 _gs = fig.add_gridspec(2, 3, hspace=0.45, wspace=0.3)
                 _axs_flat, _vns_axs = [], []
                 for j in range(n_per_page):
@@ -8820,6 +8846,7 @@ def plot_hrs2_trials(trials, header,
                 f"  (Page {page_idx+1}/{len(_vst_t['pages'])}){_pol_lbl_t}{_grp_lbl_t}",
                 fontsize=11
             )
+            _enlarge_figure(fig, _dmode_t)
             if _nv == 0:
                 plt.tight_layout()
             plt.show()
@@ -8847,12 +8874,14 @@ def plot_hrs2_trials(trials, header,
             _out.clear_output(wait=True)
             _nv = _n_vns_rows()
             if _nv == 0:
-                fig, ax = plt.subplots(figsize=(_figsize['w'] * 13/15, _figsize['h'] * 5/7))
+                fig, ax = plt.subplots(figsize=(_figsize['w'] * 13/15,
+                                                _fig_h(_figsize['h'] * 5/7, _dmode_t)))
                 _vaxes = []
             else:
                 fig, _axes = plt.subplots(
                     1 + _nv, 1, figsize=(_figsize['w'] * 13/15,
-                                         _figsize['h'] * 5/7 * (1.0 + 0.45 * _nv)),
+                                         _fig_h(_figsize['h'] * 5/7 * (1.0 + 0.45 * _nv),
+                                                _dmode_t)),
                     gridspec_kw={'height_ratios': [3] + [1] * _nv, 'hspace': 0.35})
                 ax, _vaxes = _axes[0], list(_axes[1:])
                 for _va in _vaxes[1:]:
@@ -8868,6 +8897,7 @@ def plot_hrs2_trials(trials, header,
             if _show_bg_t['val'] and np.isfinite(d.get('bg', float('nan'))):
                 _zt_lbl += f"\nBG: {d['bg']:.0f} µV"
             ax.set_title(_zt_lbl, fontsize=12)
+            _enlarge_figure(fig, _dmode_t)
             plt.tight_layout()
             plt.show()
 
@@ -9143,7 +9173,10 @@ def plot_hrs2_trials(trials, header,
     print(f"Stim waveform: {'available' if _has_stim_adc else 'not present in this file'}")
     print("Double-click a subplot to zoom in, or use the dropdown + 'View trial' button.")
 
-    display(VBox(_top_rows_t + [_view_row, _nav_row, _sig_row, _out]))
+    # ── Display mode: Compact / Large text ──────────────────────────────────
+    _dmode_t, _dmode_row_t = _display_mode_controls(_refresh, 'hrs2_trials')
+
+    display(VBox(_top_rows_t + [_view_row, _nav_row, _sig_row, _dmode_row_t, _out]))
     _plot_page(0)
 
 
@@ -14901,8 +14934,8 @@ def filter_trials(hrs2_trials, state, filter_polarity=None, filter_intensities=N
     return result, filtered_state
 
 
-def compute_reward_groups(trials, state):
-    """Group conditioning-stage trials into Rewarded / Not rewarded, per polarity.
+def compute_reward_groups(trials, state, skip_first_n: int = 100):
+    """Group conditioning-stage trials into rewarded / not rewarded, per polarity.
 
     Returns the same tuple shape as :func:`compute_trial_bins`, so the result
     plugs straight into plot_bin_overview / create_bin_viewer / print_bin_statistics:
@@ -14910,14 +14943,33 @@ def compute_reward_groups(trials, state):
     ``groups`` is ``{polarity: {label: [trials]}}``. Reward = ``vns_delivered`` /
     ``pellet_delivered`` as saved by the app (see get_trial_reward); returns
     ``None`` when the trials carry no reward flag (non-conditioning stage).
+    Labels are ``'VNS'`` / ``'No VNS'`` (or ``'Pellet'`` / ``'No pellet'``).
+
+    skip_first_n : session trials 1..skip_first_n are left out of both groups
+        (the app can't deliver a reward until its 100-trial H-wave rolling
+        window is full). Session trial number comes from
+        ``trial.session_trial_index`` (set by :func:`load_all_recordings`,
+        survives failed-trial exclusion), else the trial's position in *trials*
+        — same rule as :func:`plot_mwave_stabilization_groups`. 0 keeps all.
     """
     if not trials or get_trial_reward(trials[0])[1] is None:
         print("No reward flag on these trials (not a conditioning stage).")
         return None
     kind          = get_trial_reward(trials[0])[1]
-    group_labels  = [f'Rewarded ({kind})', 'Not rewarded']
+    # Name the groups after what was delivered: 'VNS' / 'No VNS' or 'Pellet' / 'No pellet'
+    group_labels  = [kind, f'No {kind if kind == "VNS" else kind.lower()}']
     group_colors  = ['crimson', 'grey']
     trial_bg_dict = {id(t): state['trial_bg_gm'][i] for i, t in enumerate(trials)}
+
+    if skip_first_n > 0:
+        _n0    = len(trials)
+        trials = [t for i, t in enumerate(trials)
+                  if getattr(t, 'session_trial_index', i) >= skip_first_n]
+        print(f"Left out {_n0 - len(trials)} trial(s) from session trials 1–{skip_first_n} "
+              f"(before {kind} delivery could start).")
+        if not trials:
+            print(f"No trials after session trial {skip_first_n}.")
+            return None
 
     trials_by_pol = split_trials_by_polarity(trials)
     pol_labels    = list(trials_by_pol.keys())
@@ -15120,11 +15172,12 @@ def plot_bin_overview(
     ov_out        = Output()
 
     # ── View selector ─────────────────────────────────────────────────
-    VIEW_OPTIONS = ['Global', 'Waveforms', 'H-wave', 'M-wave', 'H:M Ratio', 'Stats']
+    VIEW_OPTIONS = ['Global', 'Global 2', 'Waveforms', 'H-wave', 'M-wave', 'H:M Ratio',
+                    'Pre-stim EMG', 'Stim Intensity', 'Stats']
     view_tgl = ToggleButtons(
         options=VIEW_OPTIONS, value='Global',
         button_style='', description='View:',
-        style={'button_width': '90px'},
+        style={'button_width': '105px'},
     )
 
     # ── Legend component checkboxes ───────────────────────────────────
@@ -15161,6 +15214,7 @@ def plot_bin_overview(
                 if isinstance(_a.xaxis.get_major_locator(), FixedLocator):
                     # Bar panels: wrap group names onto lines so neighbors don't collide.
                     _a.set_xticklabels([t.get_text().replace(' (', '\n(').replace('Not ', 'Not\n')
+                                        .replace('No ', 'No\n')
                                         for t in _a.get_xticklabels()])
                 else:
                     _a.xaxis.set_major_locator(MaxNLocator(5))   # fewer, bigger time ticks
@@ -15219,6 +15273,8 @@ def plot_bin_overview(
     m_mra    = {}
     h_mra    = {}
     hm_mra   = {}
+    bg_mra   = {}   # Pre-stim EMG (PERI_STIM_BG window), µV
+    stim_ma  = {}   # stimulation intensity, mA
     ns       = {}
 
     def _collect(pol_lbl):
@@ -15228,9 +15284,9 @@ def plot_bin_overview(
             ns[lbl] = len(trs)
             if not trs:
                 avgs[lbl] = None; stacks_d[lbl] = None
-                m_mra[lbl] = h_mra[lbl] = hm_mra[lbl] = []
+                m_mra[lbl] = h_mra[lbl] = hm_mra[lbl] = bg_mra[lbl] = stim_ma[lbl] = []
                 continue
-            stacks, mv_l, hv_l, hm_l = [], [], [], []
+            stacks, mv_l, hv_l, hm_l, bg_l, st_l = [], [], [], [], [], []
             t_ref = None
             for tr in trs:
                 tm, emg, _, _, _ = get_trial_window(
@@ -15239,6 +15295,8 @@ def plot_bin_overview(
                     t_ref = tm
                 stacks.append(emg[:len(t_ref)])
                 _bg_bo = compute_peri_stim_bg(tr, 1000.0 / ms_per_sample)
+                bg_l.append(float(_bg_bo))    # NaN kept here, dropped when plotted
+                st_l.append(float(getattr(tr, 'stimulation_amplitude_ma', float('nan'))))
                 if np.isnan(_bg_bo): _bg_bo = 0.0
                 mm = (tm >= m_start_ms) & (tm <= m_end_ms)
                 hm = (tm >= h_start_ms) & (tm <= h_end_ms)
@@ -15260,6 +15318,8 @@ def plot_bin_overview(
             m_mra[lbl]  = mv_l
             h_mra[lbl]  = hv_l
             hm_mra[lbl] = hm_l
+            bg_mra[lbl] = bg_l
+            stim_ma[lbl] = st_l
 
     def _draw(pol_lbl, view='Global'):
         with ov_out:
@@ -15273,8 +15333,46 @@ def plot_bin_overview(
             short_lbls = ([f'Bin {bin_labels.index(b) + 1}' for b in present]
                           if bin_ranges is not None else list(present))
 
+            def _bar(ax, val_dict, ylabel, title, fmt='.1f'):
+                mus, sds, vals = [], [], []
+                for xi, (b_lbl, col) in enumerate(zip(present, cols)):
+                    v  = np.array([x for x in val_dict[b_lbl] if np.isfinite(x)])
+                    mu = float(np.mean(v)) if len(v) else 0.0
+                    sd = float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
+                    ax.bar(xi, mu, color=col, alpha=0.78, yerr=sd, capsize=6,
+                           error_kw={'elinewidth': 2, 'ecolor': col, 'capthick': 2})
+                    _trial_dots(ax, xi, v, col)
+                    mus.append(mu); sds.append(sd); vals.append(v)
+                _dot_ylim(ax, vals, [m + s for m, s in zip(mus, sds)], 1.22)
+                if cb_means.value:
+                    for xi, (mu, sd) in enumerate(zip(mus, sds)):
+                        if mu > 0:
+                            ax.text(xi, mu + sd, f'{mu:{fmt}}',
+                                    ha='center', va='bottom', fontsize=8.5,
+                                    fontweight='bold', color='#222222', zorder=6,
+                                    bbox=dict(fc='white', ec='none', alpha=0.75, pad=1))
+                ax.set_xticks(x_pos)
+                ax.set_xticklabels(short_lbls, rotation=0, ha='center', fontsize=9)
+                ax.set_ylabel(ylabel, fontsize=9)
+                ax.set_title(title, fontsize=10, fontweight='bold')
+                ax.grid(True, axis='y', alpha=0.3)
+
+            # ── GLOBAL 2: Pre-stim EMG, M-wave, Stim Intensity, H-wave ─
+            if view == 'Global 2':
+                fig, axes = plt.subplots(1, 4, figsize=(18, _fh(5.5 if cb_large.value else 5)))
+                ax_bg, ax_m, ax_st, ax_h = axes
+                _bar(ax_bg, bg_mra,  'Size (µV)',      'Pre-stim EMG',   fmt='.1f')
+                _bar(ax_m,  m_mra,   'Size (µV)',      'M-wave',         fmt='.1f')
+                _bar(ax_st, stim_ma, 'Intensity (mA)', 'Stim Intensity', fmt='.3f')
+                _bar(ax_h,  h_mra,   'Size (µV)',      'H-wave',         fmt='.1f')
+                plt.suptitle(f'Combined EMG Bin Overview  —  {pol_lbl}  —  '
+                             f'{hrs2_header.subject_id}', fontsize=11)
+                _finish(fig, axes)
+                plt.tight_layout()
+                plt.show()
+
             # ── GLOBAL ─────────────────────────────────────────────────
-            if view == 'Global':
+            elif view == 'Global':
                 fig, axes = plt.subplots(1, 5, figsize=(22, _fh(5.5 if cb_large.value else 5)),
                                          gridspec_kw={'width_ratios': [5, 3, 3, 3, 2.5]})
                 ax_w, ax_h, ax_m, ax_hm, ax_txt = axes
@@ -15291,30 +15389,6 @@ def plot_bin_overview(
                 ax_w.set_title(f'Avg Waveforms — {pol_lbl}')
                 ax_w.legend(fontsize=8, loc='upper right')
                 ax_w.grid(True, alpha=0.3)
-
-                def _bar(ax, val_dict, ylabel, title, fmt='.1f'):
-                    mus, sds, vals = [], [], []
-                    for xi, (b_lbl, col) in enumerate(zip(present, cols)):
-                        v  = np.array([x for x in val_dict[b_lbl] if np.isfinite(x)])
-                        mu = float(np.mean(v)) if len(v) else 0.0
-                        sd = float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
-                        ax.bar(xi, mu, color=col, alpha=0.78, yerr=sd, capsize=6,
-                               error_kw={'elinewidth': 2, 'ecolor': col, 'capthick': 2})
-                        _trial_dots(ax, xi, v, col)
-                        mus.append(mu); sds.append(sd); vals.append(v)
-                    _dot_ylim(ax, vals, [m + s for m, s in zip(mus, sds)], 1.22)
-                    if cb_means.value:
-                        for xi, (mu, sd) in enumerate(zip(mus, sds)):
-                            if mu > 0:
-                                ax.text(xi, mu + sd, f'{mu:{fmt}}',
-                                        ha='center', va='bottom', fontsize=8.5,
-                                        fontweight='bold', color='#222222', zorder=6,
-                                        bbox=dict(fc='white', ec='none', alpha=0.75, pad=1))
-                    ax.set_xticks(x_pos)
-                    ax.set_xticklabels(short_lbls, rotation=0, ha='center', fontsize=9)
-                    ax.set_ylabel(ylabel, fontsize=9)
-                    ax.set_title(title, fontsize=10, fontweight='bold')
-                    ax.grid(True, axis='y', alpha=0.3)
 
                 _bar(ax_h,  h_mra,  'Size (µV)', 'H-wave',    fmt='.1f')
                 _bar(ax_m,  m_mra,  'Size (µV)', 'M-wave',    fmt='.1f')
@@ -15369,10 +15443,13 @@ def plot_bin_overview(
                 plt.show()
 
             # ── BAR CHART ZOOM (M-wave / H-wave / H:M Ratio) ──────────
-            elif view in ('M-wave', 'H-wave', 'H:M Ratio'):
-                val_map  = {'M-wave': m_mra, 'H-wave': h_mra, 'H:M Ratio': hm_mra}
-                ylbl_map = {'M-wave': 'MRA (µV)', 'H-wave': 'MRA (µV)', 'H:M Ratio': 'H:M'}
-                fmt_map  = {'M-wave': '.1f', 'H-wave': '.1f', 'H:M Ratio': '.3f'}
+            elif view in ('M-wave', 'H-wave', 'H:M Ratio', 'Pre-stim EMG', 'Stim Intensity'):
+                val_map  = {'M-wave': m_mra, 'H-wave': h_mra, 'H:M Ratio': hm_mra,
+                            'Pre-stim EMG': bg_mra, 'Stim Intensity': stim_ma}
+                ylbl_map = {'M-wave': 'MRA (µV)', 'H-wave': 'MRA (µV)', 'H:M Ratio': 'H:M',
+                            'Pre-stim EMG': 'MRA (µV)', 'Stim Intensity': 'Intensity (mA)'}
+                fmt_map  = {'M-wave': '.1f', 'H-wave': '.1f', 'H:M Ratio': '.3f',
+                            'Pre-stim EMG': '.1f', 'Stim Intensity': '.3f'}
                 val_dict = val_map[view]
                 fmt      = fmt_map[view]
 
@@ -15408,7 +15485,7 @@ def plot_bin_overview(
                                 bbox=dict(fc='white', ec='none', alpha=0.75, pad=1))
 
                 finite_all = [x for v in all_vals for x in v if np.isfinite(x)]
-                ax_top = max(finite_all + [m + s for m, s in zip(mus, sds)] + [1.0])
+                ax_top = max(finite_all + [m + s for m, s in zip(mus, sds)] + [1e-9])
                 _bottom = min(finite_all + [0.0]) if cb_dots.value else 0.0
                 ax.set_ylim(_bottom * 1.2 if _bottom < 0 else 0, ax_top * 1.2)
                 ax.set_xticks(x_pos)
@@ -15445,7 +15522,9 @@ def plot_bin_overview(
                     stat_lines.append(f'{slbl}   (n={ns[lbl]})')
                     for key, vd in [('H-wave Size (µV)', h_mra),
                                     ('M-wave Size (µV)', m_mra),
-                                    ('H:M Ratio',        hm_mra)]:
+                                    ('H:M Ratio',        hm_mra),
+                                    ('Pre-stim EMG (µV)', bg_mra),
+                                    ('Stim Intensity (mA)', stim_ma)]:
                         v = np.array([x for x in vd[lbl] if np.isfinite(x)])
                         if len(v):
                             mu  = float(np.mean(v))
@@ -16207,6 +16286,101 @@ def _enlarge_axes(ax, k: float = _LARGE_TEXT_SCALE):
     for sp in ax.spines.values():
         sp.set_linewidth(sp.get_linewidth() * k)
     ax.tick_params(width=k, length=3.5 * k)
+
+
+_COMPACT_HEIGHT_SCALE = 0.7     # Compact display: figure height × this (width kept)
+_LARGE_TEXT_MAX_FS    = 30.0    # Large text: cap so already-big titles don't explode
+_DISPLAY_MODE_MEMORY  = {}      # viewer key → {'compact', 'large'}; survives re-renders
+
+
+def _display_mode_controls(on_change, key, compact=None, large_text=None):
+    """'Display: [ ] Compact  [ ] Large text' checkbox row shared by the
+    matplotlib viewers (plot_hrs2_analysis, plot_hrs2_trials).
+
+    Returns ``(state, widget)``: *state* is a dict ``{'compact', 'large'}``
+    read by :func:`_fig_h` / :func:`_enlarge_figure`; *on_change()* is called
+    after either box flips. The last choice per *key* is remembered for the
+    kernel session, so a Recording / Stage switch (which rebuilds the viewer)
+    keeps it; explicit *compact* / *large_text* arguments override that.
+    """
+    from ipywidgets import Checkbox, HBox, HTML
+    st = _DISPLAY_MODE_MEMORY.setdefault(key, {'compact': False, 'large': False})
+    if compact is not None:
+        st['compact'] = bool(compact)
+    if large_text is not None:
+        st['large'] = bool(large_text)
+    cb_c = Checkbox(value=st['compact'], description='Compact', indent=False,
+                    layout={'width': '100px'},
+                    tooltip=f'Figure height × {_COMPACT_HEIGHT_SCALE}')
+    cb_l = Checkbox(value=st['large'], description='Large text', indent=False,
+                    layout={'width': '110px'},
+                    tooltip='Bold, much larger titles / axis labels / ticks / annotations')
+
+    def _mk(k):
+        def _cb(ch):
+            st[k] = bool(ch['new'])
+            on_change()
+        return _cb
+    cb_c.observe(_mk('compact'), names='value')
+    cb_l.observe(_mk('large'), names='value')
+    return st, HBox([HTML('<b style="line-height:32px">Display:</b>&nbsp;'), cb_c, cb_l])
+
+
+def _fig_h(h, st):
+    """Figure height under the Compact display mode."""
+    return h * _COMPACT_HEIGHT_SCALE if st and st.get('compact') else h
+
+
+def _enlarge_figure(fig, st, k: float = _LARGE_TEXT_SCALE, annot_k: float = 1.2):
+    """Large text display mode for every visible axes of *fig* (twin axes
+    included): :func:`_enlarge_axes` (titles, axis labels, ticks, legend bold
+    and *k*× larger; lines thicker), but in-plot annotation boxes (M/H size,
+    Pre-stim EMG, …) only *annot_k*× so neighbors don't collide. A title that
+    is already ≥ 18 pt keeps its size (bold only); every other text is capped
+    at ``_LARGE_TEXT_MAX_FS``. Numeric x axes drop to ~6 ticks so bigger tick labels
+    don't overlap. Bold, larger suptitle. Call after drawing, before
+    tight_layout."""
+    if not (st and st.get('large')):
+        return
+    from matplotlib.ticker import FixedFormatter, MaxNLocator
+    for ax in fig.axes:
+        if not ax.axison:
+            continue
+        _orig_fs = {id(t): t.get_fontsize() for t in [ax.title, ax._left_title, ax._right_title]}
+        _enlarge_axes(ax, k)
+        for t in ax.texts:
+            t.set_fontsize(t.get_fontsize() * annot_k / k)
+        # Numeric x axis (e.g. draw_peristim_decorations' 1-ms ticks) → ~6 ticks;
+        # category axes (bar charts with text tick labels) are left alone.
+        if not isinstance(ax.xaxis.get_major_formatter(), FixedFormatter):
+            ax.xaxis.set_major_locator(MaxNLocator(6))
+        _leg = ax.get_legend()
+        for t in ([ax.title, ax._left_title, ax._right_title, ax.xaxis.label, ax.yaxis.label]
+                  + list(ax.texts) + ax.get_xticklabels() + ax.get_yticklabels()
+                  + (list(_leg.get_texts()) if _leg else [])):
+            _o = _orig_fs.get(id(t), 0.0)     # titles already ≥ 18 pt keep their size
+            _cap = _o if _o >= 18 else _LARGE_TEXT_MAX_FS
+            if t.get_fontsize() > _cap:
+                t.set_fontsize(_cap)
+    if fig._suptitle is not None:
+        fig._suptitle.set_fontsize(min(fig._suptitle.get_fontsize() * k * 1.25,
+                                       _LARGE_TEXT_MAX_FS))
+        fig._suptitle.set_fontweight('bold')
+
+
+def _plotly_display_mode(fig, st, base_height):
+    """Compact / Large text display mode for a Plotly figure."""
+    if st and st.get('compact'):
+        fig.update_layout(height=int(base_height * _COMPACT_HEIGHT_SCALE))
+    if st and st.get('large'):
+        _b = dict(weight='bold')
+        fig.update_layout(font=dict(size=18, **_b), title_font=dict(size=24, **_b),
+                          legend_font=dict(size=18, **_b))
+        fig.update_xaxes(title_font=dict(size=22, **_b), tickfont=dict(size=17, **_b))
+        fig.update_yaxes(title_font=dict(size=22, **_b), tickfont=dict(size=17, **_b))
+        fig.update_annotations(font=dict(size=17, **_b))
+        fig.update_traces(marker_size=11, line_width=3.5, error_y_thickness=2.5,
+                          selector=dict(type='scatter'))
 
 
 def _fmt_compact(v):
