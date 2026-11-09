@@ -4301,7 +4301,10 @@ def make_filtering_viewer(all_recordings, active_rec_label,
                 _layout['yaxis2'] = dict(title='Secondary (V)', overlaying='y',
                                          side='right', showgrid=False)
             fig.update_layout(**_layout)
+            _plotly_display_mode(fig, _filt_dm, 450)
             fig.show()
+
+    _filt_dm, _filt_dm_row = _display_mode_controls(lambda: _render(), 'filtering')
 
     def _on_rec_change(change):
         _session_cache_holder[0] = None
@@ -4336,6 +4339,7 @@ def make_filtering_viewer(all_recordings, active_rec_label,
         HBox([_low_f, _high_f, _order_i]),
         HBox([_notch_c, _notch_freq_f, _notch_q_f]),
         HBox([_offset_f, _overlay_c, _stim_adc_c, _digin_c, _delay_c]),
+        _filt_dm_row,
     ])
     return VBox([controls, _out]), _render
 
@@ -5230,6 +5234,28 @@ def _applied_success_threshold_map(trials) -> dict:
     if all(hasattr(t, 'applied_success_threshold') for t in trials):
         return {id(t): float(t.applied_success_threshold) for t in trials}
     return {id(t): float(v) for t, v in zip(trials, get_applied_success_thresholds(trials))}
+
+
+# Success-threshold line style for the peri-stim viewers (plot_hrs2_trials,
+# plot_hrs2_analysis group overlay). Width is a multiple of the trace width.
+SUCCESS_THR_COLOR    = '#0033cc'
+SUCCESS_THR_LW_SCALE = 3.0
+SUCCESS_THR_DASHES   = (5, 2)       # long dashes (in line-width units)
+
+
+def _draw_success_threshold(ax, y, text, label, lw, fsz):
+    """Emphasized success-threshold line: thick long-dash blue line with a white
+    halo (stays visible over the EMG trace), drawn above the traces, plus a bold
+    boxed value label at the right edge."""
+    import matplotlib.patheffects as _pe
+    _w = lw * SUCCESS_THR_LW_SCALE
+    ax.axhline(y, color=SUCCESS_THR_COLOR, linestyle=(0, SUCCESS_THR_DASHES), linewidth=_w,
+               zorder=6, label=label,
+               path_effects=[_pe.Stroke(linewidth=_w + 2.0, foreground='white'), _pe.Normal()])
+    ax.text(0.995, y, text, color=SUCCESS_THR_COLOR, fontsize=fsz + 1, fontweight='bold',
+            ha='right', va='bottom', zorder=7, transform=ax.get_yaxis_transform(),
+            bbox=dict(boxstyle='round,pad=0.15', facecolor='white', edgecolor=SUCCESS_THR_COLOR,
+                      linewidth=1.0, alpha=0.85))
 
 
 def plot_h_wave_reward_timeline(sessions, source: str = 'in_session',
@@ -7574,6 +7600,16 @@ def plot_hwave_regression(trials, emg_blocks=None,
           f"slope={_sl:.4f}  intercept={_ic:.2f}  R²={_r2:.4f}  p={_p:.4g}")
 
 
+# HRS2 Analysis viewer title sizes (pt) — the stim-amp label above each grid
+# panel, and the title of the zoomed (single-amplitude) view.
+HRS2_PANEL_TITLE_FS = 24
+HRS2_ZOOM_TITLE_FS  = 14
+# Max panel-title width as a multiple of the panel width; a longer title is
+# shrunk to fit. 1.12 uses most of the gap between panels without touching
+# the neighbor's title.
+HRS2_PANEL_TITLE_ROOM = 1.12
+
+
 def plot_hrs2_analysis(trials, header,
                        pre_avg_ms: float = 2.0, post_avg_ms: float = 15.0,
                        n_per_page: int = 6,
@@ -7737,7 +7773,15 @@ def plot_hrs2_analysis(trials, header,
                 _g_amps  = [_t.stimulation_amplitude_ma for _t in _trs]
                 _amp_lo_v, _amp_hi_v = float(min(_g_amps)), float(max(_g_amps))
                 _amp = float(np.mean(_g_amps))
+            # Trial-weighted stim amp mean ± SD from each trial's REAL amplitude
+            # (build_merged_amp_groups overwrites stimulation_amplitude_ma with
+            # the group mean and keeps the original in _orig_amp_ma).
+            _ta = np.array([getattr(_t, '_orig_amp_ma', _t.stimulation_amplitude_ma)
+                            for _t in _trs], dtype=float)
+            _amp_mean_v = float(np.mean(_ta)) if len(_ta) else float(_amp)
+            _amp_sd_v   = float(np.std(_ta, ddof=1)) if len(_ta) >= 2 else 0.0
             _adata.append({
+                'amp_mean': _amp_mean_v, 'amp_sd': _amp_sd_v,
                 'amp': _amp, 't_ref': _t_ref, 'n': len(_wins),
                 'group_label': _grp_lbl,
                 'mean_stim_end': _mse,
@@ -7863,11 +7907,9 @@ def plot_hrs2_analysis(trials, header,
         _thr = d.get('thr_mean', float('nan'))
         if 'thr' in sigs and np.isfinite(_thr):
             _thr_y = _thr + (_pre_emg if np.isfinite(_pre_emg) else 0.0)
-            ax.axhline(_thr_y, color='blue', linestyle='--', linewidth=lw * 1.5, zorder=4,
-                       label=f"Avg success thr {_thr:.1f} µV (n={d['thr_n']}) + BG")
-            ax.text(1.0, _thr_y, f'avg thr {_thr:.1f} µV ', color='blue',
-                    fontsize=fsz - 1, ha='right', va='bottom',
-                    transform=ax.get_yaxis_transform())
+            _draw_success_threshold(
+                ax, _thr_y, f'avg thr {_thr:.1f} µV',
+                f"Avg success thr {_thr:.1f} µV (n={d['thr_n']}) + BG", lw, fsz)
 
         ax.set_ylim(_get_ylim())
         if _ax2 is not None:
@@ -7888,13 +7930,12 @@ def plot_hrs2_analysis(trials, header,
 
     def _amp_label(d, with_bg=False):
         """Build display label for one amplitude group dict."""
+        # Several amplitudes in one group → trial mean ± SD (no lo–hi range).
+        _ams = f"{d['amp_mean']:.3f} ± {d['amp_sd']:.3f} mA"
         if d.get('group_label'):
-            _ar = (f"{d['amp_lo']:.3f} mA" if abs(d['amp_hi'] - d['amp_lo']) < 1e-6
-                   else f"{d['amp_lo']:.3f}–{d['amp_hi']:.3f} mA")
-            lbl = f"{d['group_label']} (n={d['n']})\n{_ar}"
+            lbl = f"{d['group_label']} (n={d['n']})\n{_ams}"
         elif d.get('is_merged'):
-            lbl = (f"{d['amp']:.5f} mA "
-                   f"({d['amp_lo']:.5f}–{d['amp_hi']:.5f}, n={d['n']})")
+            lbl = f"{_ams} (n={d['n']})"
         else:
             lbl = f"{d['amp']:.5f} mA (n={d['n']})"
         if with_bg:
@@ -7936,7 +7977,9 @@ def plot_hrs2_analysis(trials, header,
                     d = page[j]
                     _draw_avg_panel(ax, d, small=True)
                     _grid_lbl = _amp_label(d, _show_bg['val'])
-                    ax.set_title(_grid_lbl, fontsize=18 if '\n' in _grid_lbl else 24)
+                    if _grp_of is None:          # amplitude panels (not named trial groups)
+                        _grid_lbl = 'Stim Amp: ' + _grid_lbl
+                    ax.set_title(_grid_lbl, fontsize=HRS2_PANEL_TITLE_FS, fontweight='bold')
                 else:
                     ax.axis('off')
 
@@ -7953,6 +7996,9 @@ def plot_hrs2_analysis(trials, header,
             )
             _enlarge_figure(fig, _dmode)
             plt.tight_layout()
+            # Panel titles: shrink only if wider than the panel + most of the gap
+            # to its neighbor (HRS2_PANEL_TITLE_ROOM); measured after layout.
+            _fit_titles(fig, axes_room=HRS2_PANEL_TITLE_ROOM)
             plt.show()
 
             try:
@@ -7982,7 +8028,7 @@ def plot_hrs2_analysis(trials, header,
             _zoom_lbl = (
                 f"Averaged Waveforms (n={d['n']}) | "
                 f"{'Group' if _grp_of is not None else 'Stim Amp'}: "
-                f"{_amp_label(d, False).replace(chr(10), ', ')} | "
+                f"{_amp_label(d, False).split(chr(10))[0] if d.get('is_merged') and not d.get('group_label') else _amp_label(d, False).replace(chr(10), ', ')} | "
                 f"{header.subject_id}  "
                 f"({header.session_start_time:%Y-%m-%d %H:%M})"
             )
@@ -7990,8 +8036,9 @@ def plot_hrs2_analysis(trials, header,
             _bhi = d.get('bg_hi', float('nan'))
             if _show_bg['val'] and np.isfinite(_blo) and np.isfinite(_bhi):
                 _zoom_lbl += f"\nBG: {_blo:.0f}–{_bhi:.0f} µV"
-            ax.set_title(_zoom_lbl, fontsize=12)
+            ax.set_title(_zoom_lbl, fontsize=HRS2_ZOOM_TITLE_FS, fontweight='bold')
             _enlarge_figure(fig, _dmode)
+            _fit_titles(fig, axes_room=1.0)
             plt.tight_layout()
             plt.show()
 
@@ -8575,8 +8622,9 @@ def plot_hrs2_trials(trials, header,
             return int(detect_stim_onset(tr.sync_data, _bin_s, _rec_s, STIM_ONSET_THRESHOLD))
         return _bin_s
 
-    def _draw_vns_rows(vaxes, d, small=True):
-        """VNS ADC and/or VNS Sync DIGIN rows under a trial's EMG panel.
+    def _draw_vns_rows(vaxes, d, small=True, rows=None):
+        """VNS ADC and/or VNS Sync DIGIN rows under a trial's EMG panel
+        (*rows* overrides which, e.g. ``['vns_adc']`` for the VNS-ADC-only zoom).
 
         These rows have their OWN time axis spanning the whole stored VNS
         buffer (``vns_valid_sample_count`` samples, ~585 ms after onset): the
@@ -8592,7 +8640,9 @@ def plot_hrs2_trials(trials, header,
         t_hi = max(_win['post'], (_n_valid - onset) * _ms_ps)
         _dsi = int(getattr(tr, 'reward_decision_sample_index', -1))
         _dec_ms = (_dsi - onset) * _ms_ps if _dsi > 0 else None
-        rows = [k for k in ('vns_adc', 'vns_dig') if k in _show_sigs['val']]
+        if rows is None:
+            rows = [k for k in ('vns_adc', 'vns_dig') if k in _show_sigs['val']]
+        _annot = small or _zoom_legends['val']   # zoom: latency text only with legends on
         for vax, key in zip(vaxes, rows):
             vax.axvline(0, color='red', linestyle='--', linewidth=1.0)
             vax.axvspan(-_win['pre'], _win['post'], color='gold', alpha=0.15, lw=0)
@@ -8617,9 +8667,10 @@ def plot_hrs2_trials(trials, header,
                         vax.axvline(_p['onset_to_vns_ms'], color='purple', linestyle='--',
                                     linewidth=1.2,
                                     label=f"pulse {_p['onset_to_vns_ms']:.2f} ms")
-                        vax.text(0.99, 0.9, f"VNS @ {_p['onset_to_vns_ms']:.1f} ms",
-                                 transform=vax.transAxes, fontsize=fsz, color='purple',
-                                 ha='right', va='top')
+                        if _annot:
+                            vax.text(0.99, 0.9, f"VNS @ {_p['onset_to_vns_ms']:.1f} ms",
+                                     transform=vax.transAxes, fontsize=fsz, color='purple',
+                                     ha='right', va='top')
                     else:
                         vax.text(0.01, 0.9, f'no pulse ≥ {vns_threshold_v} V after decision',
                                  transform=vax.transAxes, fontsize=fsz, color='gray',
@@ -8673,7 +8724,7 @@ def plot_hrs2_trials(trials, header,
             vax.set_xlim(t_lo, t_hi)
             vax.tick_params(labelsize=fsz - 1)
             vax.grid(True, alpha=0.3)
-            if not small:
+            if not small and _zoom_legends['val']:
                 vax.legend(fontsize=fsz - 1, loc='upper right')
         if vaxes:
             vaxes[-1].set_xlabel('Time (ms)', fontsize=fsz)
@@ -8740,11 +8791,9 @@ def plot_hrs2_trials(trials, header,
         _thr = _thr_map.get(id(d['trial']), float('nan'))
         if 'thr' in sigs and np.isfinite(_thr) and _thr > 0:
             _thr_y = _thr + _pre_emg_mh
-            ax.axhline(_thr_y, color='blue', linestyle='--', linewidth=lw * 1.5, zorder=4,
-                       label=f'Success thr {_thr:.1f} µV + BG {_pre_emg_mh:.1f} µV')
-            ax.text(1.0, _thr_y, f'thr {_thr:.1f} µV ', color='blue',
-                    fontsize=fsz - 1, ha='right', va='bottom',
-                    transform=ax.get_yaxis_transform())
+            _draw_success_threshold(
+                ax, _thr_y, f'thr {_thr:.1f} µV',
+                f'Success thr {_thr:.1f} µV + BG {_pre_emg_mh:.1f} µV', lw, fsz)
 
         ax.set_ylim(_get_ylim())
         if _ax2 is not None:
@@ -8756,7 +8805,7 @@ def plot_hrs2_trials(trials, header,
                 _ax2.set_ylim(-_zero_frac * _y2_span,
                               (1.0 - _zero_frac) * _y2_span)
 
-        if not small:
+        if not small and _zoom_legends['val']:
             handles, labels = ax.get_legend_handles_labels()
             if _ax2 is not None:
                 h2, l2 = _ax2.get_legend_handles_labels()
@@ -8767,6 +8816,8 @@ def plot_hrs2_trials(trials, header,
 
     _cur_page   = {'idx': 0}
     _zoom_state = {'active': False, 'trial_idx': 0}
+    _zoom_legends = {'val': False}   # single-trial zoom: M/H/BG/threshold + VNS legends
+    _vns_only     = {'val': False}   # single-trial zoom: VNS ADC row alone, full size
     _show_bg_t  = {'val': False}
     _out        = Output()
 
@@ -8808,12 +8859,17 @@ def plot_hrs2_trials(trials, header,
                 _vns_axs  = [[] for _ in range(n_per_page)]
             else:
                 fig = plt.figure(figsize=(_figsize['w'],
-                                          _fig_h(_figsize['h'] * (1.0 + 0.35 * _nv), _dmode_t)))
-                _gs = fig.add_gridspec(2, 3, hspace=0.45, wspace=0.3)
+                                          _fig_h(_figsize['h'] * (1.0 + 0.45 * _nv), _dmode_t)))
+                # No tight_layout here (nested gridspecs), so Large text needs more room
+                _gs = (fig.add_gridspec(2, 3, hspace=0.6, wspace=0.6) if _dmode_t['large']
+                       else fig.add_gridspec(2, 3, hspace=0.45, wspace=0.3))
                 _axs_flat, _vns_axs = [], []
                 for j in range(n_per_page):
+                    # Gap between the EMG panel and its VNS rows: wide enough that the
+                    # EMG's x tick labels / corner boxes don't run into the VNS ADC row.
                     _sg = _gs[j // 3, j % 3].subgridspec(
-                        1 + _nv, 1, height_ratios=[3] + [1] * _nv, hspace=0.08)
+                        1 + _nv, 1, height_ratios=[3] + [1] * _nv,
+                        hspace=0.55 if _dmode_t['large'] else 0.35)
                     _a0 = fig.add_subplot(_sg[0])
                     _axs_flat.append(_a0)
                     _vax0 = fig.add_subplot(_sg[1])
@@ -8870,6 +8926,45 @@ def plot_hrs2_trials(trials, header,
         _zoom_state['active']    = True
         _zoom_state['trial_idx'] = trial_idx
         d = _vst_t['trial_data'][trial_idx]
+        if _vns_only['val'] and _has_vns:
+            with _out:
+                _out.clear_output(wait=True)
+                fig, vax = plt.subplots(figsize=(_figsize['w'] * 13/15,
+                                                 _fig_h(_figsize['h'] * 5/7 * 1.25, _dmode_t)))
+                _draw_vns_rows([vax], d, small=False, rows=['vns_adc'])
+                vax.set_title(f"Trial {d['num']}  |  VNS ADC  |  {header.subject_id}")
+                # Figure-graphic sizes, always on in this view (≈3× the normal zoom's
+                # 9–10 pt axis text): bold title / axis labels / tick numbers,
+                # thicker trace and axes. Large text doesn't scale it further.
+                _VNS_ONLY_FS = dict(title=30, label=30, tick=27, text=20)
+                vax.title.set_fontsize(_VNS_ONLY_FS['title'])
+                for _lab in (vax.title, vax.xaxis.label, vax.yaxis.label):
+                    _lab.set_fontweight('bold')
+                vax.xaxis.label.set_fontsize(_VNS_ONLY_FS['label'])
+                vax.yaxis.label.set_fontsize(_VNS_ONLY_FS['label'])
+                vax.tick_params(labelsize=_VNS_ONLY_FS['tick'], width=2.5, length=9)
+                for _tl in vax.get_xticklabels() + vax.get_yticklabels():
+                    _tl.set_fontweight('bold')
+                for _tx in vax.texts:
+                    _tx.set_fontsize(_VNS_ONLY_FS['text'])
+                    _tx.set_fontweight('bold')
+                for _ln in vax.lines:
+                    _ln.set_linewidth(_ln.get_linewidth() * 2.0)
+                for _sp in vax.spines.values():
+                    _sp.set_linewidth(2.5)
+                from matplotlib.ticker import MaxNLocator as _MNL
+                vax.xaxis.set_major_locator(_MNL(6))
+                vax.yaxis.set_major_locator(_MNL(5))
+                plt.tight_layout()
+                plt.show()
+
+                def _on_back_v(b):
+                    _zoom_state['active'] = False
+                    _plot_page(_cur_page['idx'])
+                _back_btn_v = Button(description='Back to grid', button_style='info')
+                _back_btn_v.on_click(_on_back_v)
+                display(_back_btn_v)
+            return
         with _out:
             _out.clear_output(wait=True)
             _nv = _n_vns_rows()
@@ -8880,9 +8975,10 @@ def plot_hrs2_trials(trials, header,
             else:
                 fig, _axes = plt.subplots(
                     1 + _nv, 1, figsize=(_figsize['w'] * 13/15,
-                                         _fig_h(_figsize['h'] * 5/7 * (1.0 + 0.45 * _nv),
+                                         _fig_h(_figsize['h'] * 5/7 * (1.0 + 0.55 * _nv),
                                                 _dmode_t)),
-                    gridspec_kw={'height_ratios': [3] + [1] * _nv, 'hspace': 0.35})
+                    gridspec_kw={'height_ratios': [3] + [1] * _nv,
+                                 'hspace': 0.7 if _dmode_t['large'] else 0.5})
                 ax, _vaxes = _axes[0], list(_axes[1:])
                 for _va in _vaxes[1:]:
                     _va.sharex(_vaxes[0])
@@ -9087,6 +9183,12 @@ def plot_hrs2_trials(trials, header,
                            layout={'width': '160px'})
     _cb_vns_dig = Checkbox(value=False, description='Show VNS Sync DIG IN', indent=False,
                            layout={'width': '200px'})
+    _cb_vns_only = Checkbox(value=False, description='VNS ADC only (zoom)', indent=False,
+                            layout={'width': '190px'},
+                            tooltip='View trial / double-click shows just the VNS ADC trace, full size')
+    _cb_zoom_leg = Checkbox(value=False, description='Zoom legends', indent=False,
+                            layout={'width': '130px'},
+                            tooltip='Legends (M/H/BG/threshold values, VNS latency) in the single-trial zoom')
 
     def _on_window_change(change):
         _win['pre'] = max(0.0, float(_pre_box.value))
@@ -9123,6 +9225,18 @@ def plot_hrs2_trials(trials, header,
     _cb_vns_adc.observe(_make_sig_cb('vns_adc'), names='value')
     _cb_vns_dig.observe(_make_sig_cb('vns_dig'), names='value')
 
+    def _on_vns_only(change):
+        _vns_only['val'] = bool(change['new'])
+        if _zoom_state['active']:
+            _refresh()
+    _cb_vns_only.observe(_on_vns_only, names='value')
+
+    def _on_zoom_leg(change):
+        _zoom_legends['val'] = bool(change['new'])
+        if _zoom_state['active']:
+            _refresh()
+    _cb_zoom_leg.observe(_on_zoom_leg, names='value')
+
     _nav_row = HBox([_prev_btn, _next_btn, _page_drop,
                      Label('  '), _trial_drop, _view_btn])
     _view_row = HBox(([_grp_drop, Label('   ')] if _grp_sets else []) +
@@ -9138,7 +9252,7 @@ def plot_hrs2_trials(trials, header,
                                  ' show BG EMG in labels</i>')]
                  + ([_cb_thr_t] if _thr_map else [])),
         ] + ([HTML('<b>VNS rows (own axes, below EMG):</b>'),
-              HBox([_cb_vns_adc, _cb_vns_dig])] if _has_vns else [])),
+              HBox([_cb_vns_adc, _cb_vns_dig, _cb_vns_only])] if _has_vns else [])),
         Label('   '),
         VBox([_auto_toggle, _ymin_box, _ymax_box]),
         Label('   '),
@@ -9175,6 +9289,7 @@ def plot_hrs2_trials(trials, header,
 
     # ── Display mode: Compact / Large text ──────────────────────────────────
     _dmode_t, _dmode_row_t = _display_mode_controls(_refresh, 'hrs2_trials')
+    _dmode_row_t.children = tuple(_dmode_row_t.children) + (_cb_zoom_leg,)
 
     display(VBox(_top_rows_t + [_view_row, _nav_row, _sig_row, _dmode_row_t, _out]))
     _plot_page(0)
@@ -14784,6 +14899,7 @@ def build_merged_amp_groups(hrs2_trials, merged_specs, tol=0.001):
             except Exception:
                 import dataclasses
                 t_copy = dataclasses.replace(t, stimulation_amplitude_ma=avg_amp)
+            t_copy._orig_amp_ma   = float(t.stimulation_amplitude_ma)  # for amp mean ± SD labels
             t_copy._is_merged     = True
             t_copy._merged_amp_lo = amp_lo
             t_copy._merged_amp_hi = amp_hi
@@ -16094,7 +16210,10 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
     own_fig = ax is None
     if own_fig:
         # Large text: wider recording columns so the bigger box text doesn't collide.
-        if compact:
+        if bar_colors is not None:
+            # Pooled bars: few columns, big diagonal labels → wider + taller.
+            _cw, _h = (3.2, 5 * _LARGE_TEXT_SCALE) if large_text else (2.4, 5.5)
+        elif compact:
             _cw, _h = (_LARGE_COMPACT_COL_W, 3.5 * _LARGE_TEXT_SCALE) if large_text else (0.6, 3.5)
         else:
             _cw, _h = (2.5, 5 * _LARGE_TEXT_SCALE) if large_text else (2.0, 5)
@@ -16219,26 +16338,35 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
     if x_order:
         xlbls = list(x_order)
     ax.set_xticks(range(n_x))
-    if compact:
+    if bar_mode:
+        # Pooled bars: big labels on a left-leaning diagonal (text ends at its
+        # tick and runs down-left) — far less height than vertical labels.
+        ax.set_xticklabels(xlbls, rotation=45, ha='right', rotation_mode='anchor',
+                           fontsize=_HCMP_BAR_XTICK_FS)
+    elif compact:
         ax.set_xticklabels(xlbls, rotation=90, ha='center', fontsize=8)
     else:
         ax.set_xticklabels(xlbls, rotation=20, ha='right', fontsize=9)
     ax.tick_params(axis='x', labelbottom=show_xticklabels)
+    if show_xticklabels:
+        ax.set_xlabel('Pooled days' if bar_mode else 'Recording',
+                      fontsize=_HCMP_AXIS_TITLE_FS)
     _legend_txt = ('bar = mean  ·  whiskers = mean ± 1σ' if bar_mode else
                    'box = IQR  ·  — = median  ·  ◆ = mean  ·  whiskers = mean ± 1σ')
     if compact:
-        ax.set_ylabel(_short_ylabel, fontsize=9)
+        ax.set_ylabel(_short_ylabel, fontsize=_HCMP_AXIS_TITLE_FS)
         ax.set_title(title if title is not None else
                      f'{title_base}  ·  {stage_lbl}\n'
-                     f'{_legend_txt}  ·  text = mean±σ µV / n / amp', fontsize=8.5)
+                     f'{_legend_txt}  ·  text = mean±σ µV / n / amp',
+                     fontsize=_HCMP_TITLE_FS)
         ax.set_xlim(-0.5, n_x - 0.5)
         ax.margins(y=0.08)
     else:
-        ax.set_ylabel(ylabel, fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=_HCMP_AXIS_TITLE_FS)
         ax.set_title(title if title is not None else
             f'{title_base}  ·  {stage_lbl}\n'
             f'{_legend_txt}  ·  n = trials',
-            fontsize=10)
+            fontsize=_HCMP_TITLE_FS)
         ax.set_xlim(-0.65, n_x - 0.35)
         ax.margins(y=0.22)
     ax.set_ylim(bottom=0)
@@ -16249,6 +16377,7 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
         _enlarge_axes(ax)
     if own_fig:
         plt.tight_layout()
+        _fit_titles(ax.figure, axes_room=1.0)
         _fit_texts_in_axes(ax, _texts)
         plt.tight_layout()
         plt.show()
@@ -16260,6 +16389,11 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
 
 _LARGE_TEXT_SCALE = 1.6
 _LARGE_COMPACT_COL_W = 1.15   # inches per recording column, compact + large text
+# Comparison plot font sizes (pt, before the Large-text scale-up).
+_HCMP_TITLE_FS       = 15     # plot / panel title
+_HCMP_AXIS_TITLE_FS  = 15     # x- and y-axis titles
+_HCMP_SUPTITLE_FS    = 17     # stacked figure's overall title
+_HCMP_BAR_XTICK_FS   = 14     # x tick labels of the pooled bar plot
 
 
 def _enlarge_axes(ax, k: float = _LARGE_TEXT_SCALE):
@@ -16366,6 +16500,90 @@ def _enlarge_figure(fig, st, k: float = _LARGE_TEXT_SCALE, annot_k: float = 1.2)
         fig._suptitle.set_fontsize(min(fig._suptitle.get_fontsize() * k * 1.25,
                                        _LARGE_TEXT_MAX_FS))
         fig._suptitle.set_fontweight('bold')
+    _fit_titles(fig)
+
+
+def _fit_titles(fig, min_fs: float = 10.0, axes_room: float = 1.15):
+    """Shrink any (enlarged) title that is wider than its room — an axes title
+    beyond ~1.15× its axes width, the suptitle beyond the figure width — so
+    long titles aren't clipped at the figure edge. Titles that fit are kept."""
+    try:
+        r = fig.canvas.get_renderer()
+    except Exception:
+        return
+    # A centered axes title also must not run past either figure edge.
+    _fw = fig.bbox.width
+    _items = [(ax.title, min(ax.bbox.width * axes_room, _fw * 0.98,
+                             2 * min(ax.bbox.x0 + ax.bbox.width / 2,
+                                     _fw - ax.bbox.x0 - ax.bbox.width / 2) * 0.98))
+              for ax in fig.axes if ax.axison]
+    if fig._suptitle is not None:
+        _items.append((fig._suptitle, fig.bbox.width * 0.98))
+    for t, room in _items:
+        if not t.get_text():
+            continue
+        try:
+            w = t.get_window_extent(r).width
+        except Exception:
+            continue
+        if w > room > 0:
+            t.set_fontsize(max(min_fs, t.get_fontsize() * room / w))
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _display_mode_figures(st):
+    """Apply Compact / Large text to every matplotlib figure shown with
+    ``plt.show()`` inside the block. For viewers whose figures come from
+    separate plot functions (FT viewers, failed-trials viewer): Compact shrinks
+    the finished figure's height, Large text runs :func:`_enlarge_figure`, then
+    the layout is tightened again."""
+    import matplotlib.pyplot as plt
+    if not (st and (st.get('compact') or st.get('large'))):
+        yield
+        return
+    _orig_show = plt.show
+
+    def _show(*a, **k):
+        import warnings
+        for _n in plt.get_fignums():
+            _f = plt.figure(_n)
+            if getattr(_f, '_display_mode_done', False):
+                continue
+            _f._display_mode_done = True
+            _w, _h = _f.get_size_inches()
+            if st.get('compact'):
+                _h *= _COMPACT_HEIGHT_SCALE
+            if st.get('large'):
+                # 3+ stacked rows: enlarged titles / x labels need extra height
+                _rows = len({round(a.get_position().y0, 2) for a in _f.axes if a.axison})
+                if _rows >= 3:
+                    _h *= 1.4
+            _f.set_size_inches(_w, _h)
+            _enlarge_figure(_f, st)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    _f.tight_layout()
+            except Exception:
+                pass
+        return _orig_show(*a, **k)
+
+    plt.show = _show
+    try:
+        yield
+    finally:
+        plt.show = _orig_show
+
+
+def _with_display_mode(fn, st):
+    """Wrap a viewer's render function so its figures follow display mode *st*."""
+    def _wrapped(*a, **k):
+        with _display_mode_figures(st):
+            return fn(*a, **k)
+    return _wrapped
 
 
 def _plotly_display_mode(fig, st, base_height):
@@ -16418,9 +16636,12 @@ def plot_h_reflex_comparison_stacked(h_cache, recording_dirs, stage_key, stage_l
 
     k = len(metrics)
     _g = _LARGE_TEXT_SCALE if large_text else 1.0
+    if bar_colors is not None:     # pooled bars: few, wide columns (see plot_h_reflex_comparison)
+        _cw = 3.2 if large_text else 2.4
+    else:
+        _cw = _LARGE_COMPACT_COL_W if large_text else 0.6
     fig, axes = plt.subplots(k, 1, sharex=True, squeeze=False,
-                             figsize=(max(6, len(x_order) * (_LARGE_COMPACT_COL_W if large_text
-                                                             else 0.6) + 1.5),
+                             figsize=(max(6, len(x_order) * _cw + 1.5),
                                       (panel_height * k + 1.0) * _g))
     axes = axes[:, 0]
     summaries = []
@@ -16440,9 +16661,10 @@ def plot_h_reflex_comparison_stacked(h_cache, recording_dirs, stage_key, stage_l
                    'box = IQR  ·  — = median  ·  ◆ = mean  ·  whiskers = mean ± 1σ')
     fig.suptitle(f'Across Recordings  ·  {stage_lbl}\n'
                  f'{_legend_txt}  ·  text = mean±σ µV / n / amp',
-                 fontsize=10 * _g * (1.25 if large_text else 1),
+                 fontsize=_HCMP_SUPTITLE_FS * _g * (1.25 if large_text else 1),
                  fontweight='bold' if large_text else 'normal')
     plt.tight_layout()
+    _fit_titles(fig, axes_room=1.0)
     for ax in axes:
         _fit_texts_in_axes(ax, getattr(ax, '_hcmp_texts', []))
     plt.tight_layout()
@@ -18486,6 +18708,11 @@ def make_ft_viewer(all_recordings: dict,
         _ft_render_wave()
         _ft_render_curves()
 
+    # Display mode: Compact / Large text on every figure the renders show
+    _ft_dm, _ft_dm_row = _display_mode_controls(lambda: _ft_render_all(), 'ft_viewer')
+    _ft_render_wave   = _with_display_mode(_ft_render_wave, _ft_dm)
+    _ft_render_curves = _with_display_mode(_ft_render_curves, _ft_dm)
+
     # ── Nav helpers ────────────────────────────────────────────────────────────
     def _ft_update_trial_drop():
         n = max(1, len(_ft_st['filtered']))
@@ -18811,6 +19038,7 @@ def make_ft_viewer(all_recordings: dict,
         HBox([_ft_yauto_chk, _ft_ymin_txt, _ft_ymax_txt,
               _ft_figw_txt, _ft_figh_txt, _ft_prems_txt, _ft_postms_txt]),
         HBox([_ft_show_stim_adc_chk, _ft_show_digin_chk, _ft_show_delay_chk]),
+        _ft_dm_row,
         _ft_per_trial_section,
         _ft_avg_section,
     ])
@@ -18967,6 +19195,9 @@ def make_ft_sync_viewer(all_recordings: dict,
                 fig_w=_st['fig_w'],
             )
 
+    _dm, _dm_row = _display_mode_controls(lambda: _render(), 'ft_sync')
+    _render = _with_display_mode(_render, _dm)
+
     # ── Nav helpers ────────────────────────────────────────────────────────────
     def _update_trial_drop():
         n = max(1, len(_st['filtered']))
@@ -19077,6 +19308,7 @@ def make_ft_sync_viewer(all_recordings: dict,
         _rec_d,
         HBox([_prev_btn, _next_btn, _trial_drop, _amp_drop, _freq_drop]),
         HBox([_thresh_txt, _search_txt, _prems_txt, _postms_txt, _figw_txt]),
+        _dm_row,
         _out,
     ])
 
@@ -19815,6 +20047,9 @@ def make_ft_avg_viewer(all_recordings: dict,
     _show_digin_chk.observe(_on_show_digin, names='value')
     _show_delay_chk.observe(_on_show_delay, names='value')
 
+    _dm, _dm_row = _display_mode_controls(lambda: _render(), 'ft_avg')
+    _render = _with_display_mode(_render, _dm)
+
     _update_freq_drop()
     _init_controls()
     _render()
@@ -19828,6 +20063,7 @@ def make_ft_avg_viewer(all_recordings: dict,
         HBox([_prems_txt, _postms_txt, _figw_txt, _figh_txt]),
         HBox([_yauto_chk, _ymin_txt, _ymax_txt, _show_ind_chk, _show_stim_adc_chk, _show_digin_chk,
               _show_delay_chk]),
+        _dm_row,
         _out,
     ])
 
@@ -20636,6 +20872,9 @@ def make_failed_trials_viewer(all_recordings,
     _dig_in_chk.observe(_on_dig_in,     names='value')
     _delay_chk.observe(_on_delay,       names='value')
 
+    _dm, _dm_row = _display_mode_controls(lambda: _draw(_st['idx']), 'failed_trials')
+    _draw = _with_display_mode(_draw, _dm)
+
     # Populate immediately (same pattern as make_ft_viewer calling _ft_render_all)
     _update_lbl()
     _draw(0)
@@ -20645,6 +20884,7 @@ def make_failed_trials_viewer(all_recordings,
         HBox([_yauto_chk, _ymin_txt, _ymax_txt,
               _figw_txt, _figh_txt, _prems_txt, _postms_txt]),
         HBox([_stim_adc_chk, _sync_chk, _dig_in_chk] + ([_delay_chk] if _any_delay else [])),
+        _dm_row,
         _out,
     ])
 
