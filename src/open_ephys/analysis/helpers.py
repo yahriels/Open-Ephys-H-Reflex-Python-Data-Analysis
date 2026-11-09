@@ -5258,6 +5258,15 @@ def _draw_success_threshold(ax, y, text, label, lw, fsz):
                       linewidth=1.0, alpha=0.85))
 
 
+# plot_h_wave_reward_timeline, poster mode (the default) — sizes in pt / pt².
+_HRT_AXIS_LABEL_FS   = 46       # "H-wave Size (µV)" and "Trial number" (was 34)
+_HRT_TICK_FS         = 38       # axis numbers (was 30)
+_HRT_DOT_SIZE        = 110      # no-reward dots, marker area (was 40)
+_HRT_DOT_SIZE_REWARD = 150      # reward-delivered dots (was 56)
+_HRT_THRESHOLD_LW    = 8.0      # threshold line width (was 4.5)
+_HRT_THRESHOLD_NAME  = 'CLV threshold'   # legend label (was "Success threshold")
+
+
 def plot_h_wave_reward_timeline(sessions, source: str = 'in_session',
                                 h_start_ms: float = 6.0, h_end_ms: float = 10.0,
                                 pre_ms: float = 15.0, post_ms: float = 20.0,
@@ -5383,8 +5392,10 @@ def plot_h_wave_reward_timeline(sessions, source: str = 'in_session',
     # Same visual vocabulary as plot_mwave_stabilization_groups (grey / red dots,
     # dashed y grid, no top/right spines); poster=True scales it up and bolds it.
     if poster:
-        _fs = dict(title=32, sub=28, label=34, tick=30, legend=32, sess=26)
-        _ms_g, _ms_r, _lw_thr, _lw_ax, _fig = 40, 56, 4.5, 2.8, (16, 9.5)
+        _fs = dict(title=32, sub=28, label=_HRT_AXIS_LABEL_FS, tick=_HRT_TICK_FS,
+                   legend=32, sess=26)
+        _ms_g, _ms_r, _lw_thr, _lw_ax, _fig = (_HRT_DOT_SIZE, _HRT_DOT_SIZE_REWARD,
+                                               _HRT_THRESHOLD_LW, 2.8, (16, 9.5))
     else:
         _fs = dict(title=11, sub=9, label=10, tick=9, legend=8, sess=9)
         _ms_g, _ms_r, _lw_thr, _lw_ax, _fig = 12, 16, 1.8, 0.8, (11, 4.8)
@@ -5400,7 +5411,7 @@ def plot_h_wave_reward_timeline(sessions, source: str = 'in_session',
     _tx = np.array([np.nan if v is None else v for v in tx], dtype=float)
     _ty = np.array([np.nan if v is None else v for v in ty], dtype=float)
     ax.step(_tx, _ty, where='post', color='#008a00', lw=_lw_thr, zorder=5,
-            label='Success threshold')
+            label=_HRT_THRESHOLD_NAME)
 
     for k, (x0, x1, label) in enumerate(bounds):
         if k > 0:
@@ -15256,13 +15267,23 @@ def compute_trial_bins(
     return binned_trials, bin_labels, bin_colors, trial_bg_dict, bin_unit, pol_labels, trials_by_pol
 
 
+_BIN_DOT_SPREAD = 0.25   # plot_bin_overview bars: how far right (x-units, bar = 0.8 wide) the trial dots spread
+
+
 def plot_bin_overview(
     binned_trials, bin_labels, bin_colors, pol_labels, hrs2_header,
     sample_rate, pre_avg_ms, post_avg_ms,
     m_start_ms, m_end_ms, h_start_ms, h_end_ms,
     bin_ranges=None, bin_unit='',
+    view: str = 'Global', compact: bool = False, large_text: bool = False,
+    save_dir: str = 'figures', save_dpi: int = 300,
 ):
     """Interactive EMG bin overview with Global and per-panel zoom views.
+
+    *view* / *compact* / *large_text* set the starting View and Display
+    checkboxes. The "Save PNG" button writes the plot currently shown to
+    ``<save_dir>/bin_overview_<view>_<subject>_<polarity>_<time>.png`` at
+    *save_dpi* (relative *save_dir* = next to the notebook) and prints the path.
 
     A View selector switches between the full 5-panel layout (Waveforms,
     H-wave, M-wave, H:M Ratio, Stats) and enlarged single-panel views of each.
@@ -15281,17 +15302,24 @@ def plot_bin_overview(
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     import matplotlib.patches as mpatches
-    from ipywidgets import (ToggleButtons, Checkbox, Output, VBox, HBox, HTML)
+    from ipywidgets import (ToggleButtons, Checkbox, Output, VBox, HBox, HTML, Button)
     from IPython.display import display as _display
 
     ms_per_sample = 1000.0 / sample_rate
     ov_out        = Output()
+    save_out      = Output()
+    _last_fig     = [None]
+
+    def _show():
+        """plt.show(), remembering the figure for the Save PNG button."""
+        _last_fig[0] = plt.gcf()
+        plt.show()
 
     # ── View selector ─────────────────────────────────────────────────
     VIEW_OPTIONS = ['Global', 'Global 2', 'Waveforms', 'H-wave', 'M-wave', 'H:M Ratio',
                     'Pre-stim EMG', 'Stim Intensity', 'Stats']
     view_tgl = ToggleButtons(
-        options=VIEW_OPTIONS, value='Global',
+        options=VIEW_OPTIONS, value=view if view in VIEW_OPTIONS else 'Global',
         button_style='', description='View:',
         style={'button_width': '105px'},
     )
@@ -15311,10 +15339,12 @@ def plot_bin_overview(
         HTML('&nbsp;&nbsp;<b style="line-height:32px">Bars:</b>&nbsp;'),
         cb_means, cb_dots,
     ])
-    cb_compact = Checkbox(value=False, description='Compact',    indent=False, layout=_cw)
-    cb_large   = Checkbox(value=False, description='Large text', indent=False, layout=_cw)
+    cb_compact = Checkbox(value=bool(compact),    description='Compact',    indent=False, layout=_cw)
+    cb_large   = Checkbox(value=bool(large_text), description='Large text', indent=False, layout=_cw)
+    save_btn   = Button(description=f'Save PNG ({save_dpi} dpi)', button_style='success',
+                        layout={'width': '170px'})
     display_row = HBox([HTML('<b style="line-height:32px">Display:</b>&nbsp;'),
-                        cb_compact, cb_large])
+                        cb_compact, cb_large, save_btn, save_out])
 
     def _fh(h):
         """Figure height: ~30% shorter in Compact (width unchanged, since the
@@ -15341,14 +15371,25 @@ def plot_bin_overview(
                 fig._suptitle.set_fontsize(fig._suptitle.get_fontsize() * 2.0)
                 fig._suptitle.set_fontweight('bold')
 
-    def _trial_dots(ax, xi, v, col, spread=0.18, size=14):
+    def _trial_dots(ax, xi, v, col, spread=0.18, size=14, side_pts=None):
         """One semi-transparent dot per trial over bar *xi*, jittered horizontally.
-        Jitter is seeded by *xi* so redraws (toggles, polarity) keep the same layout."""
+        Jitter is seeded by *xi* so redraws (toggles, polarity) keep the same layout.
+        *side_pts*: put the dots only to the RIGHT of the bar center, starting
+        *side_pts* points out (clear of the SD whisker cap) and spreading *spread*
+        x-units further right — so they don't cover the whisker."""
         if not cb_dots.value or len(v) == 0:
             return
-        jit = np.random.default_rng(xi).uniform(-spread, spread, len(v))
+        if side_pts is None:
+            jit = np.random.default_rng(xi).uniform(-spread, spread, len(v))
+            ax.scatter(xi + jit, v, s=size, color=col, alpha=0.45,
+                       edgecolors='#222222', linewidths=0.4, zorder=4)
+            return
+        from matplotlib.transforms import ScaledTranslation
+        jit = np.random.default_rng(xi).uniform(0, spread, len(v))
         ax.scatter(xi + jit, v, s=size, color=col, alpha=0.45,
-                   edgecolors='#222222', linewidths=0.4, zorder=4)
+                   edgecolors='#222222', linewidths=0.4, zorder=4,
+                   transform=ax.transData + ScaledTranslation(
+                       side_pts / 72, 0, ax.figure.dpi_scale_trans))
 
     def _dot_ylim(ax, vals, top_vals, pad):
         """Y-limits covering the bars (+SD) and, when shown, every trial dot."""
@@ -15358,7 +15399,7 @@ def plot_bin_overview(
         ax.set_ylim(bottom * pad if bottom < 0 else 0, top * pad)
 
     current_pol  = [pol_labels[0]]
-    current_view = ['Global']
+    current_view = [view_tgl.value]
 
     def _legend_label(i, lo, hi, n):
         parts = [f'Bin {i + 1}']
@@ -15457,7 +15498,10 @@ def plot_bin_overview(
                     sd = float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
                     ax.bar(xi, mu, color=col, alpha=0.78, yerr=sd, capsize=6,
                            error_kw={'elinewidth': 2, 'ecolor': col, 'capthick': 2})
-                    _trial_dots(ax, xi, v, col)
+                    # Dots right of the SD whisker: cap half-width (capsize 6 pt,
+                    # ×1.8 with Large text) + 3 pt gap.
+                    _trial_dots(ax, xi, v, col, spread=_BIN_DOT_SPREAD,
+                                side_pts=6 * (1.8 if cb_large.value else 1) + 3)
                     mus.append(mu); sds.append(sd); vals.append(v)
                 _dot_ylim(ax, vals, [m + s for m, s in zip(mus, sds)], 1.22)
                 if cb_means.value:
@@ -15473,19 +15517,23 @@ def plot_bin_overview(
                 ax.set_title(title, fontsize=10, fontweight='bold')
                 ax.grid(True, axis='y', alpha=0.3)
 
-            # ── GLOBAL 2: Pre-stim EMG, M-wave, Stim Intensity, H-wave ─
+            # ── GLOBAL 2: Stim Intensity, Pre-stim EMG, M-wave, H-wave ─
+            # Panel order (left → right) = order of the names on the next-but-one line.
             if view == 'Global 2':
                 fig, axes = plt.subplots(1, 4, figsize=(18, _fh(5.5 if cb_large.value else 5)))
-                ax_bg, ax_m, ax_st, ax_h = axes
-                _bar(ax_bg, bg_mra,  'Size (µV)',      'Pre-stim EMG',   fmt='.1f')
-                _bar(ax_m,  m_mra,   'Size (µV)',      'M-wave',         fmt='.1f')
-                _bar(ax_st, stim_ma, 'Intensity (mA)', 'Stim Intensity', fmt='.3f')
-                _bar(ax_h,  h_mra,   'Size (µV)',      'H-wave',         fmt='.1f')
+                ax_st, ax_bg, ax_m, ax_h = axes
+                # No panel titles here: each panel's name is its y-axis label
+                # (on 2 lines with Large text so the bigger label fits the height).
+                _nl = '\n' if cb_large.value else ' '
+                _bar(ax_bg, bg_mra,  f'Pre-stim EMG{_nl}Size (µV)',  '', fmt='.1f')
+                _bar(ax_m,  m_mra,   f'M-Wave{_nl}Size (µV)',        '', fmt='.1f')
+                _bar(ax_st, stim_ma, f'Stim Intensity{_nl}(mA)',     '', fmt='.3f')
+                _bar(ax_h,  h_mra,   f'H-Wave{_nl}Size (µV)',        '', fmt='.1f')
                 plt.suptitle(f'Combined EMG Bin Overview  —  {pol_lbl}  —  '
                              f'{hrs2_header.subject_id}', fontsize=11)
                 _finish(fig, axes)
                 plt.tight_layout()
-                plt.show()
+                _show()
 
             # ── GLOBAL ─────────────────────────────────────────────────
             elif view == 'Global':
@@ -15529,7 +15577,7 @@ def plot_bin_overview(
                 plt.suptitle(f'Combined EMG Bin Overview  —  {hrs2_header.subject_id}', fontsize=11)
                 _finish(fig, axes)
                 plt.tight_layout()
-                plt.show()
+                _show()
 
             # ── WAVEFORMS (zoomed) ─────────────────────────────────────
             elif view == 'Waveforms':
@@ -15556,7 +15604,7 @@ def plot_bin_overview(
                         va='top', fontsize=8, color='gray')
                 _finish(fig, ax)
                 plt.tight_layout()
-                plt.show()
+                _show()
 
             # ── BAR CHART ZOOM (M-wave / H-wave / H:M Ratio) ──────────
             elif view in ('M-wave', 'H-wave', 'H:M Ratio', 'Pre-stim EMG', 'Stim Intensity'):
@@ -15623,7 +15671,7 @@ def plot_bin_overview(
                 ax.legend(handles=leg_handles, fontsize=9, loc='upper right')
                 _finish(fig, ax)
                 plt.tight_layout()
-                plt.show()
+                _show()
 
             # ── STATS (zoomed text panel) ──────────────────────────────
             elif view == 'Stats':
@@ -15661,7 +15709,7 @@ def plot_bin_overview(
                         bbox=dict(boxstyle='round,pad=0.6', fc='#f9f9f9', ec='#aaaaaa'))
                 _finish(fig, ax)
                 plt.tight_layout()
-                plt.show()
+                _show()
 
     # ── Reactivity wiring ─────────────────────────────────────────────
     def _on_cb(change):
@@ -15675,6 +15723,29 @@ def plot_bin_overview(
             _draw(current_pol[0], change['new'])
     view_tgl.observe(_on_view, names='value')
 
+    def save_png(path=None):
+        """Save the plot currently shown at *save_dpi*; returns the file path."""
+        import os, re
+        from datetime import datetime
+        fig = _last_fig[0]
+        if fig is None:
+            return None
+        if path is None:
+            _tag = '_'.join(re.sub(r'[^A-Za-z0-9.+-]+', '-', str(s)).strip('-')
+                            for s in (current_view[0], getattr(hrs2_header, 'subject_id', ''),
+                                      current_pol[0], datetime.now().strftime('%Y%m%d-%H%M%S')))
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.join(save_dir, f'bin_overview_{_tag}.png')
+        fig.savefig(path, dpi=save_dpi, bbox_inches='tight', facecolor='white')
+        return os.path.abspath(path)
+
+    def _on_save(_b):
+        with save_out:
+            save_out.clear_output()
+            p = save_png()
+            print(f'Saved → {p}' if p else 'Nothing drawn yet.')
+    save_btn.on_click(_on_save)
+
     if len(pol_labels) > 1:
         pol_tgl = ToggleButtons(options=pol_labels, button_style='info', description='Polarity:')
         def _on_pol(change):
@@ -15685,7 +15756,7 @@ def plot_bin_overview(
         _display(VBox([HBox([pol_tgl]), HBox([view_tgl]), legend_row, display_row, ov_out]))
     else:
         _display(VBox([HBox([view_tgl]), legend_row, display_row, ov_out]))
-    _draw(pol_labels[0])
+    _draw(pol_labels[0], current_view[0])
 
 
 def create_bin_viewer(
@@ -16160,17 +16231,17 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
 
     stage_keys = [stage_key] if isinstance(stage_key, str) else list(stage_key)
     multi_stage = len(stage_keys) > 1
-    stage_lbl = '  |  '.join(stage_labels.get(sk, sk) for sk in stage_keys)
+    stage_lbl = '  |  '.join(_hcmp_stage_name(sk, stage_labels) for sk in stage_keys)
 
     _metric_cfg = {
         'h_reflex':   ('h_sizes',  'H-Reflex Size  (µV)  [H-MRA − BG-MRA]',  'H-Reflex Size Across Recordings'),
         'm_wave':     ('m_sizes',  'M-Wave Size  (µV)  [M-MRA − BG-MRA]',     'M-Wave Size Across Recordings'),
-        'background': ('bg_sizes', 'Background MRA  (µV)',                      'EMG Background Level Across Recordings'),
+        'background': ('bg_sizes', 'Pre-stim EMG  (µV)',                        'Pre-stim EMG Across Recordings'),
     }
     sizes_key, ylabel, title_base = _metric_cfg.get(metric, _metric_cfg['h_reflex'])
     # Short y labels for the squeezed (compact) panels; the long form goes in the title.
     _short_ylabel = {'h_reflex': 'H-Reflex (µV)', 'm_wave': 'M-Wave (µV)',
-                     'background': 'BG MRA (µV)'}.get(metric, 'H-Reflex (µV)')
+                     'background': 'Pre-stim EMG (µV)'}.get(metric, 'H-Reflex (µV)')
 
     # Collect data in RECORDING_DIRS order (block per stage when several are
     # given); skip recordings missing the stage/data.
@@ -16197,9 +16268,15 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
                'metric_label': ylabel, 'unit': 'µV',
                'recordings': [], 'range_avg': None, 'multi_stage': multi_stage}
 
-    # Per-stage box colors (fill, edge); first stage keeps the original blue.
-    _stage_colors = [('lightsteelblue', 'steelblue'), ('#b9dfc4', 'seagreen'),
-                     ('#e3c9ee', 'purple'), ('#f3d6b0', 'saddlebrown')]
+    # Per-stage box colors (fill, edge), in stage order — except any up-
+    # conditioning stage (key 'up_cond…'), which is always red (_HCMP_UP_COND_COLORS).
+    _palette = [('lightsteelblue', 'steelblue'), ('#b9dfc4', 'seagreen'),
+                ('#e3c9ee', 'purple'), ('#f3d6b0', 'saddlebrown')]
+    # Control Mode (= "Baseline") is always gray (_HCMP_BASELINE_COLORS).
+    _stage_colors = [(_HCMP_UP_COND_COLORS if str(sk).startswith('up_cond')
+                      else _HCMP_BASELINE_COLORS if sk == 'control_mode'
+                      else _palette[si % len(_palette)])
+                     for si, sk in enumerate(stage_keys)]
 
     n  = len(valid)
     bw = 0.6 if compact else 0.46
@@ -16214,7 +16291,7 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
             # Pooled bars: few columns, big diagonal labels → wider + taller.
             _cw, _h = (3.2, 5 * _LARGE_TEXT_SCALE) if large_text else (2.4, 5.5)
         elif compact:
-            _cw, _h = (_LARGE_COMPACT_COL_W, 3.5 * _LARGE_TEXT_SCALE) if large_text else (0.6, 3.5)
+            _cw, _h = (_LARGE_COMPACT_COL_W, 3.5 * _LARGE_TEXT_SCALE) if large_text else (_HCMP_COMPACT_COL_W, 3.5)
         else:
             _cw, _h = (2.5, 5 * _LARGE_TEXT_SCALE) if large_text else (2.0, 5)
         fig, ax = plt.subplots(figsize=(max(6, n_x * _cw + 1.5), _h) if compact
@@ -16237,10 +16314,12 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
             'label': rl, 'n': n_trials, 'mean': mn, 'sd': sd,
             'median': float(_q[1]), 'q1': float(_q[0]), 'q3': float(_q[2]),
             'amp_mean': float(mean_amp), 'amp_sd': float(std_amp),
-            'stage': stage_labels.get(stage_keys[si], stage_keys[si])})
+            'stage': _hcmp_stage_name(stage_keys[si], stage_labels)})
 
         if bar_mode:
             _bc = bar_colors.get(rl, bar_colors.get(rec_lbl, 'lightgray'))
+            if stage_keys[si] == 'control_mode' and str(_bc).lower() in _HCMP_BLUES:
+                _bc = _HCMP_BASELINE_COLORS[1]    # blue Control Mode (Baseline) bars → gray
             ax.bar(i, mn, width=bw, color=_bc, edgecolor=_bc, lw=1.5,
                    alpha=0.85, zorder=3)
             if n_trials >= 2:
@@ -16267,12 +16346,14 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
             # Also used for large text, where the long form overlaps its neighbors.
             _texts.append(ax.text(i, top + y_span * 0.03,
                     f'{_fmt_compact(mn)}±{_fmt_compact(sd)}\nn={n_trials}\n{mean_amp:.3f} mA',
-                    ha='center', va='bottom', fontsize=6.5, linespacing=1.0,
-                    color='#444', zorder=6))
+                    ha='center', va='bottom', fontsize=_HCMP_BOX_TXT_FS_COMPACT,
+                    linespacing=1.0, color=_HCMP_BOX_TXT_COLOR, fontweight='semibold',
+                    zorder=6))
         elif show_box_text:
             _texts.append(ax.text(i, top + y_span * 0.04,
                     f'n={n_trials}\namp = {mean_amp:.3f} ± {std_amp:.3f} mA\nμ = {mn:.3f} ± {sd:.3f} µV',
-                    ha='center', va='bottom', fontsize=8, color='#444', zorder=6))
+                    ha='center', va='bottom', fontsize=_HCMP_BOX_TXT_FS,
+                    color=_HCMP_BOX_TXT_COLOR, fontweight='semibold', zorder=6))
 
     # Mean trend line — drawn per stage block so it doesn't bridge the separator.
     _stage_idx = np.array([v[5] for v in valid])
@@ -16289,9 +16370,9 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
                        linewidth=1.8, zorder=1)
         _present = sorted(set(_stage_idx.tolist()))
         if show_legend and not bar_mode:   # bars are named on the x-axis
-            ax.legend(handles=[Patch(facecolor=_stage_colors[si % len(_stage_colors)][0],
-                                     edgecolor=_stage_colors[si % len(_stage_colors)][1],
-                                     label=stage_labels.get(stage_keys[si], stage_keys[si]))
+            ax.legend(handles=[Patch(facecolor=_stage_colors[si][0],
+                                     edgecolor=_stage_colors[si][1],
+                                     label=_hcmp_stage_name(stage_keys[si], stage_labels))
                                for si in _present],
                       loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=8, frameon=False)
 
@@ -16343,14 +16424,22 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
         # tick and runs down-left) — far less height than vertical labels.
         ax.set_xticklabels(xlbls, rotation=45, ha='right', rotation_mode='anchor',
                            fontsize=_HCMP_BAR_XTICK_FS)
-    elif compact:
-        ax.set_xticklabels(xlbls, rotation=90, ha='center', fontsize=8)
     else:
-        ax.set_xticklabels(xlbls, rotation=20, ha='right', fontsize=9)
+        # Per-recording (day) labels: big; flat when they are short (e.g. "-5"),
+        # otherwise vertical (compact) / slanted so they don't overlap.
+        _short = all(len(str(l).split('\n')[0]) <= 4 for l in xlbls)
+        if compact:
+            ax.set_xticklabels(xlbls, rotation=0 if _short else 90, ha='center',
+                               fontsize=_HCMP_REC_XTICK_FS)
+        else:
+            ax.set_xticklabels(xlbls, rotation=0 if _short else 20,
+                               ha='center' if _short else 'right',
+                               fontsize=_HCMP_REC_XTICK_FS * 0.8)   # 2-line labels (+ σ) need room
     ax.tick_params(axis='x', labelbottom=show_xticklabels)
     if show_xticklabels:
         ax.set_xlabel('Pooled days' if bar_mode else 'Recording',
                       fontsize=_HCMP_AXIS_TITLE_FS)
+    # (What the box / bar / whiskers mean is in the legend now.)
     _legend_txt = ('bar = mean  ·  whiskers = mean ± 1σ' if bar_mode else
                    'box = IQR  ·  — = median  ·  ◆ = mean  ·  whiskers = mean ± 1σ')
     if compact:
@@ -16377,7 +16466,7 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
         _enlarge_axes(ax)
     if own_fig:
         plt.tight_layout()
-        _fit_titles(ax.figure, axes_room=1.0)
+        _fit_titles(ax.figure, axes_room=1.0, min_fs=6)
         _fit_texts_in_axes(ax, _texts)
         plt.tight_layout()
         plt.show()
@@ -16388,12 +16477,38 @@ def plot_h_reflex_comparison(h_cache, recording_dirs, stage_key, stage_labels,
 
 
 _LARGE_TEXT_SCALE = 1.6
-_LARGE_COMPACT_COL_W = 1.15   # inches per recording column, compact + large text
+_LARGE_COMPACT_COL_W = 1.35   # inches per recording column, compact + large text
 # Comparison plot font sizes (pt, before the Large-text scale-up).
 _HCMP_TITLE_FS       = 15     # plot / panel title
 _HCMP_AXIS_TITLE_FS  = 15     # x- and y-axis titles
 _HCMP_SUPTITLE_FS    = 17     # stacked figure's overall title
+_HCMP_STACKED_PANEL_TITLE_FS = 22   # stacked panel titles (H-Reflex Size, M-Wave Size, ...)
+_HCMP_SD_LEGEND_FS = 12      # "Mean ± SD across trials" legend, pooled Stacked only (×1.6 Large text)
+_HCMP_SD_LEGEND_W  = 3.0     # inches added to that figure's width for the legend
 _HCMP_BAR_XTICK_FS   = 14     # x tick labels of the pooled bar plot
+_HCMP_REC_XTICK_FS   = 18     # x tick labels per recording / day (-5 … 5), box plots (×1.6 Large text)
+_HCMP_STACKED_BAR_XTICK_FS  = 24   # pooled Stacked x tick labels (Week 0 (Pre), ...) (×1.6 Large text)
+_HCMP_STACKED_BAR_XTICK_ROT = 15   # their angle in degrees (0 = flat, 45 = diagonal)
+_HCMP_STACKED_BAR_YLABEL_FS = 22   # pooled Stacked y-axis titles (H-Reflex (µV), ...) (×1.6×1.25 Large text)
+_HCMP_STACKED_BAR_YTICK_FS  = 16   # pooled Stacked y-axis numbers (×1.6 Large text)
+_HCMP_BOX_TXT_FS          = 10    # text above each box (normal width)
+_HCMP_BOX_TXT_FS_COMPACT  = 7.5   # text above each box (Compact / Large text)
+_HCMP_BOX_TXT_COLOR       = '#111'
+_HCMP_UP_COND_COLORS      = ('#f4b6b6', 'firebrick')   # up-conditioning boxes (fill, edge)
+_HCMP_BASELINE_COLORS     = ('#d9d9d9', 'dimgray')     # Control Mode (= Baseline) boxes / bars (fill, edge)
+_HCMP_BASELINE_NAME       = 'Baseline'                 # what Control Mode is called in these plots
+# Pooled-bar colors treated as "blue" (→ gray for Control Mode data).
+_HCMP_BLUES = {'tab:blue', 'blue', 'c0', 'steelblue', 'lightsteelblue', 'royalblue',
+               'navy', 'darkblue', 'mediumblue', 'cornflowerblue', 'dodgerblue', '#1f77b4'}
+
+
+def _hcmp_stage_name(sk, stage_labels):
+    """Stage name for comparison-plot titles / legends: Control Mode →
+    "Baseline"; any other stage loses its " (.hrsN)" file extension."""
+    if sk == 'control_mode':
+        return _HCMP_BASELINE_NAME
+    return re.sub(r'\s*\(\.\w+\)\s*$', '', str((stage_labels or {}).get(sk, sk)))
+_HCMP_COMPACT_COL_W       = 0.85  # inches per recording column, Compact (was 0.6)
 
 
 def _enlarge_axes(ax, k: float = _LARGE_TEXT_SCALE):
@@ -16629,19 +16744,21 @@ def plot_h_reflex_comparison_stacked(h_cache, recording_dirs, stage_key, stage_l
         print(f'No data for stage {stage_key!r} in any recording.')
         return []
     keys = [stage_key] if isinstance(stage_key, str) else list(stage_key)
-    stage_lbl = '  |  '.join(stage_labels.get(sk, sk) for sk in keys)
-    _titles = {'h_reflex': 'H-Reflex Size  [H-MRA − BG-MRA]',
-               'm_wave': 'M-Wave Size  [M-MRA − BG-MRA]',
-               'background': 'Background MRA'}
+    stage_lbl = '  |  '.join(_hcmp_stage_name(sk, stage_labels) for sk in keys)
+    _titles = {'h_reflex': 'H-Reflex Size',
+               'm_wave': 'M-Wave Size',
+               'background': 'Pre-stim EMG'}
 
     k = len(metrics)
     _g = _LARGE_TEXT_SCALE if large_text else 1.0
     if bar_colors is not None:     # pooled bars: few, wide columns (see plot_h_reflex_comparison)
-        _cw = 3.2 if large_text else 2.4
+        _cw = 4.2 if large_text else 3.0   # wide enough for the big, flat tick labels
     else:
-        _cw = _LARGE_COMPACT_COL_W if large_text else 0.6
+        _cw = _LARGE_COMPACT_COL_W if large_text else _HCMP_COMPACT_COL_W
+    _sd_legend = bar_colors is not None    # pooled bars only: "Mean ± SD" legend
     fig, axes = plt.subplots(k, 1, sharex=True, squeeze=False,
-                             figsize=(max(6, len(x_order) * _cw + 1.5),
+                             figsize=(max(6, len(x_order) * _cw + 1.5)
+                                      + (_HCMP_SD_LEGEND_W * _g if _sd_legend else 0),
                                       (panel_height * k + 1.0) * _g))
     axes = axes[:, 0]
     summaries = []
@@ -16652,11 +16769,34 @@ def plot_h_reflex_comparison_stacked(h_cache, recording_dirs, stage_key, stage_l
             ax=ax, x_order=x_order, show_xticklabels=(j == k - 1),
             title=_titles.get(mt, mt), show_legend=(j == 0), bar_colors=bar_colors,
             large_text=large_text)
+        # Bigger, bold panel titles (H-Reflex Size / M-Wave Size / Pre-stim EMG);
+        # scaled from the base title size so Large text still enlarges them.
+        ax.title.set_fontsize(ax.title.get_fontsize() * _HCMP_STACKED_PANEL_TITLE_FS / _HCMP_TITLE_FS)
+        ax.title.set_fontweight('bold')
         if s is None:
             ax.text(0.5, 0.5, 'No data', transform=ax.transAxes,
                     ha='center', va='center', color='#888',
                     fontsize=10 * _g, fontweight='bold' if large_text else 'normal')
         summaries.append(s)
+    if bar_colors is not None:
+        # Pooled Stacked: bigger, flatter x tick labels (Week 0 (Pre), ...).
+        for _tl in axes[-1].get_xticklabels():
+            _tl.set_fontsize(_HCMP_STACKED_BAR_XTICK_FS * _g)
+            _tl.set_rotation(_HCMP_STACKED_BAR_XTICK_ROT)
+        # ...and much bigger y-axis titles + numbers on every panel.
+        for _ax in axes:
+            _ax.yaxis.label.set_fontsize(_HCMP_STACKED_BAR_YLABEL_FS * _g * (1.25 if large_text else 1))
+            _ax.yaxis.label.set_fontweight('bold')
+            _ax.tick_params(axis='y', labelsize=_HCMP_STACKED_BAR_YTICK_FS * _g)
+    if _sd_legend:
+        # Frameless error-bar legend (like plot_multi_subject_daily's), right of
+        # the top panel; whiskers are ± SD across the pooled trials.
+        _eb = axes[0].errorbar([np.nan], [np.nan], yerr=[np.nan], fmt='none',
+                               ecolor='#222', elinewidth=2 * _g, capsize=6 * _g)  # proxy only
+        axes[0].legend([_eb], ['Mean ± SD across trials'], loc='upper left',
+                       bbox_to_anchor=(1.01, 1.0), frameon=False,
+                       prop={'size': _HCMP_SD_LEGEND_FS * _g,
+                             'weight': 'bold' if large_text else 'normal'})
     _legend_txt = ('bar = mean  ·  whiskers = mean ± 1σ' if bar_colors is not None else
                    'box = IQR  ·  — = median  ·  ◆ = mean  ·  whiskers = mean ± 1σ')
     fig.suptitle(f'Across Recordings  ·  {stage_lbl}\n'
@@ -16664,12 +16804,26 @@ def plot_h_reflex_comparison_stacked(h_cache, recording_dirs, stage_key, stage_l
                  fontsize=_HCMP_SUPTITLE_FS * _g * (1.25 if large_text else 1),
                  fontweight='bold' if large_text else 'normal')
     plt.tight_layout()
-    _fit_titles(fig, axes_room=1.0)
+    _fit_titles(fig, axes_room=1.0, min_fs=6)
     for ax in axes:
         _fit_texts_in_axes(ax, getattr(ax, '_hcmp_texts', []))
-    plt.tight_layout()
+    _tight_layout_below_suptitle(fig)
     plt.show()
     return summaries
+
+
+def _tight_layout_below_suptitle(fig, gap_pt: float = 8.0):
+    """tight_layout that keeps every panel (and its title) below the
+    suptitle. Plain tight_layout under-reserves room for a multi-line
+    suptitle, so on tall figures the top panel's title runs into it."""
+    fig.tight_layout()
+    if fig._suptitle is None or not fig._suptitle.get_text():
+        return
+    fig.canvas.draw()
+    r = fig.canvas.get_renderer()
+    _h = fig.bbox.height
+    _top = (fig._suptitle.get_window_extent(r).y0 - gap_pt * fig.dpi / 72.0) / _h
+    fig.tight_layout(rect=(0, 0, 1, max(0.5, _top)))
 
 
 def _h_comparison_entries(h_cache, recording_dirs, stage_keys, stage_labels=None):
@@ -16840,7 +16994,8 @@ def multi_subject_daily_table(subjects: dict, metric: str = 'h_reflex',
 def plot_multi_subject_daily(per_subject, pooled, metric: str = 'h_reflex',
                              normalize: bool = False, color: str = '#d62728',
                              group_label: str = 'VNS', title: str = None, ax=None,
-                             compact: bool = False, large_text: bool = False):
+                             compact: bool = False, large_text: bool = False,
+                             baseline_color: str = '#7f7f7f'):
     """Thin line per subject + thick pooled mean ± SEM line, by day
     (:func:`multi_subject_daily_table` output). Days ≥ 1 get a *group_label*
     bar above the plot; a dotted line separates baseline from conditioning.
@@ -16850,6 +17005,9 @@ def plot_multi_subject_daily(per_subject, pooled, metric: str = 'h_reflex',
     shape, not size, is what shows. *large_text* makes every label bold and
     ~1.7× larger with thicker lines and markers, for posters / slides read
     from a distance. The two combine.
+
+    Baseline days (day ≤ 0) are drawn in *baseline_color* (gray), conditioning
+    days (≥ 1) in *color*; the segment joining the two is gray.
     """
     name = _XR_METRIC_KEYS[metric][1]
     k = 1.7 if large_text else 1.0                  # text / line scale
@@ -16860,18 +17018,41 @@ def plot_multi_subject_daily(per_subject, pooled, metric: str = 'h_reflex',
                                         h * (1.35 if large_text else 1)))
     else:
         fig = ax.figure
+
+    def _split_plot(x, y, draw, **kw):
+        """draw(x, y, color, label?) for baseline (gray) and conditioning (color)
+        parts, plus a gray line joining the last baseline and first conditioning day."""
+        x, y = np.asarray(x, float), np.asarray(y, float)
+        bl = x <= 0
+        if bl.any() and (~bl).any():
+            ax.plot([x[bl][-1], x[~bl][0]], [y[bl][-1], y[~bl][0]], color=baseline_color,
+                    lw=kw['lw'], alpha=kw.get('alpha', 1.0), zorder=kw['zorder'] - 0.5)
+        for m, c in ((bl, baseline_color), (~bl, color)):
+            if m.any():
+                draw(m, c)
+
     for subj, g in per_subject.groupby('subject', sort=False):
         g = g.sort_values('day')
-        ax.plot(g['day'], g['value'], color=color, lw=1.0 * k, alpha=0.45,
-                marker='o', ms=3 * k, zorder=2)
+        _x, _y = g['day'].to_numpy(float), g['value'].to_numpy(float)
+        _split_plot(_x, _y, lambda m, c: ax.plot(_x[m], _y[m], color=c, lw=1.0 * k, alpha=0.45,
+                                                 marker='o', ms=3 * k, zorder=2),
+                    lw=1.0 * k, alpha=0.45, zorder=2)
         ax.annotate(subj, (g['day'].iloc[-1], g['value'].iloc[-1]), xytext=(6, 0),
                     textcoords='offset points', va='center', fontsize=10 * k,
                     fontweight=fw, color='0.35')
     p = pooled.dropna(subset=['mean']).sort_values('day')
     if not p.empty:
-        ax.errorbar(p['day'], p['mean'], yerr=p['sem'].fillna(0), color=color, lw=3.5 * k,
-                    elinewidth=2.5 * k, capsize=6 * k, capthick=2.5 * k, marker='o', ms=7 * k,
-                    zorder=4, label='Mean ± SEM across subjects')
+        _px, _py = p['day'].to_numpy(float), p['mean'].to_numpy(float)
+        _pe = p['sem'].fillna(0).to_numpy(float)
+        _has_cond = bool((_px > 0).any())
+        _split_plot(_px, _py, lambda m, c: ax.errorbar(
+                        _px[m], _py[m], yerr=_pe[m], color=c, lw=3.5 * k,
+                        elinewidth=2.5 * k, capsize=6 * k, capthick=2.5 * k, marker='o', ms=7 * k,
+                        zorder=4,
+                        # one legend entry (in the group color when there are conditioning days)
+                        label=('Mean ± SEM across subjects'
+                               if (c == color) == _has_cond else None)),
+                    lw=3.5 * k, zorder=4)
     days = sorted(per_subject['day'].unique())
     ax.set_xticks(days)
     ax.set_xticklabels([f'{d:g}' for d in days])
