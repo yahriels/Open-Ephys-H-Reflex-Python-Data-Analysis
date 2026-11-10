@@ -21174,6 +21174,94 @@ def convert_conditioning_to_hrs2(source_path: str, output_path: str = None,
                 sample_rate=hdr.sample_rate)
 
 
+def append_trials_to_hrs2(base_path: str, extra_path: str, output_path: str,
+                          extra_trials: tuple = (1, 500), emg_margin_ms: float = 2000.0,
+                          target_fv: int = 14, overwrite: bool = False) -> dict:
+    """Write *base_path* (a .hrs2) with trials *extra_trials* of *extra_path*
+    (.hrs2–.hrs6) appended after its last trial, as one .hrs2 file.
+
+    Used when files differ in extension or file_version, which the byte-level
+    :func:`combine_hrs_recordings` can't join (e.g. Control Mode .hrs2 fv19 +
+    the first 500 trials of an Up-Conditioning VNS .hrs6 fv15). Everything is
+    decoded and re-written with :func:`write_hrs2` at *target_fv* (14 = the
+    newest .hrs2 layout written here), so — exactly as for
+    :func:`convert_conditioning_to_hrs2` — every trial keeps its EMG / sync /
+    stim ADC data, timestamps, stim amplitude, onset indices, background,
+    polarity and the app's M/H responses, and the header keeps
+    filtering_protocol / booth_snapshot / filter_config (OFFLINE rebuild), but
+    fields with no fv14 .hrs2 slot are dropped: digital_event_* arrays,
+    pre_stim_emg_mean, data_integrity_flags, decision_* values and the
+    reward / VNS fields.
+
+    *extra_trials* is an inclusive 1-based (first, last) range of the extra
+    file's session trials. The extra file's continuous EMG blocks are kept up
+    to *emg_margin_ms* after the last kept trial's trigger (so its OFFLINE
+    rebuild window is covered) and dropped after that. The output header is the
+    base file's. Writes ``<output>.part`` then renames; copies the base
+    ``.settings.json``; records the sources in ``<output>.append.json``.
+
+    Returns dict(output, n_base, n_extra, n_trials, n_emg_base, n_emg_extra,
+    extra_trial_nums, target_fv, n_bytes).
+    """
+    import copy
+    import shutil
+    if os.path.isfile(output_path) and not overwrite:
+        raise FileExistsError(f'{output_path} exists (overwrite=False)')
+    if os.path.abspath(output_path) in (os.path.abspath(base_path), os.path.abspath(extra_path)):
+        raise ValueError('output_path is one of the source files')
+    if os.path.splitext(base_path)[1].lower() != '.hrs2' or \
+            os.path.splitext(output_path)[1].lower() != '.hrs2':
+        raise ValueError('base_path and output_path must be .hrs2 files')
+    readers = {'.hrs2': read_hrs2, **{k: globals()[v] for k, v in _CONDITIONING_READERS.items()}}
+    ext2 = os.path.splitext(extra_path)[1].lower()
+    if ext2 not in readers:
+        raise ValueError(f'unsupported extra file extension {ext2!r}')
+
+    b_hdr, b_trials, b_emg = read_hrs2(base_path)
+    x_hdr, x_trials, x_emg = readers[ext2](extra_path)
+    if b_hdr.filtering_protocol != x_hdr.filtering_protocol:
+        raise ValueError(f'filtering_protocol differs: base {b_hdr.filtering_protocol!r}, '
+                         f'extra {x_hdr.filtering_protocol!r}')
+    lo, hi = int(extra_trials[0]), int(extra_trials[1])
+    if not 1 <= lo <= hi <= len(x_trials):
+        raise ValueError(f'extra_trials {extra_trials} outside 1..{len(x_trials)}')
+    sel = x_trials[lo - 1:hi]
+    _t_last = int(getattr(sel[-1], 'trigger_wall_time_ms', 0) or 0)
+    if _t_last <= 0:
+        raise ValueError('last kept trial has no trigger_wall_time_ms — cannot cut its EMG')
+    _cut = _t_last + emg_margin_ms
+    sel_emg = [b for b in x_emg if int(b.ts_background_emitted) <= _cut]
+    for t in b_trials + sel:
+        if np.isnan(float(getattr(t, 'h_wave_response', float('nan')))):
+            raise ValueError('a trial has no h_wave_response — cannot write it as a '
+                             'Control Mode .hrs2 trial')
+
+    hdr = copy.deepcopy(b_hdr)
+    _part = output_path + '.part'
+    try:
+        write_hrs2(_part, hdr, b_trials + sel, list(b_emg) + sel_emg, file_version=target_fv)
+        os.replace(_part, output_path)
+    except BaseException:
+        if os.path.isfile(_part):
+            os.remove(_part)
+        raise
+    _sidecar = base_path + '.settings.json'
+    if os.path.isfile(_sidecar):
+        shutil.copy2(_sidecar, output_path + '.settings.json')
+    result = dict(output=output_path, n_base=len(b_trials), n_extra=len(sel),
+                  n_trials=len(b_trials) + len(sel), n_emg_base=len(b_emg),
+                  n_emg_extra=len(sel_emg), n_emg_extra_dropped=len(x_emg) - len(sel_emg),
+                  extra_trial_nums=[lo, hi], target_fv=target_fv,
+                  n_bytes=os.path.getsize(output_path))
+    with open(output_path + '.append.json', 'w', encoding='utf-8') as f:
+        json.dump(dict(result, base=dict(path=base_path, file_version=b_hdr.file_version,
+                                         n_trials=len(b_trials)),
+                       extra=dict(path=extra_path, file_version=x_hdr.file_version,
+                                  n_trials=len(x_trials), kept=[lo, hi],
+                                  emg_cut_wall_ms=_cut)), f, indent=1)
+    return result
+
+
 _UNIX_MS_LO, _UNIX_MS_HI = 5e11, 3e12   # wall-clock Unix-ms range (~1985–2065)
 
 
