@@ -4845,6 +4845,16 @@ def get_trial_reward(trial):
     return False, None
 
 
+# What each reward kind is called in plot labels / legends / tables. The kind
+# itself ('VNS' / 'Pellet', from get_trial_reward) is unchanged for the logic.
+REWARD_DISPLAY_NAMES = {'VNS': 'CLV'}
+
+
+def reward_display_name(kind):
+    """Label for a reward *kind* in plots and tables ('VNS' → 'CLV')."""
+    return REWARD_DISPLAY_NAMES.get(kind, kind) if kind else kind
+
+
 def _is_fixed_intensity_trial(trial, tol: float = 1e-9) -> bool:
     """Return True when this trial used fixed stimulation intensity.
 
@@ -4975,7 +4985,7 @@ def plot_mwave_stabilization_groups(trials, header, sample_rate: float,
             continue
         amp = float(getattr(t, 'stimulation_amplitude_ma', float('nan')))
         rewarded, _kind = get_trial_reward(t)
-        reward_kind = reward_kind or _kind
+        reward_kind = reward_kind or reward_display_name(_kind)
         if _is_fixed_intensity_trial(t):
             fixed_vals.append(val)
             fixed_amps.append(amp)
@@ -5349,7 +5359,7 @@ def plot_h_wave_reward_timeline(sessions, source: str = 'in_session',
         rew = np.zeros(len(trials), dtype=bool)
         for i, t in enumerate(trials):
             rew[i], _kind = get_trial_reward(t)
-            reward_kind = reward_kind or _kind
+            reward_kind = reward_kind or reward_display_name(_kind)
         _x0 = int(stn.min()) - 1 if _multi else 0     # several sessions: no gap at each start
         x = offset + stn - _x0
         for i in range(len(trials)):
@@ -5465,6 +5475,7 @@ def plot_h_wave_reward_timeline(sessions, source: str = 'in_session',
 
 
 def format_h_wave_reward_summary(summary, reward_kind: str = 'Reward') -> str:
+    reward_kind = reward_display_name(reward_kind) or 'Reward'
     """Tab-separated text of a :func:`plot_h_wave_reward_timeline` summary —
     pastes into Excel/Sheets as columns."""
     if not summary:
@@ -15082,9 +15093,10 @@ def compute_reward_groups(trials, state, skip_first_n: int = 100):
     if not trials or get_trial_reward(trials[0])[1] is None:
         print("No reward flag on these trials (not a conditioning stage).")
         return None
-    kind          = get_trial_reward(trials[0])[1]
-    # Name the groups after what was delivered: 'VNS' / 'No VNS' or 'Pellet' / 'No pellet'
-    group_labels  = [kind, f'No {kind if kind == "VNS" else kind.lower()}']
+    _raw_kind     = get_trial_reward(trials[0])[1]
+    kind          = reward_display_name(_raw_kind)    # 'VNS' is shown as 'CLV'
+    # Name the groups after what was delivered: 'CLV' / 'No CLV' or 'Pellet' / 'No pellet'
+    group_labels  = [kind, f'No {kind if _raw_kind == "VNS" else kind.lower()}']
     group_colors  = ['crimson', 'grey']
     trial_bg_dict = {id(t): state['trial_bg_gm'][i] for i, t in enumerate(trials)}
 
@@ -16483,6 +16495,7 @@ _HCMP_TITLE_FS       = 15     # plot / panel title
 _HCMP_AXIS_TITLE_FS  = 15     # x- and y-axis titles
 _HCMP_SUPTITLE_FS    = 17     # stacked figure's overall title
 _HCMP_STACKED_PANEL_TITLE_FS = 22   # stacked panel titles (H-Reflex Size, M-Wave Size, ...)
+_HCMP_STACKED_POOLED_PANEL_TITLES = False   # pooled Stacked: show those panel titles? (y labels name the panels)
 _HCMP_SD_LEGEND_FS = 12      # "Mean ± SD across trials" legend, pooled Stacked only (×1.6 Large text)
 _HCMP_SD_LEGEND_W  = 3.0     # inches added to that figure's width for the legend
 _HCMP_BAR_XTICK_FS   = 14     # x tick labels of the pooled bar plot
@@ -16504,10 +16517,12 @@ _HCMP_BLUES = {'tab:blue', 'blue', 'c0', 'steelblue', 'lightsteelblue', 'royalbl
 
 def _hcmp_stage_name(sk, stage_labels):
     """Stage name for comparison-plot titles / legends: Control Mode →
-    "Baseline"; any other stage loses its " (.hrsN)" file extension."""
+    "Baseline"; any other stage loses its " (.hrsN)" file extension, and
+    "VNS" is shown as "CLV" (REWARD_DISPLAY_NAMES), e.g. "Up Condition CLV"."""
     if sk == 'control_mode':
         return _HCMP_BASELINE_NAME
-    return re.sub(r'\s*\(\.\w+\)\s*$', '', str((stage_labels or {}).get(sk, sk)))
+    name = re.sub(r'\s*\(\.\w+\)\s*$', '', str((stage_labels or {}).get(sk, sk)))
+    return re.sub(r'\bVNS\b', REWARD_DISPLAY_NAMES['VNS'], name)
 _HCMP_COMPACT_COL_W       = 0.85  # inches per recording column, Compact (was 0.6)
 
 
@@ -16773,6 +16788,8 @@ def plot_h_reflex_comparison_stacked(h_cache, recording_dirs, stage_key, stage_l
         # scaled from the base title size so Large text still enlarges them.
         ax.title.set_fontsize(ax.title.get_fontsize() * _HCMP_STACKED_PANEL_TITLE_FS / _HCMP_TITLE_FS)
         ax.title.set_fontweight('bold')
+        if bar_colors is not None and not _HCMP_STACKED_POOLED_PANEL_TITLES:
+            ax.set_title('')     # pooled: the y-axis label already names the panel
         if s is None:
             ax.text(0.5, 0.5, 'No data', transform=ax.transAxes,
                     ha='center', va='center', color='#888',
@@ -16929,6 +16946,7 @@ def load_subject_caches(subject_pickles: dict) -> dict:
         out[subj] = {'xr_cache': b['xr_cache'],
                      'recording_dirs': cfg.get('RECORDING_DIRS') or
                                        [(l, '', None) for l in b['xr_cache']],
+                     'recording_names': b.get('recording_names', {}),
                      'config': cfg}
         del b
         gc.collect()
@@ -16995,7 +17013,7 @@ def plot_multi_subject_daily(per_subject, pooled, metric: str = 'h_reflex',
                              normalize: bool = False, color: str = '#d62728',
                              group_label: str = 'VNS', title: str = None, ax=None,
                              compact: bool = False, large_text: bool = False,
-                             baseline_color: str = '#7f7f7f'):
+                             baseline_color: str = '#7f7f7f', show_legend: bool = True):
     """Thin line per subject + thick pooled mean ± SEM line, by day
     (:func:`multi_subject_daily_table` output). Days ≥ 1 get a *group_label*
     bar above the plot; a dotted line separates baseline from conditioning.
@@ -17008,6 +17026,8 @@ def plot_multi_subject_daily(per_subject, pooled, metric: str = 'h_reflex',
 
     Baseline days (day ≤ 0) are drawn in *baseline_color* (gray), conditioning
     days (≥ 1) in *color*; the segment joining the two is gray.
+
+    *show_legend* = False drops the "Mean ± SEM" legend entirely.
     """
     name = _XR_METRIC_KEYS[metric][1]
     k = 1.7 if large_text else 1.0                  # text / line scale
@@ -17079,7 +17099,9 @@ def plot_multi_subject_daily(per_subject, pooled, metric: str = 'h_reflex',
     ax.grid(axis='y', color='0.9', lw=0.8)
     ax.set_axisbelow(True)
     _lp = {'size': 11 * k, 'weight': fw}
-    if compact:   # a short axes has no free corner — short legend outside on the right
+    if not show_legend:
+        pass
+    elif compact:   # a short axes has no free corner — short legend outside on the right
         _hs, _ls = ax.get_legend_handles_labels()
         ax.legend(_hs, [l.replace(' across subjects', '') for l in _ls], loc='upper left', bbox_to_anchor=(1.02, 1.0), frameon=False, prop=_lp)
     else:
@@ -18442,6 +18464,35 @@ def _strip_recordings(all_recordings: dict, keep_emg: bool) -> dict:
 ANALYSIS_PICKLE_FORMAT = 1
 
 
+def get_recording_name_map(bundle: dict) -> dict:
+    """``{label: recording folder name}`` for an analysis snapshot, e.g.
+    ``{'20': 'UPVNS23_HRPILOT-33_BOOTH3_250US_10KHZ_11-13-26', ...}``.
+
+    Taken from the saved ``RECORDING_DIRS`` config; labels missing there (or
+    old pickles with no config) fall back to the folder of the stage file the
+    recording was loaded from (``stage_paths``)."""
+    names = {}
+    for _d in (bundle.get('config') or {}).get('RECORDING_DIRS') or []:
+        if len(_d) >= 2 and _d[1]:
+            names[str(_d[0])] = os.path.basename(os.path.normpath(_d[1]))
+    for _rl, _rec in (bundle.get('recordings_raw') or bundle.get('recordings') or {}).items():
+        if _rl not in names:
+            for _p in (_rec.get('stage_paths') or {}).values():
+                names[_rl] = os.path.basename(os.path.dirname(os.path.normpath(_p)))
+                break
+    return names
+
+
+def print_recording_name_map(names: dict) -> None:
+    """Print a ``label → recording folder`` table (see :func:`get_recording_name_map`)."""
+    if not names:
+        return
+    _w = max(len(repr(l)) for l in names)
+    print('  recording names:')
+    for _l, _n in names.items():
+        print(f'    {repr(_l):>{_w}} → {_n}')
+
+
 def save_analysis_pickle(path: str = None, *, config: dict = None,
                          all_recordings_raw: dict = None, all_recordings: dict = None,
                          include_recordings: bool = True, include_emg_blocks: bool = False,
@@ -18489,6 +18540,7 @@ def save_analysis_pickle(path: str = None, *, config: dict = None,
         raise
     print(f'Saved {os.path.getsize(path) / 1e6:.1f} MB → {path}')
     print(f'  contents: {[k for k in bundle if bundle[k] is not None]}')
+    print_recording_name_map(get_recording_name_map(bundle))
     return path
 
 
@@ -18516,6 +18568,8 @@ def load_analysis_pickle(path: str, config_now: dict = None) -> dict:
     if bundle.get('recordings_raw'):
         print(f"  recordings: {list(bundle['recordings_raw'])}"
               + ('' if meta.get('include_emg_blocks') else '  (no raw EMG blocks)'))
+    bundle['recording_names'] = get_recording_name_map(bundle)
+    print_recording_name_map(bundle['recording_names'])
     if config_now is not None:
         diff_analysis_config(bundle.get('config', {}), config_now)
     return bundle
